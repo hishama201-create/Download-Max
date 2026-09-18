@@ -14,21 +14,36 @@
       "intentFilters": [
         {
           "action": "SEND",
-          "category": ["DEFAULT"],
+          "category": [
+            "DEFAULT"
+          ],
           "data": [
-            { "mimeType": "text/plain" },
-            { "mimeType": "text/*" },
-            { "mimeType": "image/*" },
-            { "mimeType": "video/*" },
-            { "mimeType": "audio/*" }
+            {
+              "mimeType": "text/plain"
+            },
+            {
+              "mimeType": "text/*"
+            },
+            {
+              "mimeType": "image/*"
+            },
+            {
+              "mimeType": "video/*"
+            },
+            {
+              "mimeType": "audio/*"
+            }
           ]
         }
-      ]
+      ],
+      "package": "com.anonymous.downloadmax"
     },
     "web": {
       "favicon": "./assets/images/icon.png"
     },
-    "plugins": ["expo-router"],
+    "plugins": [
+      "expo-router"
+    ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
