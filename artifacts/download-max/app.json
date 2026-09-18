@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "Download Max",
+    "slug": "download-max",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "download-max",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "intentFilters": [
+        {
+          "action": "SEND",
+          "category": ["DEFAULT"],
+          "data": [
+            { "mimeType": "text/plain" },
+            { "mimeType": "text/*" },
+            { "mimeType": "image/*" },
+            { "mimeType": "video/*" },
+            { "mimeType": "audio/*" }
+          ]
+        }
+      ]
+    },
+    "web": {
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
