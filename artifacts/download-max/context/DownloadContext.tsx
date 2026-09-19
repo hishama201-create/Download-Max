@@ -47,6 +47,21 @@ function looksLikeDirectMedia(url: string) {
   return /\.(mp4|webm|mov|m4v|mp3|m4a|wav|aac|jpg|jpeg|png|webp|gif)(\?.*)?$/i.test(url);
 }
 
+async function resolveMediaUrl(sourceUrl: string): Promise<string> {
+  if (looksLikeDirectMedia(sourceUrl)) return sourceUrl;
+  const response = await fetch('https://api.cobalt.tools/api/json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({ url: sourceUrl }),
+  });
+  if (!response.ok) throw new Error('تعذر الوصول إلى خدمة الاستخراج.');
+  const data = await response.json();
+  if (data.status === 'error' || !data.url) {
+    throw new Error(data.text || 'تعذر استخراج رابط الوسائط من هذا الرابط.');
+  }
+  return data.url as string;
+}
+
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<DownloadItem[]>([]);
 
@@ -81,29 +96,22 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    if (!looksLikeDirectMedia(item.url)) {
-      await updateItem(item.id, {
-        status: 'failed',
-        error: 'هذا الرابط صفحة ويب وليس رابط ملف مباشر. استخدم مصدراً يوفر رابط الوسائط المسموح بتنزيله.',
-      });
-      return;
-    }
-
     try {
       const baseDirectory = FileSystem.documentDirectory;
       if (!baseDirectory) throw new Error('تعذر الوصول إلى مساحة التخزين.');
+      const mediaUrl = await resolveMediaUrl(item.url);
       const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
-      const result = await FileSystem.downloadAsync(item.url, target);
+      const result = await FileSystem.downloadAsync(mediaUrl, target);
       await updateItem(item.id, {
         status: 'completed',
         progress: 1,
         fileUri: result.uri,
       });
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch {
+    } catch (err) {
       await updateItem(item.id, {
         status: 'failed',
-        error: 'فشل التنزيل. تحقق من الرابط والاتصال ثم حاول مرة أخرى.',
+        error: err instanceof Error ? err.message : 'فشل التنزيل. تحقق من الرابط والاتصال ثم حاول مرة أخرى.',
       });
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
