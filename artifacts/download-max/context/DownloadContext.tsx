@@ -49,7 +49,7 @@ function looksLikeDirectMedia(url: string) {
 
 async function resolveMediaUrl(sourceUrl: string): Promise<string> {
   if (looksLikeDirectMedia(sourceUrl)) return sourceUrl;
-  const response = await fetch('https://api.cobalt.tools/api/json', {
+  const response = await fetch('https://api-production-85a7.up.railway.app/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({ url: sourceUrl }),
