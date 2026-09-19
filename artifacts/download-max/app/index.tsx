@@ -11,7 +11,6 @@ import {
   Platform,
   Pressable,
   RefreshControl,
-  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -66,8 +65,14 @@ function guessedTitle(url: string) {
 
 function formatBytes(value?: number) {
   if (!value) return '—';
+  if (value < 1024) return `${Math.round(value)} B`;
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function percentLabel(item: DownloadItem) {
+  const percent = Math.min(Math.floor(item.progress * 100), 99);
+  return `${percent}%`;
 }
 
 function useSafeIncomingShare() {
@@ -80,15 +85,23 @@ function useSafeIncomingShare() {
   return useIncomingShare();
 }
 
-function DownloadRow({ item, onRetry, onRemove, onShare }: {
+function DownloadRow({ item, onRetry, onRemove, onShare, onOpen }: {
   item: DownloadItem;
   onRetry: () => void;
   onRemove: () => void;
   onShare: () => void;
+  onOpen: () => void;
 }) {
   const colors = useColors();
   const isActive = item.status === 'downloading' || item.status === 'queued';
   const iconColor = item.status === 'completed' ? colors.accentForeground : item.status === 'failed' ? colors.destructive : colors.primary;
+  const statusLabel = item.status === 'completed'
+    ? 'اكتمل'
+    : item.status === 'failed'
+      ? 'تعذر التحميل'
+      : isActive
+        ? `جارٍ التحميل · ${percentLabel(item)}`
+        : 'في الانتظار';
   return (
     <View style={[styles.downloadRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
       <View style={[styles.fileIcon, { backgroundColor: `${iconColor}16` }]}>
@@ -97,11 +110,16 @@ function DownloadRow({ item, onRetry, onRemove, onShare }: {
       <View style={styles.rowBody}>
         <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
         <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
-          {typeLabels[item.type]} · {item.format.toUpperCase()} · {item.status === 'completed' ? 'اكتمل' : item.status === 'failed' ? 'تعذر التحميل' : isActive ? 'جارٍ التحميل' : 'في الانتظار'}
+          {typeLabels[item.type]} · {item.format.toUpperCase()} · {statusLabel}
+          {isActive && item.bytesWritten ? ` · ${formatBytes(item.bytesWritten)}` : ''}
+          {item.totalBytes ? ` / ${formatBytes(item.totalBytes)}` : ''}
         </Text>
         {isActive ? (
-          <View style={[styles.progressTrack, { backgroundColor: colors.muted }]}>
-            <View style={[styles.progressFill, { backgroundColor: colors.primary, width: `${Math.max(item.progress * 100, 8)}%` }]} />
+          <View style={styles.progressLine}>
+            <View style={[styles.progressTrack, { backgroundColor: colors.muted }]}>
+              <View style={[styles.progressFill, { backgroundColor: colors.primary, width: `${Math.max(item.progress * 100, 4)}%` }]} />
+            </View>
+            <Text style={[styles.progressPercent, { color: colors.primary }]}>{percentLabel(item)}</Text>
           </View>
         ) : item.error ? (
           <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
@@ -109,9 +127,14 @@ function DownloadRow({ item, onRetry, onRemove, onShare }: {
       </View>
       <View style={styles.rowActions}>
         {item.status === 'completed' && item.fileUri ? (
-          <Pressable testID="share-file" accessibilityLabel="مشاركة الملف" onPress={onShare} style={styles.iconButton}>
-            <Feather name="share-2" size={18} color={colors.primary} />
-          </Pressable>
+          <>
+            <Pressable testID="open-file" accessibilityLabel="فتح الملف" onPress={onOpen} style={[styles.iconButton, styles.openButton, { backgroundColor: colors.primary }]}>
+              <Feather name="play" size={15} color={colors.primaryForeground} />
+            </Pressable>
+            <Pressable testID="share-file" accessibilityLabel="مشاركة الملف" onPress={onShare} style={styles.iconButton}>
+              <Feather name="share-2" size={18} color={colors.primary} />
+            </Pressable>
+          </>
         ) : item.status === 'failed' ? (
           <Pressable testID="retry-download" accessibilityLabel="إعادة المحاولة" onPress={onRetry} style={styles.iconButton}>
             <Feather name="refresh-cw" size={18} color={colors.primary} />
@@ -175,7 +198,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, addDownload, retryDownload, removeDownload, clearCompleted } = useDownloads();
+  const { items, activeCount, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, setThemeMode, setAccent, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -239,7 +262,11 @@ export default function HomeScreen() {
   }
 
   function showShare(item: DownloadItem) {
-    if (item.fileUri) void Share.share({ url: item.fileUri, message: item.title });
+    void shareFile(item);
+  }
+
+  function showOpen(item: DownloadItem) {
+    void openFile(item);
   }
 
   return (
@@ -362,7 +389,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} onRetry={() => void retryDownload(item.id)} onRemove={() => void removeDownload(item.id)} onShare={() => showShare(item)} />}
+            renderItem={({ item }) => <DownloadRow item={item} onRetry={() => void retryDownload(item.id)} onRemove={() => void removeDownload(item.id)} onShare={() => showShare(item)} onOpen={() => showOpen(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
         )}
@@ -498,8 +525,11 @@ const styles = StyleSheet.create({
   rowBody: { flex: 1, marginLeft: 11, minWidth: 0 },
   rowTitle: { fontSize: 13, fontWeight: '800' },
   rowMeta: { fontSize: 10, marginTop: 4 },
-  progressTrack: { height: 4, borderRadius: 3, marginTop: 9, overflow: 'hidden' },
+  progressLine: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 9 },
+  progressTrack: { flex: 1, height: 5, borderRadius: 3, overflow: 'hidden' },
   progressFill: { height: '100%', borderRadius: 3 },
+  progressPercent: { fontSize: 11, fontWeight: '800', minWidth: 32, textAlign: 'right' },
+  openButton: { width: 30, height: 30, borderRadius: 15, justifyContent: 'center', alignItems: 'center' },
   errorText: { fontSize: 10, lineHeight: 14, marginTop: 6 },
   rowActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 5, gap: 1 },
   iconButton: { padding: 7 },

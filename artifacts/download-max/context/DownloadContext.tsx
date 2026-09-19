@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
+import * as Sharing from 'expo-sharing';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
 
@@ -25,6 +26,8 @@ export type DownloadItem = {
   quality: string;
   status: DownloadStatus;
   progress: number;
+  bytesWritten?: number;
+  totalBytes?: number;
   fileUri?: string;
   error?: string;
   createdAt: number;
@@ -37,6 +40,8 @@ type DownloadContextValue = {
   retryDownload: (id: string) => Promise<void>;
   removeDownload: (id: string) => Promise<void>;
   clearCompleted: () => Promise<void>;
+  openFile: (item: DownloadItem) => Promise<void>;
+  shareFile: (item: DownloadItem) => Promise<void>;
 };
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -52,6 +57,42 @@ function safeFilename(title: string, format: string) {
 
 function looksLikeDirectMedia(url: string) {
   return /\.(mp4|webm|mov|m4v|mp3|m4a|wav|aac|jpg|jpeg|png|webp|gif)(\?.*)?$/i.test(url);
+}
+
+/** أنواع MIME الصحيحة لكل صيغة حتى يفتح Android الملف بالتطبيق المناسب. */
+const MIME_TYPES: Record<string, string> = {
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  m4v: 'video/x-m4v',
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  wav: 'audio/wav',
+  aac: 'audio/aac',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+};
+
+function mimeFor(filename: string) {
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  return MIME_TYPES[ext] ?? '*/*';
+}
+
+/**
+ * يفتح الملف الذي تم تنزيله عبر لوحة مشاركة أندرويد،
+ * فيمكن تشغيله بأي مشغل فيديو/صوت أو عارض صور مثبّت على الجهاز.
+ */
+async function openDownloadedFile(item: DownloadItem) {
+  if (Platform.OS === 'web' || !item.fileUri) return;
+  const available = await Sharing.isAvailableAsync();
+  if (!available) throw new Error('المشاركة غير مدعومة على هذا الجهاز.');
+  await Sharing.shareAsync(item.fileUri, {
+    mimeType: mimeFor(item.fileUri),
+    dialogTitle: 'فتح أو مشاركة الملف',
+  });
 }
 
 async function resolveMediaUrl(sourceUrl: string): Promise<string> {
@@ -78,6 +119,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const activeIdRef = useRef<string | null>(null);
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
   const progressRef = useRef(new Map<string, { progress: number; at: number }>());
+  const bytesRef = useRef(new Map<string, { bytesWritten: number; totalBytes?: number }>());
   const pumpRef = useRef<() => void>(() => undefined);
   const runJobRef = useRef<(id: string) => void>(() => undefined);
 
@@ -136,17 +178,26 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           if (now - lastAt < 250 && nextProgress - (progressRef.current.get(id)?.progress ?? 0) < 0.02) return;
           lastAt = now;
           progressRef.current.set(id, { progress: nextProgress, at: now });
-          patchItem(id, { progress: nextProgress });
+          bytesRef.current.set(id, { bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
+          patchItem(id, { progress: nextProgress, bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
         },
       );
       resumablesRef.current.set(id, resumable);
 
       const result = await resumable.downloadAsync();
+      const finalBytes = bytesRef.current.get(id);
       resumablesRef.current.delete(id);
       progressRef.current.delete(id);
+      bytesRef.current.delete(id);
 
       if (result?.status === 200) {
-        await patchItem(id, { status: 'completed', progress: 1, fileUri: result.uri });
+        await patchItem(id, {
+          status: 'completed',
+          progress: 1,
+          bytesWritten: finalBytes?.bytesWritten,
+          totalBytes: finalBytes?.totalBytes,
+          fileUri: result.uri,
+        });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } else {
         await patchItem(id, { status: 'failed', error: `تعذر تنزيل الملف (رمز ${result?.status ?? 'مجهول'}).` });
@@ -155,6 +206,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       resumablesRef.current.delete(id);
       progressRef.current.delete(id);
+      bytesRef.current.delete(id);
       await patchItem(id, {
         status: 'failed',
         error: err instanceof Error ? err.message : 'فشل التنزيل. تحقق من الرابط والاتصال ثم حاول مرة أخرى.',
@@ -251,12 +303,25 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
     }
     progressRef.current.delete(id);
+    bytesRef.current.delete(id);
     commit((current) => current.filter((item) => item.id !== id));
   }, [commit]);
 
   const clearCompleted = useCallback(async () => {
     commit((current) => current.filter((item) => item.status !== 'completed'));
   }, [commit]);
+
+  const openFile = useCallback(async (item: DownloadItem) => {
+    if (item.status !== 'completed' || !item.fileUri) return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    await openDownloadedFile(item);
+  }, []);
+
+  const shareFile = useCallback(async (item: DownloadItem) => {
+    if (item.status !== 'completed' || !item.fileUri) return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    await openDownloadedFile(item);
+  }, []);
 
   const value = useMemo(() => ({
     items,
@@ -265,7 +330,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     retryDownload,
     removeDownload,
     clearCompleted,
-  }), [items, addDownload, retryDownload, removeDownload, clearCompleted]);
+    openFile,
+    shareFile,
+  }), [items, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }
