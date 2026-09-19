@@ -3,8 +3,6 @@ name: Build Android Release APK
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'artifacts/download-max/**'
   workflow_dispatch: {}
 
 jobs:
