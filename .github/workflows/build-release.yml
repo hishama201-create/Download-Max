@@ -42,7 +42,7 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       - name: Expo prebuild (android)
-        run: pnpm exec expo prebuild --platform android --clean
+        run: pnpm exec expo prebuild --platform android --clean --no-install
 
       - name: Build release APK
         working-directory: artifacts/download-max/android
