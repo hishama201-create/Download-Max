@@ -1,10 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
 
 const STORAGE_KEY = '@download-max/downloads';
+
+/**
+ * خدمة تحويل روابط الصفحات إلى روابط وسائط مباشرة.
+ * يمكن تغييرها لكل بيئة عبر EXPO_PUBLIC_EXTRACTOR_URL (تُثبَّت وقت البناء).
+ */
+const EXTRACTOR_API_URL =
+  process.env.EXPO_PUBLIC_EXTRACTOR_URL?.trim() || 'https://api-production-85a7.up.railway.app/';
 
 export type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'failed';
 export type MediaType = 'video' | 'audio' | 'image';
@@ -49,9 +56,9 @@ function looksLikeDirectMedia(url: string) {
 
 async function resolveMediaUrl(sourceUrl: string): Promise<string> {
   if (looksLikeDirectMedia(sourceUrl)) return sourceUrl;
-  const response = await fetch('https://api-production-85a7.up.railway.app/', {
+  const response = await fetch(EXTRACTOR_API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ url: sourceUrl }),
   });
   if (!response.ok) throw new Error('تعذر الوصول إلى خدمة الاستخراج.');
@@ -65,57 +72,151 @@ async function resolveMediaUrl(sourceUrl: string): Promise<string> {
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<DownloadItem[]>([]);
 
-  useEffect(() => {
-    AsyncStorage.getItem(STORAGE_KEY)
-      .then((stored) => {
-        if (stored) setItems(JSON.parse(stored) as DownloadItem[]);
-      })
-      .catch(() => undefined);
-  }, []);
+  // مراجع تعمل خارج دورة الرسم لإدارة الطابور بأمان.
+  const itemsRef = useRef<DownloadItem[]>([]);
+  const queueRef = useRef<string[]>([]);
+  const activeIdRef = useRef<string | null>(null);
+  const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
+  const progressRef = useRef(new Map<string, { progress: number; at: number }>());
+  const pumpRef = useRef<() => void>(() => undefined);
+  const runJobRef = useRef<(id: string) => void>(() => undefined);
 
-  const persist = useCallback((next: DownloadItem[]) => {
-    setItems(next);
-    return AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-  }, []);
-
-  const updateItem = useCallback(async (id: string, patch: Partial<DownloadItem>) => {
+  const commit = useCallback((updater: (current: DownloadItem[]) => DownloadItem[]) => {
     setItems((current) => {
-      const next = current.map((item) => (item.id === id ? { ...item, ...patch } : item));
-      void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      const next = updater(current);
+      itemsRef.current = next;
+      void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
       return next;
     });
   }, []);
 
-  const startDownload = useCallback(async (item: DownloadItem) => {
-    await updateItem(item.id, { status: 'downloading', progress: 0, error: undefined });
+  const patchItem = useCallback((id: string, patch: Partial<DownloadItem>) => {
+    commit((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  }, [commit]);
+
+  /** مهمة تنزيل واحدة: تستخرج الرابط المباشر ثم تنزّل مع تتبع التقدم. */
+  const runJob = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    if (!item) {
+      activeIdRef.current = null;
+      pumpRef.current();
+      return;
+    }
+
+    await patchItem(id, { status: 'downloading', progress: 0, error: undefined });
+
     if (Platform.OS === 'web') {
-      await updateItem(item.id, {
-        status: 'failed',
-        error: 'التنزيل المباشر متاح من تطبيق Android فقط.',
-      });
+      await patchItem(id, { status: 'failed', error: 'التنزيل المباشر متاح من تطبيق Android فقط.' });
+      activeIdRef.current = null;
+      pumpRef.current();
       return;
     }
 
     try {
       const baseDirectory = FileSystem.documentDirectory;
       if (!baseDirectory) throw new Error('تعذر الوصول إلى مساحة التخزين.');
+
       const mediaUrl = await resolveMediaUrl(item.url);
       const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
-      const result = await FileSystem.downloadAsync(mediaUrl, target);
-      await updateItem(item.id, {
-        status: 'completed',
-        progress: 1,
-        fileUri: result.uri,
-      });
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+      // إزالة أي بقايا من محاولة سابقة حتى يبدأ التقدم من الصفر.
+      const existing = await FileSystem.getInfoAsync(target);
+      if (existing.exists) await FileSystem.deleteAsync(target, { idempotent: true });
+
+      let lastAt = 0;
+      const resumable = FileSystem.createDownloadResumable(
+        mediaUrl,
+        target,
+        {},
+        (progress) => {
+          const expected = progress.totalBytesExpectedToWrite;
+          const nextProgress = expected > 0 ? progress.totalBytesWritten / expected : 0;
+          if (nextProgress <= 0 || nextProgress >= 1) return;
+          const now = Date.now();
+          if (now - lastAt < 250 && nextProgress - (progressRef.current.get(id)?.progress ?? 0) < 0.02) return;
+          lastAt = now;
+          progressRef.current.set(id, { progress: nextProgress, at: now });
+          patchItem(id, { progress: nextProgress });
+        },
+      );
+      resumablesRef.current.set(id, resumable);
+
+      const result = await resumable.downloadAsync();
+      resumablesRef.current.delete(id);
+      progressRef.current.delete(id);
+
+      if (result?.status === 200) {
+        await patchItem(id, { status: 'completed', progress: 1, fileUri: result.uri });
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } else {
+        await patchItem(id, { status: 'failed', error: `تعذر تنزيل الملف (رمز ${result?.status ?? 'مجهول'}).` });
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      }
     } catch (err) {
-      await updateItem(item.id, {
+      resumablesRef.current.delete(id);
+      progressRef.current.delete(id);
+      await patchItem(id, {
         status: 'failed',
         error: err instanceof Error ? err.message : 'فشل التنزيل. تحقق من الرابط والاتصال ثم حاول مرة أخرى.',
       });
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      activeIdRef.current = null;
+      pumpRef.current();
     }
-  }, [updateItem]);
+  }, [patchItem]);
+
+  /** يشغّل المهمة التالية في الطابور إن لم يكن هناك تنزيل نشط. */
+  const pump = useCallback(() => {
+    if (activeIdRef.current) return;
+    const nextId = queueRef.current.shift();
+    if (!nextId) return;
+    const item = itemsRef.current.find((candidate) => candidate.id === nextId);
+    if (!item || item.status !== 'queued') {
+      pumpRef.current(); // تخطي العناصر المحذوفة أو المنتهية
+      return;
+    }
+    activeIdRef.current = nextId;
+    runJobRef.current(nextId);
+  }, []);
+
+  const enqueue = useCallback((id: string) => {
+    if (!queueRef.current.includes(id)) queueRef.current.push(id);
+    pumpRef.current();
+  }, []);
+
+  useEffect(() => {
+    runJobRef.current = (id) => {
+      void runJob(id);
+    };
+    pumpRef.current = pump;
+  }, [runJob, pump]);
+
+  // استرجاع السجل عند الإقلاع وإعادة جدولة أي تنزيلات معلّقة.
+  useEffect(() => {
+    let cancelled = false;
+    AsyncStorage.getItem(STORAGE_KEY)
+      .then((stored) => {
+        if (!stored || cancelled) return;
+        const parsed = JSON.parse(stored) as DownloadItem[];
+        const currentIds = new Set(itemsRef.current.map((existing) => existing.id));
+        const merged = [...itemsRef.current, ...parsed.filter((existing) => !currentIds.has(existing.id))]
+          .sort((a, b) => b.createdAt - a.createdAt);
+        itemsRef.current = merged;
+        setItems(merged);
+
+        for (const item of merged) {
+          if (item.status === 'downloading' || item.status === 'queued') {
+            patchItem(item.id, { status: 'queued', progress: 0, error: undefined });
+            enqueue(item.id);
+          }
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [patchItem, enqueue]);
 
   const addDownload = useCallback(async (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => {
     const item: DownloadItem = {
@@ -125,23 +226,37 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       progress: 0,
       createdAt: Date.now(),
     };
-    await persist([item, ...items]);
+    commit((current) => [item, ...current]);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    void startDownload(item);
-  }, [items, persist, startDownload]);
+    enqueue(item.id);
+  }, [commit, enqueue]);
 
   const retryDownload = useCallback(async (id: string) => {
-    const item = items.find((candidate) => candidate.id === id);
-    if (item) void startDownload(item);
-  }, [items, startDownload]);
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    if (!item) return;
+    if (item.status === 'downloading' || item.status === 'queued') return;
+    patchItem(id, { status: 'queued', progress: 0, error: undefined });
+    enqueue(id);
+  }, [patchItem, enqueue]);
 
   const removeDownload = useCallback(async (id: string) => {
-    await persist(items.filter((item) => item.id !== id));
-  }, [items, persist]);
+    queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
+    const resumable = resumablesRef.current.get(id);
+    if (resumable) {
+      resumablesRef.current.delete(id);
+      try {
+        await resumable.cancelAsync();
+      } catch {
+        // المهمة ربما انتهت بالفعل
+      }
+    }
+    progressRef.current.delete(id);
+    commit((current) => current.filter((item) => item.id !== id));
+  }, [commit]);
 
   const clearCompleted = useCallback(async () => {
-    await persist(items.filter((item) => item.status !== 'completed'));
-  }, [items, persist]);
+    commit((current) => current.filter((item) => item.status !== 'completed'));
+  }, [commit]);
 
   const value = useMemo(() => ({
     items,
