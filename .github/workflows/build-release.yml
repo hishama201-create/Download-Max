@@ -21,15 +21,16 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
+      # مجلد android/ يُنشأ لاحقاً بواسطة expo prebuild، لذا نستخدم مفتاحاً ثابتاً
+      # مع restore-keys بدل hashFiles على ملفات غير موجودة بعد.
       - name: Cache Gradle wrapper & dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/wrapper
             ~/.gradle/caches
-          key: gradle-${{ runner.os }}-${{ hashFiles('artifacts/download-max/android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: gradle-${{ runner.os }}-v1
           restore-keys: gradle-${{ runner.os }}-
 
       - name: Cache pnpm store
