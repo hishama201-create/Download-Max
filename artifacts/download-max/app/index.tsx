@@ -1,10 +1,13 @@
 import { Feather } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
+import * as FileSystem from 'expo-file-system/legacy';
 import { useIncomingShare } from 'expo-sharing';
+import { VideoView, useVideoPlayer } from 'expo-video';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   Keyboard,
   Linking,
   Modal,
@@ -12,6 +15,7 @@ import {
   Pressable,
   RefreshControl,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -21,7 +25,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { DownloadItem, MediaType, useDownloads } from '@/context/DownloadContext';
-import { AccentKey, accentSwatches, ThemeMode, useAppSettings } from '@/context/SettingsContext';
+import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 const formats: Record<MediaType, { format: string; label: string; detail: string }[]> = {
   video: [
@@ -85,12 +89,13 @@ function useSafeIncomingShare() {
   return useIncomingShare();
 }
 
-function DownloadRow({ item, onRetry, onRemove, onShare, onOpen }: {
+function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault }: {
   item: DownloadItem;
   onRetry: () => void;
   onRemove: () => void;
   onShare: () => void;
   onOpen: () => void;
+  onVault: () => void;
 }) {
   const colors = useColors();
   const isActive = item.status === 'downloading' || item.status === 'queued';
@@ -134,6 +139,9 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen }: {
             <Pressable testID="share-file" accessibilityLabel="مشاركة الملف" onPress={onShare} style={styles.iconButton}>
               <Feather name="share-2" size={18} color={colors.primary} />
             </Pressable>
+            <Pressable testID="vault-file" accessibilityLabel="نقل إلى الخزنة" onPress={onVault} style={styles.iconButton}>
+              <Feather name="lock" size={16} color={colors.primary} />
+            </Pressable>
           </>
         ) : item.status === 'failed' ? (
           <Pressable testID="retry-download" accessibilityLabel="إعادة المحاولة" onPress={onRetry} style={styles.iconButton}>
@@ -152,16 +160,210 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen }: {
 
 type Palette = ReturnType<typeof useColors>;
 
+function PinPad({ draft, colors, onDigit, onDelete }: {
+  draft: string;
+  colors: Palette;
+  onDigit: (digit: string) => void;
+  onDelete: () => void;
+}) {
+  const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
+  return (
+    <View>
+      <View style={styles.pinDots}>
+        {[0, 1, 2, 3].map((index) => (
+          <View key={index} style={[styles.pinDot, { borderColor: colors.border }, draft.length > index && { backgroundColor: colors.primary, borderColor: colors.primary }]} />
+        ))}
+      </View>
+      <View style={styles.pinGrid}>
+        {keys.map((key) => (
+          <Pressable key={key} onPress={() => onDigit(key)} style={[styles.pinKey, { backgroundColor: colors.background, borderColor: colors.border }]}>
+            <Text style={[styles.pinKeyText, { color: colors.foreground }]}>{key}</Text>
+          </Pressable>
+        ))}
+        <View style={styles.pinKey} />
+        <Pressable onPress={() => onDigit('0')} style={[styles.pinKey, { backgroundColor: colors.background, borderColor: colors.border }]}>
+          <Text style={[styles.pinKeyText, { color: colors.foreground }]}>0</Text>
+        </Pressable>
+        <Pressable onPress={onDelete} style={styles.pinKey} accessibilityLabel="حذف الرقم">
+          <Feather name="delete" size={21} color={colors.mutedForeground} />
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut, onRemove }: {
+  colors: Palette;
+  pin: string | null;
+  setPin: (value: string | null) => void;
+  vaultItems: DownloadItem[];
+  onBack: () => void;
+  onOpen: (item: DownloadItem) => void;
+  onMoveOut: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  const [unlocked, setUnlocked] = useState(false);
+  const [stage, setStage] = useState<'entry' | 'create' | 'confirm'>(pin ? 'entry' : 'create');
+  const [draft, setDraft] = useState('');
+  const [firstPin, setFirstPin] = useState('');
+  const [error, setError] = useState(false);
+  const [filter, setFilter] = useState<MediaType | 'all'>('all');
+
+  function complete(code: string) {
+    setDraft('');
+    if (stage === 'entry') {
+      if (code === pin) {
+        setError(false);
+        setUnlocked(true);
+      } else {
+        setError(true);
+      }
+    } else if (stage === 'create') {
+      setFirstPin(code);
+      setStage('confirm');
+    } else {
+      if (code === firstPin) {
+        setPin(code);
+        setError(false);
+        setUnlocked(true);
+      } else {
+        setError(true);
+        setFirstPin('');
+        setStage('create');
+      }
+    }
+  }
+
+  function pressDigit(digit: string) {
+    if (draft.length >= 4) return;
+    const next = draft + digit;
+    setDraft(next);
+    if (next.length === 4) setTimeout(() => complete(next), 160);
+  }
+
+  const filtered = filter === 'all' ? vaultItems : vaultItems.filter((item) => item.type === filter);
+
+  return (
+    <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+      <View style={styles.panelHeader}>
+        <Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable>
+        <Text style={[styles.panelTitle, { color: colors.foreground }]}>Vault · الخزنة</Text>
+        <View style={{ width: 34 }} />
+      </View>
+
+      {!unlocked ? (
+        <View style={styles.vaultLockWrap}>
+          <View style={[styles.vaultLockIcon, { backgroundColor: `${colors.primary}14` }]}>
+            <Feather name={pin ? 'lock' : 'shield'} size={34} color={colors.primary} />
+          </View>
+          <Text style={[styles.vaultTitle, { color: colors.foreground }]}>{pin ? 'أدخل الرمز السري' : 'اختر رمزاً سرياً'}</Text>
+          <Text style={[styles.vaultSubtitle, { color: colors.mutedForeground }]}>
+            {pin ? 'رمز من 4 أرقام لفتح ملفاتك الخاصة' : stage === 'confirm' ? 'أعد إدخال الرمز للتأكيد' : 'احتفظ بملفاتك الخاصة هنا · لن تظهر في التشغيل أو التنزيلات'}
+          </Text>
+          {error ? <Text style={[styles.vaultError, { color: colors.destructive }]}>رمز خاطئ، حاول مرة أخرى</Text> : null}
+          <PinPad draft={draft} colors={colors} onDigit={pressDigit} onDelete={() => setDraft((current) => current.slice(0, -1))} />
+        </View>
+      ) : (
+        <>
+          <View style={styles.vaultOpenHeader}>
+            <Text style={[styles.vaultCount, { color: colors.mutedForeground }]}>{vaultItems.length} ملفات خاصة</Text>
+            <Pressable testID="lock-vault" accessibilityLabel="قفل الخزنة" onPress={() => { setUnlocked(false); setDraft(''); }} style={[styles.lockPill, { backgroundColor: colors.primary }]}>
+              <Feather name="lock" size={15} color={colors.primaryForeground} />
+              <Text style={[styles.lockPillText, { color: colors.primaryForeground }]}>LOCK</Text>
+            </Pressable>
+          </View>
+          <View style={styles.filterRow}>
+            {([{ key: 'all', label: 'الكل', icon: 'grid' }, { key: 'image', label: 'صور', icon: 'image' }, { key: 'audio', label: 'صوت', icon: 'headphones' }, { key: 'video', label: 'فيديو', icon: 'video' }] as { key: MediaType | 'all'; label: string; icon: keyof typeof Feather.glyphMap }[]).map((chip) => (
+              <Pressable key={chip.key} onPress={() => setFilter(chip.key)} style={[styles.filterChip, { backgroundColor: filter === chip.key ? colors.primary : colors.background, borderColor: filter === chip.key ? colors.primary : colors.border }]}>
+                <Feather name={chip.icon} size={14} color={filter === chip.key ? colors.primaryForeground : colors.mutedForeground} />
+                <Text style={[styles.filterText, { color: filter === chip.key ? colors.primaryForeground : colors.mutedForeground }]}>{chip.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+          {filtered.length === 0 ? (
+            <View style={styles.vaultEmpty}>
+              <View style={[styles.vaultEmptyFolder, { backgroundColor: `${colors.primary}12` }]}>
+                <Feather name="folder" size={40} color={colors.primary} />
+                <View style={[styles.vaultEmptyBadge, { backgroundColor: colors.primary }]}><Feather name="lock" size={11} color={colors.primaryForeground} /></View>
+              </View>
+              <Text style={[styles.vaultTitle, { color: colors.foreground }]}>احتفظ بملفاتك الخاصة هنا</Text>
+              <Text style={[styles.vaultSubtitle, { color: colors.mutedForeground }]}>الملفات في الخزنة لن تُرى في تبويب التشغيل أو قائمة التنزيلات</Text>
+            </View>
+          ) : (
+            <View style={styles.vaultList}>
+              {filtered.map((item) => (
+                <View key={item.id} style={[styles.downloadRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                  <View style={[styles.fileIcon, { backgroundColor: `${colors.primary}16` }]}>
+                    <Feather name={typeIcons[item.type]} size={19} color={colors.primary} />
+                  </View>
+                  <View style={styles.rowBody}>
+                    <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
+                    <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>{typeLabels[item.type]} · {formatBytes(item.totalBytes)}</Text>
+                  </View>
+                  <View style={styles.rowActions}>
+                    <Pressable accessibilityLabel="تشغيل" onPress={() => onOpen(item)} style={[styles.iconButton, styles.openButton, { backgroundColor: colors.primary }]}>
+                      <Feather name="play" size={14} color={colors.primaryForeground} />
+                    </Pressable>
+                    <Pressable accessibilityLabel="إخراج من الخزنة" onPress={() => onMoveOut(item.id)} style={styles.iconButton}>
+                      <Feather name="unlock" size={16} color={colors.primary} />
+                    </Pressable>
+                    <Pressable accessibilityLabel="حذف نهائي" onPress={() => onRemove(item.id)} style={styles.iconButton}>
+                      <Feather name="trash-2" size={16} color={colors.destructive} />
+                    </Pressable>
+                  </View>
+                </View>
+              ))}
+            </View>
+          )}
+        </>
+      )}
+    </Pressable>
+  );
+}
+
+function MediaCard({ item, onPress, colors }: { item: DownloadItem; onPress: () => void; colors: Palette }) {
+  return (
+    <Pressable onPress={onPress} style={[styles.mediaCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+      {item.type === 'image' && item.fileUri ? (
+        <Image source={{ uri: item.fileUri }} style={styles.mediaCardArt} resizeMode="cover" />
+      ) : (
+        <View style={[styles.mediaCardArt, styles.mediaCardPlaceholder, { backgroundColor: `${colors.primary}10` }]}>
+          <Feather name={typeIcons[item.type]} size={30} color={colors.primary} />
+        </View>
+      )}
+      <View style={styles.mediaCardPlay}>
+        <Feather name="play" size={13} color="#fff" />
+      </View>
+      <Text style={[styles.mediaCardTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
+      <Text style={[styles.mediaCardMeta, { color: colors.mutedForeground }]}>{typeLabels[item.type]} · {formatBytes(item.totalBytes)}</Text>
+    </Pressable>
+  );
+}
+
+function PlayerBody({ item }: { item: DownloadItem }) {
+  const player = useVideoPlayer(item.fileUri ? { uri: item.fileUri } : null, (instance) => {
+    instance.loop = false;
+  });
+  useEffect(() => {
+    player.play();
+  }, [player]);
+  return <VideoView style={styles.videoView} player={player} contentFit="contain" fullscreenOptions={{ enable: true }} />;
+}
+
 function FeatureRow({ icon, text, colors }: { icon: keyof typeof Feather.glyphMap; text: string; colors: Palette }) {
   return <View style={styles.featureRow}><View style={[styles.featureIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name={icon} size={16} color={colors.primary} /></View><Text style={[styles.featureText, { color: colors.foreground }]}>{text}</Text></View>;
 }
 
-function SettingsPanel({ colors, themeMode, accent, onThemeChange, onAccentChange, onBack }: {
+function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, onThemeChange, onAccentChange, onMaxTasks, onAllowMobileData, onBack }: {
   colors: Palette;
   themeMode: ThemeMode;
   accent: AccentKey;
+  maxTasks: MaxTasks;
+  allowMobileData: boolean;
   onThemeChange: (mode: ThemeMode) => void;
   onAccentChange: (value: AccentKey) => void;
+  onMaxTasks: (value: MaxTasks) => void;
+  onAllowMobileData: (value: boolean) => void;
   onBack: () => void;
 }) {
   const themeOptions: { value: ThemeMode; label: string; icon: keyof typeof Feather.glyphMap }[] = [
@@ -181,6 +383,22 @@ function SettingsPanel({ colors, themeMode, accent, onThemeChange, onAccentChang
     <View style={styles.colorOptions}>
       {(Object.keys(accentSwatches) as AccentKey[]).map((key) => <Pressable key={key} testID={`accent-${key}`} accessibilityLabel={`اختيار اللون ${key}`} onPress={() => onAccentChange(key)} style={[styles.colorOption, { backgroundColor: accentSwatches[key] }, accent === key && styles.colorOptionSelected]}><Feather name="check" size={17} color="#fff" style={{ opacity: accent === key ? 1 : 0 }} /></Pressable>)}
     </View>
+    <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 27 }]}>التنزيلات المتزامنة</Text>
+    <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>كم ملفاً يُنزّل في نفس الوقت</Text>
+    <View style={styles.queueOptions}>
+      {([1, 2, 3] as const).map((value) => (
+        <Pressable key={value} testID={`max-tasks-${value}`} accessibilityLabel={`${value} مهام متزامنة`} onPress={() => onMaxTasks(value)} style={[styles.queueOption, { backgroundColor: colors.background, borderColor: maxTasks === value ? colors.primary : colors.border }]}>
+          <Text style={[styles.themeOptionText, { color: maxTasks === value ? colors.primary : colors.mutedForeground }]}>{value}</Text>
+        </Pressable>
+      ))}
+    </View>
+    <View style={[styles.switchRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
+      <View style={{ flex: 1, paddingRight: 10 }}>
+        <Text style={[styles.settingsLabel, { color: colors.foreground, fontSize: 13 }]}>التنزيل عبر بيانات الجوال</Text>
+        <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>عند الإيقاف ينتظر التطبيق شبكة Wi-Fi</Text>
+      </View>
+      <Switch testID="mobile-data-switch" value={allowMobileData} onValueChange={onAllowMobileData} trackColor={{ true: colors.primary, false: colors.input }} thumbColor="#ffffff" />
+    </View>
     <View style={[styles.settingsNote, { backgroundColor: colors.background, borderColor: colors.border }]}><Feather name="info" size={17} color={colors.primary} /><Text style={[styles.settingsNoteText, { color: colors.mutedForeground }]}>يتم حفظ اختياراتك تلقائياً على هذا الجهاز.</Text></View>
   </Pressable>;
 }
@@ -198,18 +416,26 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile } = useDownloads();
-  const { themeMode, accent, hasSeenOnboarding, setThemeMode, setAccent, completeOnboarding } = useAppSettings();
+  const { items, activeCount, waitingForWifi, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions } = useDownloads();
+  const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'home' | 'downloads'>('home');
+  const [activeTab, setActiveTab] = useState<'home' | 'downloads' | 'play'>('home');
   const [mediaFilter, setMediaFilter] = useState<MediaType | 'all'>('all');
   const [mediaType, setMediaType] = useState<MediaType>('video');
   const [selectedFormat, setSelectedFormat] = useState('mp4');
   const [showFormatSheet, setShowFormatSheet] = useState(false);
-  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | null>(null);
+  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showSearch, setShowSearch] = useState(false);
+  const [nowPlaying, setNowPlaying] = useState<DownloadItem | null>(null);
+
+  // مزامنة إعدادات الطابور (المهام المتزامنة + بيانات الجوال) مع سياق التنزيل.
+  useEffect(() => {
+    setQueueOptions({ maxTasks, allowMobileData });
+  }, [maxTasks, allowMobileData, setQueueOptions]);
 
   useEffect(() => {
     const shared = resolvedSharedPayloads[0];
@@ -227,10 +453,24 @@ export default function HomeScreen() {
   const hasValidUrl = /^https?:\/\/\S+$/i.test(url);
   const selectedOption = formats[mediaType].find((option) => option.format === selectedFormat) ?? formats[mediaType][0];
   const downloadItems = useMemo(() => [...items].sort((a, b) => b.createdAt - a.createdAt), [items]);
-  const filteredItems = useMemo(
-    () => mediaFilter === 'all' ? downloadItems : downloadItems.filter((item) => item.type === mediaFilter),
-    [downloadItems, mediaFilter],
+  const visibleItems = useMemo(() => downloadItems.filter((item) => !item.inVault), [downloadItems]);
+  const vaultItems = useMemo(() => downloadItems.filter((item) => item.inVault && item.status === 'completed'), [downloadItems]);
+  const searchableItems = useMemo(
+    () => visibleItems.filter((item) => item.title.toLowerCase().includes(searchQuery.trim().toLowerCase())),
+    [visibleItems, searchQuery],
   );
+  const filteredItems = useMemo(
+    () => mediaFilter === 'all' ? searchableItems : searchableItems.filter((item) => item.type === mediaFilter),
+    [searchableItems, mediaFilter],
+  );
+  const playableItems = useMemo(
+    () => visibleItems.filter((item) => item.status === 'completed' && item.fileUri),
+    [visibleItems],
+  );
+  const stats = useMemo(() => ({
+    total: visibleItems.filter((item) => item.status === 'completed').length,
+    bytes: visibleItems.reduce((sum, item) => sum + (item.totalBytes ?? 0), 0),
+  }), [visibleItems]);
 
   function changeType(type: MediaType) {
     setMediaType(type);
@@ -267,6 +507,16 @@ export default function HomeScreen() {
 
   function showOpen(item: DownloadItem) {
     void openFile(item);
+  }
+
+  function openInPlayer(item: DownloadItem) {
+    setPanel(null);
+    setNowPlaying(item);
+  }
+
+  function vaultAction(item: DownloadItem) {
+    void moveToVault(item.id);
+    setNotice('نُقل الملف إلى الخزنة 🔒');
   }
 
   return (
@@ -367,7 +617,7 @@ export default function HomeScreen() {
               </>
             )}
           />
-        ) : (
+        ) : activeTab === 'downloads' ? (
           <FlatList
             data={filteredItems}
             keyExtractor={(item) => item.id}
@@ -378,10 +628,34 @@ export default function HomeScreen() {
                 <View style={styles.downloadsHeader}>
                   <View>
                     <Text style={[styles.pageTitle, { color: colors.foreground }]}>التنزيلات</Text>
-                    <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>{downloadItems.length ? `${downloadItems.length} ملفات في السجل` : 'كل ما نزلته يظهر هنا'}</Text>
+                    <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>{visibleItems.length ? `${visibleItems.length} ملفات · ${stats.total} مكتمل · ${formatBytes(stats.bytes)}` : 'كل ما نزلته يظهر هنا'}</Text>
                   </View>
-                  {downloadItems.some((item) => item.status === 'completed') ? <Pressable onPress={clearCompleted}><Text style={[styles.clearCompleted, { color: colors.primary }]}>مسح المكتمل</Text></Pressable> : null}
+                  <View style={styles.headerActions}>
+                    <Pressable testID="toggle-search" accessibilityLabel="بحث في التنزيلات" onPress={() => { setShowSearch((value) => !value); setSearchQuery(''); }} style={styles.headerActionButton}>
+                      <Feather name={showSearch ? 'x' : 'search'} size={18} color={colors.primary} />
+                    </Pressable>
+                    {downloadItems.some((item) => item.status === 'completed') ? <Pressable onPress={clearCompleted}><Text style={[styles.clearCompleted, { color: colors.primary }]}>مسح المكتمل</Text></Pressable> : null}
+                  </View>
                 </View>
+                {showSearch ? (
+                  <View style={[styles.searchWrap, { backgroundColor: colors.background, borderColor: colors.input }]}>
+                    <Feather name="search" size={17} color={colors.mutedForeground} />
+                    <TextInput
+                      value={searchQuery}
+                      onChangeText={setSearchQuery}
+                      placeholder="ابحث باسم الملف..."
+                      placeholderTextColor={colors.mutedForeground}
+                      style={[styles.searchInput, { color: colors.foreground }]}
+                      returnKeyType="search"
+                    />
+                  </View>
+                ) : null}
+                {waitingForWifi && activeCount > 0 ? (
+                  <View style={[styles.wifiBanner, { backgroundColor: `${colors.primary}12`, borderColor: `${colors.primary}44` }]}>
+                    <Feather name="wifi-off" size={16} color={colors.primary} />
+                    <Text style={[styles.wifiBannerText, { color: colors.primary }]}>بانتظار اتصال Wi-Fi — التنزيل عبر بيانات الجوال معطّل من الإعدادات</Text>
+                  </View>
+                ) : null}
                 <View style={styles.filterRow}>
                   {([{ key: 'all', label: 'الكل', icon: 'grid' }, { key: 'video', label: 'فيديو', icon: 'video' }, { key: 'audio', label: 'صوت', icon: 'headphones' }, { key: 'image', label: 'صور', icon: 'image' }] as { key: MediaType | 'all'; label: string; icon: keyof typeof Feather.glyphMap }[]).map((filter) => <Pressable key={filter.key} onPress={() => setMediaFilter(filter.key)} style={[styles.filterChip, { backgroundColor: mediaFilter === filter.key ? colors.primary : colors.card, borderColor: mediaFilter === filter.key ? colors.primary : colors.border }]}><Feather name={filter.icon} size={14} color={mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground} /><Text style={[styles.filterText, { color: mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground }]}>{filter.label}</Text></Pressable>)}
                 </View>
@@ -389,8 +663,30 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} onRetry={() => void retryDownload(item.id)} onRemove={() => void removeDownload(item.id)} onShare={() => showShare(item)} onOpen={() => showOpen(item)} />}
+            renderItem={({ item }) => <DownloadRow item={item} onRetry={() => void retryDownload(item.id)} onRemove={() => void removeDownload(item.id)} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          />
+        ) : (
+          <FlatList
+            data={playableItems}
+            keyExtractor={(item) => item.id}
+            numColumns={2}
+            columnWrapperStyle={styles.playColumn}
+            refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} tintColor={colors.primary} />}
+            contentContainerStyle={[styles.downloadsContent, playableItems.length === 0 && styles.emptyList]}
+            ListHeaderComponent={
+              <View style={styles.downloadsHeader}>
+                <View>
+                  <Text style={[styles.pageTitle, { color: colors.foreground }]}>التشغيل</Text>
+                  <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>شاهد واستمع لملفاتك داخل التطبيق</Text>
+                </View>
+                <View style={[styles.playBadge, { backgroundColor: `${colors.primary}14` }]}>
+                  <Feather name="play-circle" size={19} color={colors.primary} />
+                </View>
+              </View>
+            }
+            ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="play-circle" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>لا توجد ملفات للتشغيل بعد</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>أكمل تنزيل فيديو أو صوت أو صورة وسيظهر هنا لتشغيله فوراً.</Text></View>}
+            renderItem={({ item }) => <MediaCard item={item} colors={colors} onPress={() => openInPlayer(item)} />}
           />
         )}
       </View>
@@ -403,6 +699,10 @@ export default function HomeScreen() {
         <Pressable testID="tab-downloads" accessibilityLabel="التنزيلات" onPress={() => setActiveTab('downloads')} style={styles.navItem}>
           <View><Feather name="download" size={21} color={activeTab === 'downloads' ? colors.primary : colors.mutedForeground} />{activeCount > 0 ? <View style={[styles.navDot, { backgroundColor: colors.primary }]} /> : null}</View>
           <Text style={[styles.navLabel, { color: activeTab === 'downloads' ? colors.primary : colors.mutedForeground }]}>التنزيلات</Text>
+        </Pressable>
+        <Pressable testID="tab-play" accessibilityLabel="التشغيل" onPress={() => setActiveTab('play')} style={styles.navItem}>
+          <Feather name="play-circle" size={21} color={activeTab === 'play' ? colors.primary : colors.mutedForeground} />
+          <Text style={[styles.navLabel, { color: activeTab === 'play' ? colors.primary : colors.mutedForeground }]}>التشغيل</Text>
         </Pressable>
       </View>
 
@@ -431,17 +731,32 @@ export default function HomeScreen() {
               <View style={[styles.drawerDivider, { backgroundColor: colors.border }]} />
               <Pressable onPress={() => { setPanel(null); setActiveTab('home'); }} style={styles.menuItem}><Feather name="home" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الرئيسية</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => { setPanel(null); setActiveTab('downloads'); }} style={styles.menuItem}><Feather name="download" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>التنزيلات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
+              <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><Feather name="lock" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.0.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
-            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} onThemeChange={setThemeMode} onAccentChange={setAccent} onBack={() => setPanel('menu')} />
+            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onBack={() => setPanel('menu')} />
+          ) : panel === 'vault' ? (
+            <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={openInPlayer} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : (
             <AboutPanel colors={colors} onBack={() => setPanel('menu')} />
           )}
         </Pressable>
       </Modal>
+
+      {nowPlaying ? (
+        <Modal visible transparent animationType="slide" onRequestClose={() => setNowPlaying(null)}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setNowPlaying(null)}>
+            <Pressable style={[styles.sheet, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+              <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
+              <Text style={[styles.sheetTitle, { color: colors.foreground }]} numberOfLines={1}>{nowPlaying.title}</Text>
+              <PlayerBody item={nowPlaying} />
+            </Pressable>
+          </Pressable>
+        </Modal>
+      ) : null}
 
       <Modal visible={!hasSeenOnboarding} transparent animationType="fade" onRequestClose={completeOnboarding}>
         <View style={styles.onboardingBackdrop}>
@@ -468,6 +783,42 @@ export default function HomeScreen() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },
+  headerActionButton: { width: 34, height: 34, borderRadius: 12, borderWidth: 1, justifyContent: 'center', alignItems: 'center' },
+  searchWrap: { minHeight: 44, borderRadius: 13, borderWidth: 1, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 },
+  searchInput: { flex: 1, fontSize: 13, minHeight: 42, textAlign: 'left' },
+  wifiBanner: { borderRadius: 13, borderWidth: 1, padding: 11, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
+  wifiBannerText: { flex: 1, fontSize: 11, fontWeight: '700', lineHeight: 16 },
+  playColumn: { gap: 12 },
+  playBadge: { width: 42, height: 42, borderRadius: 15, justifyContent: 'center', alignItems: 'center' },
+  mediaCard: { flex: 1, borderRadius: 18, borderWidth: 1, padding: 12, minHeight: 170, justifyContent: 'flex-end' },
+  mediaCardArt: { width: '100%', height: 84, borderRadius: 13, marginBottom: 10 },
+  mediaCardPlaceholder: { justifyContent: 'center', alignItems: 'center' },
+  mediaCardPlay: { position: 'absolute', top: 41, left: 0, right: 0, alignItems: 'center' },
+  mediaCardTitle: { fontSize: 12, fontWeight: '800' },
+  mediaCardMeta: { fontSize: 10, marginTop: 3 },
+  videoView: { width: '100%', aspectRatio: 16 / 9, borderRadius: 14, backgroundColor: '#000', marginTop: 6 },
+  pinDots: { flexDirection: 'row', justifyContent: 'center', gap: 14, marginTop: 18 },
+  pinDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 2 },
+  pinGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 10, marginTop: 22, width: 252, alignSelf: 'center' },
+  pinKey: { width: 77, height: 56, borderRadius: 15, borderWidth: 1, justifyContent: 'center', alignItems: 'center' },
+  pinKeyText: { fontSize: 20, fontWeight: '800' },
+  vaultLockWrap: { alignItems: 'center', paddingTop: 8 },
+  vaultLockIcon: { width: 76, height: 76, borderRadius: 26, justifyContent: 'center', alignItems: 'center', marginBottom: 16 },
+  vaultTitle: { fontSize: 19, fontWeight: '800', marginTop: 4 },
+  vaultSubtitle: { fontSize: 12, lineHeight: 18, textAlign: 'center', marginTop: 7, maxWidth: 290 },
+  vaultError: { fontSize: 12, fontWeight: '700', marginTop: 12 },
+  vaultOpenHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  vaultCount: { fontSize: 12, fontWeight: '700' },
+  lockPill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 13, paddingVertical: 9, borderRadius: 12 },
+  lockPillText: { fontSize: 11, fontWeight: '800', letterSpacing: 1 },
+  vaultEmpty: { flex: 1, minHeight: 300, justifyContent: 'center', alignItems: 'center' },
+  vaultEmptyFolder: { width: 92, height: 92, borderRadius: 30, justifyContent: 'center', alignItems: 'center', marginBottom: 16 },
+  vaultEmptyBadge: { position: 'absolute', bottom: -6, right: -6, width: 26, height: 26, borderRadius: 13, justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#ffffff' },
+  vaultList: { gap: 10, paddingBottom: 8 },
+  queueOptions: { flexDirection: 'row', gap: 8, marginTop: 14 },
+  queueOption: { flex: 1, minHeight: 56, borderRadius: 12, borderWidth: 1, justifyContent: 'center', alignItems: 'center' },
+  switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 16, borderRadius: 15, borderWidth: 1, padding: 13 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 20, paddingTop: 16, paddingBottom: 13 },
   brandLine: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   brandMark: { width: 30, height: 30, borderRadius: 10, justifyContent: 'center', alignItems: 'center' },

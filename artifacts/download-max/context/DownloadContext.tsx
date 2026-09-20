@@ -1,9 +1,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
 import * as Sharing from 'expo-sharing';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
+import { MaxTasks } from '@/context/SettingsContext';
 
 const STORAGE_KEY = '@download-max/downloads';
 
@@ -30,6 +32,7 @@ export type DownloadItem = {
   totalBytes?: number;
   fileUri?: string;
   error?: string;
+  inVault?: boolean;
   createdAt: number;
 };
 
@@ -42,6 +45,10 @@ type DownloadContextValue = {
   clearCompleted: () => Promise<void>;
   openFile: (item: DownloadItem) => Promise<void>;
   shareFile: (item: DownloadItem) => Promise<void>;
+  moveToVault: (id: string) => Promise<void>;
+  removeFromVault: (id: string) => Promise<void>;
+  setQueueOptions: (options: { maxTasks: MaxTasks; allowMobileData: boolean }) => void;
+  waitingForWifi: boolean;
 };
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -112,11 +119,15 @@ async function resolveMediaUrl(sourceUrl: string): Promise<string> {
 
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<DownloadItem[]>([]);
+  const [waitingForWifi, setWaitingForWifi] = useState(false);
 
   // مراجع تعمل خارج دورة الرسم لإدارة الطابور بأمان.
   const itemsRef = useRef<DownloadItem[]>([]);
   const queueRef = useRef<string[]>([]);
-  const activeIdRef = useRef<string | null>(null);
+  const activeIdsRef = useRef<Set<string>>(new Set());
+  const maxTasksRef = useRef<MaxTasks>(2);
+  const allowMobileDataRef = useRef(true);
+  const canDownloadRef = useRef(true);
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
   const progressRef = useRef(new Map<string, { progress: number; at: number }>());
   const bytesRef = useRef(new Map<string, { bytesWritten: number; totalBytes?: number }>());
@@ -140,7 +151,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const runJob = useCallback(async (id: string) => {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item) {
-      activeIdRef.current = null;
+      activeIdsRef.current.delete(id);
       pumpRef.current();
       return;
     }
@@ -149,7 +160,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
     if (Platform.OS === 'web') {
       await patchItem(id, { status: 'failed', error: 'التنزيل المباشر متاح من تطبيق Android فقط.' });
-      activeIdRef.current = null;
+      activeIdsRef.current.delete(id);
       pumpRef.current();
       return;
     }
@@ -213,14 +224,19 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       });
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     } finally {
-      activeIdRef.current = null;
+      activeIdsRef.current.delete(id);
       pumpRef.current();
     }
   }, [patchItem]);
 
-  /** يشغّل المهمة التالية في الطابور إن لم يكن هناك تنزيل نشط. */
+  /** يشغّل المهام التالية في الطابور حتى بلوغ حد التنزيلات المتزامنة. */
   const pump = useCallback(() => {
-    if (activeIdRef.current) return;
+    if (activeIdsRef.current.size >= maxTasksRef.current) return;
+    if (!canDownloadRef.current) {
+      setWaitingForWifi(queueRef.current.length > 0);
+      return;
+    }
+    setWaitingForWifi(false);
     const nextId = queueRef.current.shift();
     if (!nextId) return;
     const item = itemsRef.current.find((candidate) => candidate.id === nextId);
@@ -228,8 +244,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       pumpRef.current(); // تخطي العناصر المحذوفة أو المنتهية
       return;
     }
-    activeIdRef.current = nextId;
+    activeIdsRef.current.add(nextId);
     runJobRef.current(nextId);
+    if (activeIdsRef.current.size < maxTasksRef.current && queueRef.current.length > 0) {
+      pumpRef.current();
+    }
   }, []);
 
   const enqueue = useCallback((id: string) => {
@@ -243,6 +262,22 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     };
     pumpRef.current = pump;
   }, [runJob, pump]);
+
+  // مراقبة الاتصال: احترام إعداد "التنزيل عبر بيانات الجوال".
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    const update = (state: NetInfoState) => {
+      const isConnected = !!state.isConnected && !!state.isInternetReachable;
+      const isCellular = state.type === 'cellular';
+      canDownloadRef.current = isConnected && (!isCellular || allowMobileDataRef.current);
+      pumpRef.current();
+    };
+    const unsubscribe = NetInfo.addEventListener(update);
+    NetInfo.fetch().then(update).catch(() => undefined);
+    return () => {
+      unsubscribe();
+    };
+  }, []);
 
   // استرجاع السجل عند الإقلاع وإعادة جدولة أي تنزيلات معلّقة.
   useEffect(() => {
@@ -323,16 +358,36 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     await openDownloadedFile(item);
   }, []);
 
+  const moveToVault = useCallback(async (id: string) => {
+    patchItem(id, { inVault: true });
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+  }, [patchItem]);
+
+  const removeFromVault = useCallback(async (id: string) => {
+    patchItem(id, { inVault: false });
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [patchItem]);
+
+  const setQueueOptions = useCallback((options: { maxTasks: MaxTasks; allowMobileData: boolean }) => {
+    maxTasksRef.current = options.maxTasks;
+    allowMobileDataRef.current = options.allowMobileData;
+    pumpRef.current();
+  }, []);
+
   const value = useMemo(() => ({
     items,
     activeCount: items.filter((item) => item.status === 'queued' || item.status === 'downloading').length,
+    waitingForWifi,
     addDownload,
     retryDownload,
     removeDownload,
     clearCompleted,
     openFile,
     shareFile,
-  }), [items, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile]);
+    moveToVault,
+    removeFromVault,
+    setQueueOptions,
+  }), [items, waitingForWifi, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

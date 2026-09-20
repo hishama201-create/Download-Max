@@ -3,6 +3,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type AccentKey = 'blue' | 'violet' | 'emerald' | 'coral' | 'orange';
+export type MaxTasks = 1 | 2 | 3;
 export const accentSwatches: Record<AccentKey, string> = {
   blue: '#2f7df6',
   violet: '#7657e8',
@@ -15,8 +16,14 @@ type SettingsValue = {
   themeMode: ThemeMode;
   accent: AccentKey;
   hasSeenOnboarding: boolean;
+  maxTasks: MaxTasks;
+  allowMobileData: boolean;
+  vaultPin: string | null;
   setThemeMode: (mode: ThemeMode) => void;
   setAccent: (accent: AccentKey) => void;
+  setMaxTasks: (value: MaxTasks) => void;
+  setAllowMobileData: (value: boolean) => void;
+  setVaultPin: (pin: string | null) => void;
   completeOnboarding: () => void;
 };
 
@@ -27,6 +34,10 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [themeMode, setThemeModeState] = useState<ThemeMode>('system');
   const [accent, setAccentState] = useState<AccentKey>('blue');
   const [hasSeenOnboarding, setHasSeenOnboarding] = useState(false);
+  const [maxTasks, setMaxTasksState] = useState<MaxTasks>(2);
+  const [allowMobileData, setAllowMobileDataState] = useState(true);
+  const [vaultPin, setVaultPinState] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY)
@@ -36,11 +47,15 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
         if (parsed.themeMode) setThemeModeState(parsed.themeMode);
         if (parsed.accent) setAccentState(parsed.accent);
         if (parsed.hasSeenOnboarding) setHasSeenOnboarding(true);
+        if (parsed.maxTasks === 1 || parsed.maxTasks === 2 || parsed.maxTasks === 3) setMaxTasksState(parsed.maxTasks);
+        if (typeof parsed.allowMobileData === 'boolean') setAllowMobileDataState(parsed.allowMobileData);
+        if (typeof parsed.vaultPin === 'string' || parsed.vaultPin === null) setVaultPinState(parsed.vaultPin ?? null);
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => setLoaded(true));
   }, []);
 
-  const save = useCallback((patch: Partial<Pick<SettingsValue, 'themeMode' | 'accent' | 'hasSeenOnboarding'>>) => {
+  const save = useCallback((patch: Partial<Pick<SettingsValue, 'themeMode' | 'accent' | 'hasSeenOnboarding' | 'maxTasks' | 'allowMobileData' | 'vaultPin'>>) => {
     void AsyncStorage.mergeItem(STORAGE_KEY, JSON.stringify(patch));
   }, []);
 
@@ -59,14 +74,36 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     save({ hasSeenOnboarding: true });
   }, [save]);
 
+  const setMaxTasks = useCallback((value: MaxTasks) => {
+    setMaxTasksState(value);
+    save({ maxTasks: value });
+  }, [save]);
+
+  const setAllowMobileData = useCallback((value: boolean) => {
+    setAllowMobileDataState(value);
+    save({ allowMobileData: value });
+  }, [save]);
+
+  const setVaultPin = useCallback((pin: string | null) => {
+    setVaultPinState(pin);
+    save({ vaultPin: pin });
+  }, [save]);
+
   const value = useMemo(() => ({
     themeMode,
     accent,
     hasSeenOnboarding,
+    maxTasks,
+    allowMobileData,
+    vaultPin,
+    loaded,
     setThemeMode,
     setAccent,
+    setMaxTasks,
+    setAllowMobileData,
+    setVaultPin,
     completeOnboarding,
-  }), [themeMode, accent, hasSeenOnboarding, setThemeMode, setAccent, completeOnboarding]);
+  }), [themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, loaded, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding]);
 
   return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
 }
