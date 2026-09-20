@@ -333,6 +333,56 @@ function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut
   );
 }
 
+/** حساب الأيام المتبقية قبل الحذف التلقائي من سلة المحذوفات (30 يوماً). */
+function daysLeftInTrash(deletedAt: number) {
+  const elapsed = Date.now() - deletedAt;
+  const remaining = Math.ceil((30 * 24 * 60 * 60 * 1000 - elapsed) / (24 * 60 * 60 * 1000));
+  return Math.max(remaining, 0);
+}
+
+function TrashPanel({ colors, trashItems, onBack, onRestore, onDelete, onEmpty }: {
+  colors: Palette;
+  trashItems: DownloadItem[];
+  onBack: () => void;
+  onRestore: (id: string) => void;
+  onDelete: (id: string) => void;
+  onEmpty: () => void;
+}) {
+  return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+    <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>سلة المحذوفات</Text>{trashItems.length > 0 ? <Pressable onPress={onEmpty} accessibilityLabel="تفريغ السلة"><Feather name="trash-2" size={19} color={colors.destructive} /></Pressable> : <View style={{ width: 34 }} />}</View>
+    <Text style={[styles.settingsHint, { color: colors.mutedForeground, marginBottom: 8 }]}>تبقى الملفات 30 يوماً ثم تُحذف تلقائياً</Text>
+    {trashItems.length === 0 ? (
+      <View style={[styles.trashEmpty, { backgroundColor: colors.background, borderColor: colors.border }]}>
+        <View style={[styles.trashEmptyIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="trash-2" size={30} color={colors.primary} /></View>
+        <Text style={[styles.trashEmptyTitle, { color: colors.foreground }]}>السلة فارغة</Text>
+        <Text style={[styles.trashEmptyHint, { color: colors.mutedForeground }]}>الملفات المحذوفة تظهر هنا 30 يوماً قبل حذفها نهائياً</Text>
+      </View>
+    ) : (
+      trashItems.map((item) => (
+        <View key={item.id} style={[styles.trashRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
+          <View style={[styles.fileIcon, { backgroundColor: `${colors.mutedForeground}14` }]}>
+            <Feather name={typeIcons[item.type]} size={17} color={colors.mutedForeground} />
+          </View>
+          <View style={{ flex: 1, marginLeft: 10 }}>
+            <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
+            <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
+              {typeLabels[item.type]} · {formatBytes(item.totalBytes)} · يُحذف بعد {daysLeftInTrash(item.deletedAt!)} يوم
+            </Text>
+          </View>
+          <View style={styles.rowActions}>
+            <Pressable testID={`restore-${item.id}`} accessibilityLabel="استعادة الملف" onPress={() => onRestore(item.id)} style={styles.iconButton}>
+              <Feather name="rotate-ccw" size={17} color={colors.primary} />
+            </Pressable>
+            <Pressable testID={`purge-${item.id}`} accessibilityLabel="حذف نهائي" onPress={() => onDelete(item.id)} style={styles.iconButton}>
+              <Feather name="trash-2" size={17} color={colors.destructive} />
+            </Pressable>
+          </View>
+        </View>
+      ))
+    )}
+  </Pressable>;
+}
+
 function MediaCard({ item, onPress, colors }: { item: DownloadItem; onPress: () => void; colors: Palette }) {
   return (
     <Pressable onPress={onPress} style={[styles.mediaCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
@@ -441,7 +491,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.2.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.3.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -451,7 +501,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -460,7 +510,7 @@ export default function HomeScreen() {
   const [mediaType, setMediaType] = useState<MediaType>('video');
   const [selectedFormat, setSelectedFormat] = useState('mp4');
   const [showFormatSheet, setShowFormatSheet] = useState(false);
-  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | null>(null);
+  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -504,8 +554,9 @@ export default function HomeScreen() {
   const hasValidUrl = /^https?:\/\/\S+$/i.test(url);
   const selectedOption = formats[mediaType].find((option) => option.format === selectedFormat) ?? formats[mediaType][0];
   const downloadItems = useMemo(() => [...items].sort((a, b) => b.createdAt - a.createdAt), [items]);
-  const visibleItems = useMemo(() => downloadItems.filter((item) => !item.inVault), [downloadItems]);
-  const vaultItems = useMemo(() => downloadItems.filter((item) => item.inVault && item.status === 'completed'), [downloadItems]);
+  const visibleItems = useMemo(() => downloadItems.filter((item) => !item.inVault && !item.deletedAt), [downloadItems]);
+  const vaultItems = useMemo(() => downloadItems.filter((item) => item.inVault && !item.deletedAt && item.status === 'completed'), [downloadItems]);
+  const trashItems = useMemo(() => downloadItems.filter((item) => item.deletedAt), [downloadItems]);
   const searchableItems = useMemo(
     () => visibleItems.filter((item) => item.title.toLowerCase().includes(searchQuery.trim().toLowerCase())),
     [visibleItems, searchQuery],
@@ -795,14 +846,17 @@ export default function HomeScreen() {
               <Pressable onPress={() => { setPanel(null); setActiveTab('home'); }} style={styles.menuItem}><Feather name="home" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الرئيسية</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => { setPanel(null); setActiveTab('downloads'); }} style={styles.menuItem}><Feather name="download" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>التنزيلات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><Feather name="lock" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
+              <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.2.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.3.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
           ) : panel === 'vault' ? (
             <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={openInPlayer} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
+          ) : panel === 'trash' ? (
+            <TrashPanel colors={colors} trashItems={trashItems} onBack={() => setPanel('menu')} onRestore={(id) => { void restoreFromTrash(id); setNotice('أُعيد الملف إلى التنزيلات ✓'); }} onDelete={(id) => void deletePermanently(id)} onEmpty={() => { void emptyTrash(); setNotice('فُرّغت سلة المحذوفات 🗑️'); }} />
           ) : (
             <AboutPanel colors={colors} onBack={() => setPanel('menu')} />
           )}
@@ -949,6 +1003,11 @@ const styles = StyleSheet.create({
   dirActions: { flexDirection: 'row', gap: 9, marginTop: 10 },
   dirButton: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 15, paddingVertical: 10, borderRadius: 12 },
   dirButtonText: { fontSize: 13, fontWeight: '700' },
+  trashRow: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderRadius: 15, padding: 12, marginTop: 9 },
+  trashEmpty: { minHeight: 300, borderRadius: 20, borderWidth: 1, justifyContent: 'center', alignItems: 'center', padding: 24, marginTop: 12 },
+  trashEmptyIcon: { width: 74, height: 74, borderRadius: 26, justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
+  trashEmptyTitle: { fontSize: 16, fontWeight: '800', marginBottom: 5 },
+  trashEmptyHint: { fontSize: 12, textAlign: 'center', lineHeight: 19, paddingHorizontal: 12 },
   errorText: { fontSize: 10, lineHeight: 14, marginTop: 6 },
   rowActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 5, gap: 1 },
   iconButton: { padding: 7 },

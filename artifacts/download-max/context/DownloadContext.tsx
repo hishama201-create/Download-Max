@@ -9,6 +9,8 @@ import { MaxTasks } from '@/context/SettingsContext';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
+/** مدة بقاء الملفات في سلة المحذوفات قبل حذفها تلقائياً (30 يوماً). */
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * خدمة تحويل روابط الصفحات إلى روابط وسائط مباشرة.
@@ -34,6 +36,8 @@ export type DownloadItem = {
   fileUri?: string;
   error?: string;
   inVault?: boolean;
+  /** وقت النقل إلى سلة المحذوفات — وجوده يعني أن الملف في السلة. */
+  deletedAt?: number;
   createdAt: number;
 };
 
@@ -55,6 +59,12 @@ type DownloadContextValue = {
   /** مجلد التنزيل المختار (SAF URI) أو null للحفظ الداخلي. */
   downloadDir: string | null;
   setDownloadDir: (uri: string | null) => Promise<void>;
+  /** إعادة ملف من سلة المحذوفات إلى القائمة. */
+  restoreFromTrash: (id: string) => Promise<void>;
+  /** حذف ملف من السلة نهائياً مع ملفه الفعلي. */
+  deletePermanently: (id: string) => Promise<void>;
+  /** تفريغ سلة المحذوفات بالكامل. */
+  emptyTrash: () => Promise<void>;
 };
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -64,8 +74,55 @@ function createId() {
 }
 
 function safeFilename(title: string, format: string) {
-  const cleaned = title.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').slice(0, 54) || 'download';
+  // \p{L} يحافظ على الحروف العربية وكل اللغات في اسم الملف.
+  const cleaned = title.replace(/[^\p{L}\p{N}\s._-]/gu, '').trim().replace(/\s+/g, ' ').slice(0, 60) || 'download';
   return `${cleaned}.${format}`;
+}
+
+/** يحاول استخراج اسم ملف مقروء من مسار الرابط المباشر. */
+function prettyNameFromUrl(url: string): string | null {
+  try {
+    const last = new URL(url).pathname.split('/').filter(Boolean).pop();
+    if (!last) return null;
+    const decoded = decodeURIComponent(last).replace(/\.[^.]+$/, '').replace(/[-_+]+/g, ' ').trim();
+    // أسماء مثل 3a5f2c8d مجرد بصمات بلا فائدة — نتجاهلها إن لم تحوِ حروفًا كافية.
+    if (decoded.length < 3 || !/[\p{L}]{3,}/u.test(decoded)) return null;
+    return decoded.slice(0, 60);
+  } catch {
+    return null;
+  }
+}
+
+/** يجلب اسم الملف الحقيقي ونوعه من ترويسات الخادم قبل التنزيل. */
+async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string | null; mime: string | null }> {
+  try {
+    const response = await fetch(mediaUrl, { method: 'HEAD' });
+    const disposition = response.headers.get('content-disposition');
+    const mime = response.headers.get('content-type')?.split(';')[0]?.trim() ?? null;
+    let filename: string | null = null;
+    if (disposition) {
+      const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+      const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+      const raw = utf8Match?.[1] ?? plainMatch?.[1] ?? null;
+      if (raw) {
+        try {
+          filename = decodeURIComponent(raw);
+        } catch {
+          filename = raw;
+        }
+      }
+    }
+    return { filename: filename?.trim() || null, mime };
+  } catch {
+    return { filename: null, mime: null };
+  }
+}
+
+/** يستنتج امتداداً صحيحاً من نوع MIME المُرجَع من الخادم. */
+function extFromMime(mime: string | null): string | null {
+  if (!mime) return null;
+  const entry = Object.entries(MIME_TYPES).find(([, value]) => value === mime);
+  return entry?.[0] ?? null;
 }
 
 function looksLikeDirectMedia(url: string) {
@@ -80,13 +137,14 @@ function typeFromMime(mimeType: string | null): MediaType {
   return 'video';
 }
 
-/** يفصل امتداد الملف من اسمه الأصلي أو من نوع MIME. */
-function extensionFor(mimeType: string | null, originalName: string | null) {
+/** يفصل امتداد الملف من اسمه الأصلي أو من نوع MIME، مع بدائل صالحة دائماً. */
+function extensionFor(mimeType: string | null, originalName: string | null, type: MediaType) {
   const fromName = originalName?.includes('.') ? originalName.split('.').pop() : null;
   if (fromName && /^[a-z0-9]{2,5}$/i.test(fromName)) return fromName.toLowerCase();
-  const fromMime = mimeType?.split('/').pop();
-  if (fromMime && /^[a-z0-9]{2,5}$/i.test(fromMime) && fromMime !== 'quicktime') return fromMime === 'jpeg' ? 'jpg' : fromMime;
-  return 'bin';
+  const fromMime = extFromMime(mimeType);
+  if (fromMime) return fromMime;
+  // بدائل مضمونة حتى لا يُحفظ الملف أبداً بلا امتداد صالح.
+  return type === 'image' ? 'jpg' : type === 'audio' ? 'mp3' : 'mp4';
 }
 
 /** ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم (مكان التنزيل). */
@@ -214,12 +272,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
       // الملفات المحلية المشارَكة (content:// أو file://) تُنسخ مباشرة بلا تنزيل شبكي.
       if (!/^https?:\/\//i.test(item.url)) {
-        const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
+        // الاسم الأصلي من نظام المشاركة محفوظ في العنوان، ونضمن امتداداً صالحاً دائماً.
+        const filename = safeFilename(item.title, extensionFor(mimeFor(item.format), item.title, item.type));
+        const target = `${baseDirectory}${filename}`;
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
         if (downloadDirRef.current) {
-          await saveFileToSafDirectory(target, safeFilename(item.title, item.format), mimeFor(item.format), downloadDirRef.current);
+          await saveFileToSafDirectory(target, filename, mimeFor(filename), downloadDirRef.current);
         }
         await patchItem(id, {
           status: 'completed',
@@ -233,7 +293,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
 
       const mediaUrl = await resolveMediaUrl(item.url);
-      const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
+      let target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
+
+      // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
+      let resolvedTitle = item.title;
+      let resolvedFormat = item.format;
+      const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
+      const remoteName = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
+      if (remoteName) {
+        const remoteExt = remoteName.includes('.') ? remoteName.split('.').pop()?.toLowerCase() : null;
+        resolvedTitle = remoteName.replace(/\.[^.]+$/, '');
+        if (remoteExt && /^[a-z0-9]{2,5}$/i.test(remoteExt)) resolvedFormat = remoteExt;
+      }
+      const serverExt = extFromMime(remoteInfo.mime);
+      if (serverExt) resolvedFormat = serverExt;
+      if (resolvedTitle !== item.title || resolvedFormat !== item.format) {
+        await patchItem(id, { title: resolvedTitle, format: resolvedFormat });
+      }
 
       // إزالة أي بقايا من محاولة سابقة حتى يبدأ التقدم من الصفر.
       const existing = await FileSystem.getInfoAsync(target);
@@ -265,15 +341,30 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       bytesRef.current.delete(id);
 
       if (result?.status === 200) {
+        // ضمان صيغة صحيحة: إن كان الرابط المباشر يحمل امتداداً واضحاً نعتمده.
+        let finalFormat = resolvedFormat;
+        const uriExt = result.uri.split('.').pop()?.toLowerCase();
+        if (uriExt && /^[a-z0-9]{2,5}$/i.test(uriExt) && MIME_TYPES[uriExt]) finalFormat = uriExt;
+        const finalFilename = safeFilename(resolvedTitle, finalFormat);
+        if (result.uri !== `${baseDirectory}${finalFilename}`) {
+          try {
+            await FileSystem.moveAsync({ from: result.uri, to: `${baseDirectory}${finalFilename}` });
+          } catch {
+            // نُبقي المسار الأصلي عند تعذر النقل.
+          }
+        }
+        target = `${baseDirectory}${finalFilename}`;
         if (downloadDirRef.current) {
-          await saveFileToSafDirectory(result.uri, safeFilename(item.title, item.format), mimeFor(item.format), downloadDirRef.current);
+          await saveFileToSafDirectory(target, finalFilename, mimeFor(finalFormat), downloadDirRef.current);
         }
         await patchItem(id, {
           status: 'completed',
           progress: 1,
           bytesWritten: finalBytes?.bytesWritten,
           totalBytes: finalBytes?.totalBytes,
-          fileUri: result.uri,
+          fileUri: target,
+          title: resolvedTitle,
+          format: finalFormat,
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } else {
@@ -349,7 +440,26 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  // استرجاع السجل عند الإقلاع وإعادة جدولة أي تنزيلات معلّقة.
+
+  /** تنظيف دوري: يحذف تلقائياً ملفات السلة التي تجاوزت 30 يوماً. */
+  const purgeExpiredTrash = useCallback(async () => {
+    const now = Date.now();
+    const expired = itemsRef.current.filter((item) => item.deletedAt && now - item.deletedAt > TRASH_RETENTION_MS);
+    if (expired.length === 0) return;
+    for (const item of expired) {
+      if (item.fileUri && !item.fileUri.startsWith('content://')) {
+        try {
+          const info = await FileSystem.getInfoAsync(item.fileUri);
+          if (info.exists) await FileSystem.deleteAsync(item.fileUri, { idempotent: true });
+        } catch {
+          // تجاهل أخطاء حذف الملفات الفردية
+        }
+      }
+    }
+    commit((current) => current.filter((item) => !(item.deletedAt && now - item.deletedAt > TRASH_RETENTION_MS)));
+  }, [commit]);
+
+  // استرجاع السجل عند الإقلاع وإعادة جدولة أي تنزيلات معلّقة ثم تنظيف السلة.
   useEffect(() => {
     let cancelled = false;
     AsyncStorage.getItem(STORAGE_KEY)
@@ -369,11 +479,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           }
         }
       })
+      .then(() => {
+        if (!cancelled) void purgeExpiredTrash();
+      })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [patchItem, enqueue]);
+  }, [patchItem, enqueue, purgeExpiredTrash]);
 
   const addDownload = useCallback(async (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => {
     const item: DownloadItem = {
@@ -392,7 +505,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
     if (Platform.OS === 'web') return;
     const type = typeFromMime(mimeType);
-    const extension = extensionFor(mimeType, originalName);
+    const extension = extensionFor(mimeType, originalName, type);
     const baseName = (originalName?.replace(/\.[^.]+$/, '') ?? '').replace(/[^\w\s\u0600-\u06FF-]/g, '').trim().slice(0, 48);
     const item: DownloadItem = {
       id: createId(),
@@ -418,6 +531,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     enqueue(id);
   }, [patchItem, enqueue]);
 
+  /** الحذف العادي ينقل الملف إلى سلة المحذوفات لمدة 30 يوماً. */
   const removeDownload = useCallback(async (id: string) => {
     queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
     const resumable = resumablesRef.current.get(id);
@@ -431,8 +545,47 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
     progressRef.current.delete(id);
     bytesRef.current.delete(id);
-    commit((current) => current.filter((item) => item.id !== id));
+    patchItem(id, { deletedAt: Date.now(), status: 'completed', error: undefined, inVault: false });
+  }, [patchItem]);
+
+  /** إعادة ملف من السلة إلى قائمة التنزيلات. */
+  const restoreFromTrash = useCallback(async (id: string) => {
+    patchItem(id, { deletedAt: undefined });
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [patchItem]);
+
+  /** حذف نهائي من السلة مع إزالة الملف الفعلي من التخزين. */
+  const deletePermanently = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    if (item?.fileUri && !item.fileUri.startsWith('content://')) {
+      try {
+        const info = await FileSystem.getInfoAsync(item.fileUri);
+        if (info.exists) await FileSystem.deleteAsync(item.fileUri, { idempotent: true });
+      } catch {
+        // الملف ربما حُذف يدوياً من التخزين
+      }
+    }
+    commit((current) => current.filter((entry) => entry.id !== id));
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   }, [commit]);
+
+  /** تفريغ السلة بالكامل. */
+  const emptyTrash = useCallback(async () => {
+    const trashed = itemsRef.current.filter((item) => item.deletedAt);
+    for (const item of trashed) {
+      if (item.fileUri && !item.fileUri.startsWith('content://')) {
+        try {
+          const info = await FileSystem.getInfoAsync(item.fileUri);
+          if (info.exists) await FileSystem.deleteAsync(item.fileUri, { idempotent: true });
+        } catch {
+          // تجاهل أخطاء حذف الملفات الفردية
+        }
+      }
+    }
+    commit((current) => current.filter((item) => !item.deletedAt));
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  }, [commit]);
+
 
   const clearCompleted = useCallback(async () => {
     commit((current) => current.filter((item) => item.status !== 'completed'));
@@ -504,7 +657,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     setQueueOptions,
     downloadDir,
     setDownloadDir,
-  }), [items, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir]);
+    restoreFromTrash,
+    deletePermanently,
+    emptyTrash,
+  }), [items, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }
