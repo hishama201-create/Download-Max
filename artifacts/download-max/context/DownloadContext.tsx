@@ -8,6 +8,7 @@ import { Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 
 const STORAGE_KEY = '@download-max/downloads';
+const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
 
 /**
  * خدمة تحويل روابط الصفحات إلى روابط وسائط مباشرة.
@@ -39,7 +40,10 @@ export type DownloadItem = {
 type DownloadContextValue = {
   items: DownloadItem[];
   activeCount: number;
+  waitingForWifi: boolean;
   addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<void>;
+  /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
+  addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
   removeDownload: (id: string) => Promise<void>;
   clearCompleted: () => Promise<void>;
@@ -48,7 +52,9 @@ type DownloadContextValue = {
   moveToVault: (id: string) => Promise<void>;
   removeFromVault: (id: string) => Promise<void>;
   setQueueOptions: (options: { maxTasks: MaxTasks; allowMobileData: boolean }) => void;
-  waitingForWifi: boolean;
+  /** مجلد التنزيل المختار (SAF URI) أو null للحفظ الداخلي. */
+  downloadDir: string | null;
+  setDownloadDir: (uri: string | null) => Promise<void>;
 };
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -64,6 +70,41 @@ function safeFilename(title: string, format: string) {
 
 function looksLikeDirectMedia(url: string) {
   return /\.(mp4|webm|mov|m4v|mp3|m4a|wav|aac|jpg|jpeg|png|webp|gif)(\?.*)?$/i.test(url);
+}
+
+/** يستنتج نوع الوسائط من نوع MIME الوارد من نظام المشاركة. */
+function typeFromMime(mimeType: string | null): MediaType {
+  if (!mimeType) return 'video';
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  return 'video';
+}
+
+/** يفصل امتداد الملف من اسمه الأصلي أو من نوع MIME. */
+function extensionFor(mimeType: string | null, originalName: string | null) {
+  const fromName = originalName?.includes('.') ? originalName.split('.').pop() : null;
+  if (fromName && /^[a-z0-9]{2,5}$/i.test(fromName)) return fromName.toLowerCase();
+  const fromMime = mimeType?.split('/').pop();
+  if (fromMime && /^[a-z0-9]{2,5}$/i.test(fromMime) && fromMime !== 'quicktime') return fromMime === 'jpeg' ? 'jpg' : fromMime;
+  return 'bin';
+}
+
+/** ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم (مكان التنزيل). */
+async function saveFileToSafDirectory(localUri: string, filename: string, mimeType: string, directoryUri: string): Promise<boolean> {
+  try {
+    const baseName = filename.replace(/\.[^.]+$/, '') || 'download';
+    const safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(directoryUri, baseName, mimeType);
+    try {
+      await FileSystem.copyAsync({ from: localUri, to: safFileUri });
+    } catch {
+      const data = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
+      await FileSystem.writeAsStringAsync(safFileUri, data, { encoding: FileSystem.EncodingType.Base64 });
+    }
+    return true;
+  } catch {
+    // فشل الحفظ في المجلد المختار — يبقى الملف في مجلد التطبيق.
+    return false;
+  }
 }
 
 /** أنواع MIME الصحيحة لكل صيغة حتى يفتح Android الملف بالتطبيق المناسب. */
@@ -120,6 +161,7 @@ async function resolveMediaUrl(sourceUrl: string): Promise<string> {
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<DownloadItem[]>([]);
   const [waitingForWifi, setWaitingForWifi] = useState(false);
+  const [downloadDir, setDownloadDirState] = useState<string | null>(null);
 
   // مراجع تعمل خارج دورة الرسم لإدارة الطابور بأمان.
   const itemsRef = useRef<DownloadItem[]>([]);
@@ -127,6 +169,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const activeIdsRef = useRef<Set<string>>(new Set());
   const maxTasksRef = useRef<MaxTasks>(2);
   const allowMobileDataRef = useRef(true);
+  const downloadDirRef = useRef<string | null>(null);
   const canDownloadRef = useRef(true);
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
   const progressRef = useRef(new Map<string, { progress: number; at: number }>());
@@ -169,6 +212,26 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const baseDirectory = FileSystem.documentDirectory;
       if (!baseDirectory) throw new Error('تعذر الوصول إلى مساحة التخزين.');
 
+      // الملفات المشارَكة (content://) تُنسخ مباشرة بلا استخراج ولا تنزيل شبكي.
+      if (item.url.startsWith('content://')) {
+        const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
+        await FileSystem.copyAsync({ from: item.url, to: target });
+        const info = await FileSystem.getInfoAsync(target);
+        const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
+        if (downloadDirRef.current) {
+          await saveFileToSafDirectory(target, safeFilename(item.title, item.format), mimeFor(item.format), downloadDirRef.current);
+        }
+        await patchItem(id, {
+          status: 'completed',
+          progress: 1,
+          bytesWritten: size,
+          totalBytes: size,
+          fileUri: target,
+        });
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        return;
+      }
+
       const mediaUrl = await resolveMediaUrl(item.url);
       const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
 
@@ -202,6 +265,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       bytesRef.current.delete(id);
 
       if (result?.status === 200) {
+        if (downloadDirRef.current) {
+          await saveFileToSafDirectory(result.uri, safeFilename(item.title, item.format), mimeFor(item.format), downloadDirRef.current);
+        }
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -232,7 +298,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   /** يشغّل المهام التالية في الطابور حتى بلوغ حد التنزيلات المتزامنة. */
   const pump = useCallback(() => {
     if (activeIdsRef.current.size >= maxTasksRef.current) return;
-    if (!canDownloadRef.current) {
+    const headId = queueRef.current[0];
+    const headItem = headId ? itemsRef.current.find((candidate) => candidate.id === headId) : undefined;
+    // النسخ المحلي من الملفات المشاركة لا يحتاج اتصالاً بالإنترنت.
+    const isLocalCopy = !!headItem?.url.startsWith('content://');
+    if (!canDownloadRef.current && !isLocalCopy) {
       setWaitingForWifi(queueRef.current.length > 0);
       return;
     }
@@ -318,6 +388,28 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     enqueue(item.id);
   }, [commit, enqueue]);
 
+  /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content://) مباشرةً بلا حاجة لرابط إنترنت. */
+  const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
+    if (Platform.OS === 'web') return;
+    const type = typeFromMime(mimeType);
+    const extension = extensionFor(mimeType, originalName);
+    const baseName = (originalName?.replace(/\.[^.]+$/, '') ?? '').replace(/[^\w\s\u0600-\u06FF-]/g, '').trim().slice(0, 48);
+    const item: DownloadItem = {
+      id: createId(),
+      url: contentUri,
+      title: baseName || `ملف مشترك ${new Date().toLocaleTimeString('ar', { hour: '2-digit', minute: '2-digit' })}`,
+      type,
+      format: extension,
+      quality: 'من المشاركة',
+      status: 'queued',
+      progress: 0,
+      createdAt: Date.now(),
+    };
+    commit((current) => [item, ...current]);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    enqueue(item.id);
+  }, [commit, enqueue]);
+
   const retryDownload = useCallback(async (id: string) => {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item) return;
@@ -374,11 +466,34 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pumpRef.current();
   }, []);
 
+  // استرجاع مجلد التنزيل المحفوظ عند الإقلاع.
+  useEffect(() => {
+    AsyncStorage.getItem(DOWNLOAD_DIR_KEY)
+      .then((stored) => {
+        if (stored) {
+          setDownloadDirState(stored);
+          downloadDirRef.current = stored;
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const setDownloadDir = useCallback(async (uri: string | null) => {
+    setDownloadDirState(uri);
+    downloadDirRef.current = uri;
+    if (uri) {
+      await AsyncStorage.setItem(DOWNLOAD_DIR_KEY, uri).catch(() => undefined);
+    } else {
+      await AsyncStorage.removeItem(DOWNLOAD_DIR_KEY).catch(() => undefined);
+    }
+  }, []);
+
   const value = useMemo(() => ({
     items,
     activeCount: items.filter((item) => item.status === 'queued' || item.status === 'downloading').length,
     waitingForWifi,
     addDownload,
+    addSharedFile,
     retryDownload,
     removeDownload,
     clearCompleted,
@@ -387,7 +502,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     moveToVault,
     removeFromVault,
     setQueueOptions,
-  }), [items, waitingForWifi, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions]);
+    downloadDir,
+    setDownloadDir,
+  }), [items, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

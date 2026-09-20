@@ -79,10 +79,22 @@ function percentLabel(item: DownloadItem) {
   return `${percent}%`;
 }
 
+/** يعرض اسم مجلد التنزيل المختار بصيغة مقروءة من SAF URI. */
+function dirLabel(uri: string) {
+  try {
+    const decoded = decodeURIComponent(uri);
+    const afterColon = decoded.includes(':') ? decoded.split(':').pop() ?? '' : decoded;
+    const segment = afterColon.split('/').filter(Boolean).pop();
+    return segment || 'مجلد مخصص';
+  } catch {
+    return 'مجلد مخصص';
+  }
+}
+
 function useSafeIncomingShare() {
   if (Platform.OS === 'web') {
     return {
-      resolvedSharedPayloads: [] as { contentUri: string | null; value: string }[],
+      resolvedSharedPayloads: [] as { contentUri: string | null; contentType: string | null; contentMimeType: string | null; originalName: string | null; value: string }[],
       clearSharedPayloads: () => undefined,
     };
   }
@@ -354,16 +366,19 @@ function FeatureRow({ icon, text, colors }: { icon: keyof typeof Feather.glyphMa
   return <View style={styles.featureRow}><View style={[styles.featureIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name={icon} size={16} color={colors.primary} /></View><Text style={[styles.featureText, { color: colors.foreground }]}>{text}</Text></View>;
 }
 
-function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, onThemeChange, onAccentChange, onMaxTasks, onAllowMobileData, onBack }: {
+function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, downloadDir, onThemeChange, onAccentChange, onMaxTasks, onAllowMobileData, onChooseDownloadDir, onClearDownloadDir, onBack }: {
   colors: Palette;
   themeMode: ThemeMode;
   accent: AccentKey;
   maxTasks: MaxTasks;
   allowMobileData: boolean;
+  downloadDir: string | null;
   onThemeChange: (mode: ThemeMode) => void;
   onAccentChange: (value: AccentKey) => void;
   onMaxTasks: (value: MaxTasks) => void;
   onAllowMobileData: (value: boolean) => void;
+  onChooseDownloadDir: () => void;
+  onClearDownloadDir: () => void;
   onBack: () => void;
 }) {
   const themeOptions: { value: ThemeMode; label: string; icon: keyof typeof Feather.glyphMap }[] = [
@@ -392,6 +407,26 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, o
         </Pressable>
       ))}
     </View>
+    <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 27 }]}>مكان التنزيل</Text>
+    <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>اختر مجلداً في الجهاز لحفظ الملفات فيه، أو اتركه في مجلد التطبيق</Text>
+    <View style={[styles.dirRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
+      <Feather name="folder" size={19} color={colors.primary} style={{ marginTop: 1 }} />
+      <Text style={[styles.dirText, { color: colors.foreground }]} numberOfLines={1}>
+        {downloadDir ? `${dirLabel(downloadDir)} · محفوظ ✓` : 'مجلد التطبيق (افتراضي)'}
+      </Text>
+    </View>
+    <View style={styles.dirActions}>
+      <Pressable testID="choose-download-dir" accessibilityLabel="اختيار مجلد التنزيل" onPress={onChooseDownloadDir} style={[styles.dirButton, { backgroundColor: colors.primary }]}>
+        <Feather name="edit" size={14} color={colors.primaryForeground} />
+        <Text style={[styles.dirButtonText, { color: colors.primaryForeground }]}>{downloadDir ? 'تغيير' : 'اختيار مجلد'}</Text>
+      </Pressable>
+      {downloadDir ? (
+        <Pressable testID="clear-download-dir" accessibilityLabel="إزالة مجلد التنزيل" onPress={onClearDownloadDir} style={[styles.dirButton, { backgroundColor: colors.background, borderWidth: 1, borderColor: colors.border }]}>
+          <Feather name="x-circle" size={14} color={colors.destructive} />
+          <Text style={[styles.dirButtonText, { color: colors.destructive }]}>إزالة</Text>
+        </Pressable>
+      ) : null}
+    </View>
     <View style={[styles.switchRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
       <View style={{ flex: 1, paddingRight: 10 }}>
         <Text style={[styles.settingsLabel, { color: colors.foreground, fontSize: 13 }]}>التنزيل عبر بيانات الجوال</Text>
@@ -416,7 +451,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -437,17 +472,26 @@ export default function HomeScreen() {
     setQueueOptions({ maxTasks, allowMobileData });
   }, [maxTasks, allowMobileData, setQueueOptions]);
 
+  // استقبال المشاركات: الملفات (صور/فيديو/صوت) تُحفظ مباشرةً، والروابط تُعبّأ في الحقل.
   useEffect(() => {
     const shared = resolvedSharedPayloads[0];
     if (!shared) return;
-    const value = shared.contentUri ?? shared.value;
-    if (value) {
-      setInput(value);
+    clearSharedPayloads();
+    const isFileShare = shared.contentUri && shared.contentType && shared.contentType !== 'text';
+    if (isFileShare) {
+      void addSharedFile(shared.contentUri!, shared.contentMimeType ?? null, shared.originalName ?? null);
+      setActiveTab('downloads');
+      setNotice('تم حفظ الملف المشارَك في التنزيلات ✓');
+      return;
+    }
+    const value = shared.value ?? '';
+    const extracted = extractUrl(value);
+    if (extracted) {
+      setInput(extracted);
       setActiveTab('home');
       setNotice('تم استلام الرابط من المشاركة');
-      clearSharedPayloads();
     }
-  }, [resolvedSharedPayloads, clearSharedPayloads]);
+  }, [resolvedSharedPayloads, clearSharedPayloads, addSharedFile]);
 
   const url = extractUrl(input);
   const hasValidUrl = /^https?:\/\/\S+$/i.test(url);
@@ -512,6 +556,18 @@ export default function HomeScreen() {
   function openInPlayer(item: DownloadItem) {
     setPanel(null);
     setNowPlaying(item);
+  }
+
+  /** يفتح منتقي مجلدات أندرويد لاختيار مكان حفظ التنزيلات. */
+  async function chooseDownloadDir() {
+    if (Platform.OS === 'web') {
+      setNotice('خيار المجلد متاح في تطبيق أندرويد');
+      return;
+    }
+    const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+    if (!permissions.granted) return;
+    await setDownloadDir(permissions.directoryUri);
+    setNotice(`سيُحفظ في: ${dirLabel(permissions.directoryUri)} ✓`);
   }
 
   function vaultAction(item: DownloadItem) {
@@ -737,7 +793,7 @@ export default function HomeScreen() {
               <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.0.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
-            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onBack={() => setPanel('menu')} />
+            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
           ) : panel === 'vault' ? (
             <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={openInPlayer} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : (
@@ -881,6 +937,11 @@ const styles = StyleSheet.create({
   progressFill: { height: '100%', borderRadius: 3 },
   progressPercent: { fontSize: 11, fontWeight: '800', minWidth: 32, textAlign: 'right' },
   openButton: { width: 30, height: 30, borderRadius: 15, justifyContent: 'center', alignItems: 'center' },
+  dirRow: { flexDirection: 'row', alignItems: 'center', gap: 9, borderWidth: 1, borderRadius: 15, padding: 13, marginTop: 10 },
+  dirText: { flex: 1, fontSize: 13, fontWeight: '600' },
+  dirActions: { flexDirection: 'row', gap: 9, marginTop: 10 },
+  dirButton: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 15, paddingVertical: 10, borderRadius: 12 },
+  dirButtonText: { fontSize: 13, fontWeight: '700' },
   errorText: { fontSize: 10, lineHeight: 14, marginTop: 6 },
   rowActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 5, gap: 1 },
   iconButton: { padding: 7 },
