@@ -212,8 +212,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const baseDirectory = FileSystem.documentDirectory;
       if (!baseDirectory) throw new Error('تعذر الوصول إلى مساحة التخزين.');
 
-      // الملفات المشارَكة (content://) تُنسخ مباشرة بلا استخراج ولا تنزيل شبكي.
-      if (item.url.startsWith('content://')) {
+      // الملفات المحلية المشارَكة (content:// أو file://) تُنسخ مباشرة بلا تنزيل شبكي.
+      if (!/^https?:\/\//i.test(item.url)) {
         const target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
@@ -301,7 +301,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const headId = queueRef.current[0];
     const headItem = headId ? itemsRef.current.find((candidate) => candidate.id === headId) : undefined;
     // النسخ المحلي من الملفات المشاركة لا يحتاج اتصالاً بالإنترنت.
-    const isLocalCopy = !!headItem?.url.startsWith('content://');
+    const isLocalCopy = !!headItem && !/^https?:\/\//i.test(headItem.url);
     if (!canDownloadRef.current && !isLocalCopy) {
       setWaitingForWifi(queueRef.current.length > 0);
       return;
@@ -388,7 +388,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     enqueue(item.id);
   }, [commit, enqueue]);
 
-  /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content://) مباشرةً بلا حاجة لرابط إنترنت. */
+  /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content:// أو file://) مباشرةً بلا حاجة لرابط إنترنت. */
   const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
     if (Platform.OS === 'web') return;
     const type = typeFromMime(mimeType);
