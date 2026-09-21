@@ -3,7 +3,6 @@ import Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useIncomingShare } from 'expo-sharing';
-import { isPictureInPictureSupported, VideoView, useVideoPlayer } from 'expo-video';
 import { cleanupSlideshowTemp, fetchSlideshowBundle, generateSlideshowVideo } from '../context/slideshow';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
@@ -621,47 +620,6 @@ function TrashPanel({ colors, trashItems, onBack, onRestore, onDelete, onEmpty }
   </Pressable>;
 }
 
-function MediaCard({ item, onPress, colors }: { item: DownloadItem; onPress: () => void; colors: Palette }) {
-  return (
-    <Pressable onPress={onPress} style={[styles.mediaCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-      {item.type === 'image' && item.fileUri ? (
-        <Image source={{ uri: item.fileUri }} style={styles.mediaCardArt} resizeMode="cover" />
-      ) : (
-        <View style={[styles.mediaCardArt, styles.mediaCardPlaceholder, { backgroundColor: `${colors.primary}10` }]}>
-          <Feather name={typeIcons[item.type]} size={30} color={colors.primary} />
-        </View>
-      )}
-      <View style={styles.mediaCardPlay}>
-        <Feather name="play" size={13} color="#fff" />
-      </View>
-      <Text style={[styles.mediaCardTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
-      <Text style={[styles.mediaCardMeta, { color: colors.mutedForeground }]}>{typeLabels[item.type]} · {formatBytes(item.totalBytes)}</Text>
-    </Pressable>
-  );
-}
-
-function PlayerBody({ item }: { item: DownloadItem }) {
-  const player = useVideoPlayer(item.fileUri ? { uri: item.fileUri } : null, (instance) => {
-    instance.loop = false;
-  });
-  const pipSupported = Platform.OS !== 'web' && isPictureInPictureSupported();
-  useEffect(() => {
-    player.play();
-  }, [player]);
-  return (
-    <VideoView
-      style={styles.videoView}
-      player={player}
-      contentFit="contain"
-      fullscreenOptions={{ enable: true }}
-      allowsPictureInPicture={pipSupported}
-      startsPictureInPictureAutomatically={pipSupported}
-      onPictureInPictureStart={() => undefined}
-      onPictureInPictureStop={() => undefined}
-    />
-  );
-}
-
 function FeatureRow({ icon, text, colors }: { icon: keyof typeof Feather.glyphMap; text: string; colors: Palette }) {
   return <View style={styles.featureRow}><View style={[styles.featureIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name={icon} size={16} color={colors.primary} /></View><Text style={[styles.featureText, { color: colors.foreground }]}>{text}</Text></View>;
 }
@@ -741,7 +699,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.1</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.2</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -755,7 +713,7 @@ export default function HomeScreen() {
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'home' | 'downloads' | 'play' | 'discover'>('home');
+  const [activeTab, setActiveTab] = useState<'home' | 'downloads'>('home');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   const [youtubeKey, setYoutubeKey] = useState('AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44');
@@ -770,7 +728,6 @@ export default function HomeScreen() {
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
-  const [nowPlaying, setNowPlaying] = useState<DownloadItem | null>(null);
   // شبكة اختيار صور الكاروسيل: الصور مصغّرة مع صح/بدون صح ثم تنزيل المحدد فقط.
   const [carouselGallery, setCarouselGallery] = useState<{ urls: string[]; selected: boolean[]; title?: string } | null>(null);
   // نافذة المحتوى المختلط: منشور يحتوي صوراً ونسخة فيديو قصير معاً — نسأل المستخدم أيهما يريد.
@@ -793,7 +750,10 @@ export default function HomeScreen() {
     const shared = resolvedSharedPayloads[0];
     if (!shared) return;
     clearSharedPayloads();
-    const isFileShare = shared.contentUri && shared.contentType && shared.contentType !== 'text';
+    // المشاركة النصية (text/plain وغيره) دائماً تُعالج كرابط وتُفحص — حتى لو انضافت مسارات ملفات معاً.
+    // الملفات الحقيقية فقط (صورة/فيديو/صوت MIME مع contentUri) تُحفظ مباشرة بدون فحص.
+    const sharedTextHasUrl = !!extractUrl(shared.value ?? '');
+    const isFileShare = shared.contentUri && shared.contentType && !shared.contentType.startsWith('text/') && !sharedTextHasUrl;
     if (isFileShare) {
       void addSharedFile(shared.contentUri!, shared.contentMimeType ?? null, shared.originalName ?? null);
       setActiveTab('downloads');
@@ -855,10 +815,6 @@ export default function HomeScreen() {
   const filteredItems = useMemo(
     () => mediaFilter === 'all' ? searchableItems : searchableItems.filter((item) => item.type === mediaFilter),
     [searchableItems, mediaFilter],
-  );
-  const playableItems = useMemo(
-    () => visibleItems.filter((item) => item.status === 'completed' && item.fileUri),
-    [visibleItems],
   );
   const stats = useMemo(() => ({
     total: visibleItems.filter((item) => item.status === 'completed').length,
@@ -1020,10 +976,7 @@ export default function HomeScreen() {
     void openFile(item);
   }
 
-  function openInPlayer(item: DownloadItem) {
-    setPanel(null);
-    setNowPlaying(item);
-  }
+
 
   /** يفتح منتقي مجلدات أندرويد لاختيار مكان حفظ التنزيلات. */
   async function chooseDownloadDir() {
@@ -1235,29 +1188,7 @@ export default function HomeScreen() {
             renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
-        ) : (
-          <FlatList
-            data={playableItems}
-            keyExtractor={(item) => item.id}
-            numColumns={2}
-            columnWrapperStyle={styles.playColumn}
-            refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} tintColor={colors.primary} />}
-            contentContainerStyle={[styles.downloadsContent, playableItems.length === 0 && styles.emptyList]}
-            ListHeaderComponent={
-              <View style={styles.downloadsHeader}>
-                <View>
-                  <Text style={[styles.pageTitle, { color: colors.foreground }]}>التشغيل</Text>
-                  <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>شاهد واستمع لملفاتك داخل التطبيق</Text>
-                </View>
-                <View style={[styles.playBadge, { backgroundColor: `${colors.primary}14` }]}>
-                  <Feather name="play-circle" size={19} color={colors.primary} />
-                </View>
-              </View>
-            }
-            ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="play-circle" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>لا توجد ملفات للتشغيل بعد</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>أكمل تنزيل فيديو أو صوت أو صورة وسيظهر هنا لتشغيله فوراً.</Text></View>}
-            renderItem={({ item }) => <MediaCard item={item} colors={colors} onPress={() => openInPlayer(item)} />}
-          />
-        )}
+        ) : null}
       </View>
 
       <View style={[styles.bottomNav, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 34 : Math.max(insets.bottom, 10) }]}>
@@ -1268,10 +1199,6 @@ export default function HomeScreen() {
         <Pressable testID="tab-downloads" accessibilityLabel="التنزيلات" onPress={() => setActiveTab('downloads')} style={styles.navItem}>
           <View><Feather name="download" size={21} color={activeTab === 'downloads' ? colors.primary : colors.mutedForeground} />{activeCount > 0 ? <View style={[styles.navDot, { backgroundColor: colors.primary }]} /> : null}</View>
           <Text style={[styles.navLabel, { color: activeTab === 'downloads' ? colors.primary : colors.mutedForeground }]}>التنزيلات</Text>
-        </Pressable>
-        <Pressable testID="tab-play" accessibilityLabel="التشغيل" onPress={() => setActiveTab('play')} style={styles.navItem}>
-          <Feather name="play-circle" size={21} color={activeTab === 'play' ? colors.primary : colors.mutedForeground} />
-          <Text style={[styles.navLabel, { color: activeTab === 'play' ? colors.primary : colors.mutedForeground }]}>التشغيل</Text>
         </Pressable>
       </View>
 
@@ -1317,11 +1244,11 @@ export default function HomeScreen() {
             </Text>
             <Pressable testID="mixed-as-video" onPress={() => void handleMixedChoice('video')} style={[styles.dialogButton, { backgroundColor: colors.primary }]}>
               <Feather name="film" size={17} color={colors.primaryForeground} />
-              <Text style={[styles.dialogButtonText, { color: colors.primaryForeground }]}>تحميل كفيديو قصير 🎬</Text>
+              <Text style={[styles.dialogButtonText, { color: colors.primaryForeground }]}>تحميل فيديو العرض التقديمي 🎬</Text>
             </Pressable>
             <Pressable testID="mixed-as-image" onPress={() => void handleMixedChoice('image')} style={[styles.dialogButton, { backgroundColor: `${colors.primary}16` }]}>
               <Feather name="image" size={17} color={colors.primary} />
-              <Text style={[styles.dialogButtonText, { color: colors.primary }]}>تحميل كصور ({mixedPrompt?.imageCount ?? 0}) 📸</Text>
+              <Text style={[styles.dialogButtonText, { color: colors.primary }]}>تحميل الصورة ({mixedPrompt?.imageCount ?? 0}) 📸</Text>
             </Pressable>
             <Pressable onPress={() => setMixedPrompt(null)} style={styles.dialogCancel}>
               <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
@@ -1396,12 +1323,12 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.1</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.2</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
           ) : panel === 'vault' ? (
-            <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={openInPlayer} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
+            <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={showOpen} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : panel === 'trash' ? (
             <TrashPanel colors={colors} trashItems={trashItems} onBack={() => setPanel('menu')} onRestore={(id) => { void restoreFromTrash(id); setNotice('أُعيد الملف إلى التنزيلات ✓'); }} onDelete={(id) => void deletePermanently(id)} onEmpty={() => { void emptyTrash(); setNotice('فُرّغت سلة المحذوفات 🗑️'); }} />
           ) : panel === 'youtube' ? (
@@ -1458,18 +1385,6 @@ export default function HomeScreen() {
         </View>
       ) : null}
 
-      {nowPlaying ? (
-        <Modal visible transparent animationType="slide" onRequestClose={() => setNowPlaying(null)}>
-          <Pressable style={styles.modalBackdrop} onPress={() => setNowPlaying(null)}>
-            <Pressable style={[styles.sheet, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
-              <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
-              <Text style={[styles.sheetTitle, { color: colors.foreground }]} numberOfLines={1}>{nowPlaying.title}</Text>
-              <PlayerBody item={nowPlaying} />
-            </Pressable>
-          </Pressable>
-        </Modal>
-      ) : null}
-
       <Modal visible={!hasSeenOnboarding} transparent animationType="fade" onRequestClose={completeOnboarding}>
         <View style={styles.onboardingBackdrop}>
           <View style={[styles.onboardingCard, { backgroundColor: colors.card }]}>
@@ -1500,15 +1415,6 @@ const styles = StyleSheet.create({
   searchInput: { flex: 1, fontSize: 13, minHeight: 42, textAlign: 'left' },
   wifiBanner: { borderRadius: 13, borderWidth: 1, padding: 11, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
   wifiBannerText: { flex: 1, fontSize: 11, fontWeight: '700', lineHeight: 16 },
-  playColumn: { gap: 12 },
-  playBadge: { width: 42, height: 42, borderRadius: 15, justifyContent: 'center', alignItems: 'center' },
-  mediaCard: { flex: 1, borderRadius: 18, borderWidth: 1, padding: 12, minHeight: 170, justifyContent: 'flex-end' },
-  mediaCardArt: { width: '100%', height: 84, borderRadius: 13, marginBottom: 10 },
-  mediaCardPlaceholder: { justifyContent: 'center', alignItems: 'center' },
-  mediaCardPlay: { position: 'absolute', top: 41, left: 0, right: 0, alignItems: 'center' },
-  mediaCardTitle: { fontSize: 12, fontWeight: '800' },
-  mediaCardMeta: { fontSize: 10, marginTop: 3 },
-  videoView: { width: '100%', aspectRatio: 16 / 9, borderRadius: 14, backgroundColor: '#000', marginTop: 6 },
   pinDots: { flexDirection: 'row', justifyContent: 'center', gap: 14, marginTop: 18 },
   pinDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 2 },
   pinGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 10, marginTop: 22, width: 252, alignSelf: 'center' },
