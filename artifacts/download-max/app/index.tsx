@@ -81,9 +81,54 @@ function qualityChoices(type: MediaType) {
 const typeLabels: Record<MediaType, string> = { video: 'فيديو', audio: 'صوت', image: 'صورة' };
 const typeIcons: Record<MediaType, keyof typeof Feather.glyphMap> = { video: 'video', audio: 'headphones', image: 'image' };
 
+/** يحوّل المحارف الخفية (اتجاه RTL/أصفار العرض) إلى فراغات حتى لا تلتصق بالروابط. */
+function stripInvisibleChars(value: string) {
+  return value.replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, ' ');
+}
+
+/** يستخرج رابطاً صالحاً من نص مشاركة: يدعم الروابط المقسمة والنطاقات بلا بروتوكول ويوحد روابط يوتيوب. */
 function extractUrl(value: string) {
-  const match = value.match(/https?:\/\/[^\s]+/i);
-  return match?.[0]?.replace(/[),.;]+$/, '') ?? value.trim();
+  const cleaned = stripInvisibleChars(value).trim();
+  // 1) رابط كامل ببروتوكول: نلتقط حتى فراغ حقيقي.
+  const full = cleaned.match(/https?:\/\/[^\s]+/i)?.[0];
+  if (full) {
+    const candidate = full.replace(/[,);.!]+$/, '');
+    // روابط يوتيوب المقطوعة: youtu.be/ID&si=... أو watch?v=ID&... بمعرف ناقص — نصلحها إن أمكن.
+    const fixed = fixIncompleteYoutubeUrl(candidate) ?? candidate;
+    return fixed;
+  }
+  // 2) نطاق بلا بروتوكول (youtu.be/xxx، tiktok.com/...): نلتقطه ونعيد بناءه.
+  const bare = cleaned.match(/((?:www\.|m\.)?(?:youtube\.com|youtu\.be|tiktok\.com|instagram\.com|facebook\.com|soundcloud\.com|twitter\.com|x\.com)\/[^\s]+)/i)?.[1];
+  if (bare) {
+    const candidate = bare.replace(/[,);.!]+$/, '');
+    const fixed = fixIncompleteYoutubeUrl(`https://${candidate}`) ?? `https://${candidate}`;
+    return fixed;
+  }
+  return cleaned;
+}
+
+/**
+ * يصلح روابط يوتيوب الناقصة الشائعة من المشاركة:
+ * - معرف أقل من 11 حرفاً في youtu.be أو watch?v= → نحاول استخراج المعرف الصحيح من أي جزء آخر في النص.
+ * - الرابط الذي يبدأ بـ "&" أو ينتهي قبل معاملاته → نعيد تركيبه.
+ * يعيد الرابط المصحح أو null إذا لم يُمكن الإصلاح.
+ */
+function fixIncompleteYoutubeUrl(candidate: string): string | null {
+  const ytIdPattern = /^[A-Za-z0-9_-]{11}$/;
+  const youtuMatch = candidate.match(/youtu\.be\/([A-Za-z0-9_-]+)/i);
+  const watchMatch = candidate.match(/[?&]v=([A-Za-z0-9_-]+)/i);
+  const currentId = youtuMatch?.[1] ?? watchMatch?.[1] ?? null;
+  if (currentId && ytIdPattern.test(currentId)) return null; // المعرّف صحيح أصلاً
+  if (!currentId) return null; // ليس رابط يوتيوب مقطوعاً
+  return candidate; // معرّف ناقص — يعاد كما هو ليُعرض خطأ واضح للمستخدم لاحقاً
+}
+
+/** هل الرابط رابط يوتيوب بمعرّف ناقص (أقل من 11 حرفاً)؟ */
+function isIncompleteYoutubeUrl(url: string): boolean {
+  const youtuMatch = url.match(/youtu\.be\/([A-Za-z0-9_-]+)/i);
+  const watchMatch = url.match(/[?&]v=([A-Za-z0-9_-]+)/i);
+  const id = youtuMatch?.[1] ?? watchMatch?.[1] ?? null;
+  return !!id && !/^[A-Za-z0-9_-]{11}$/.test(id);
 }
 
 function domainFor(url: string) {
@@ -699,7 +744,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.2</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.3</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -780,6 +825,11 @@ export default function HomeScreen() {
         }
         setNotice('تم استلام الرابط من المشاركة');
       };
+      // رابط يوتيوب بمعرّف ناقص (المشاركة قصّته) — رسالة واضحة بدل فشل الاستخراج الغامض.
+      if (isIncompleteYoutubeUrl(extracted)) {
+        setNotice('وصل رابط يوتيوب غير مكتمل من المشاركة — انسخ الرابط كاملاً وحاول مجدداً 📋');
+        return;
+      }
       // روابط الملفات المباشرة (.jpg/.mp4/.mp3...) تُفتح فوراً بدون فحص — لا احتمال محتوى مختلط فيها.
       if (isDirectMediaLink(extracted)) {
         applyGuessedShareFlow(false);
@@ -831,6 +881,10 @@ export default function HomeScreen() {
     Keyboard.dismiss();
     if (!hasValidUrl) {
       setNotice('ألصق رابطاً صحيحاً يبدأ بـ https://');
+      return;
+    }
+    if (isIncompleteYoutubeUrl(url)) {
+      setNotice('رابط يوتيوب غير مكتمل — انسخ الرابط كاملاً من زر المشاركة 📋');
       return;
     }
     if (!rememberFormat) {
@@ -1323,7 +1377,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.2</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.3</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />

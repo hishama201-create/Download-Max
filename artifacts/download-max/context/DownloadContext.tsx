@@ -254,7 +254,22 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error('تعذر الوصول إلى خدمة الاستخراج.');
+  if (!response.ok) {
+    // نعرض سبب الخطأ الحقيقي من الخدمة بدل رسالة عامة (رابط ناقص / خاص / غير مدعوم...).
+    let reason = '';
+    try {
+      const errData = await response.json();
+      const code: string = errData?.error?.code ?? '';
+      if (code.includes('fetch.fail')) reason = 'الرابط غير مكتمل أو المحتوى غير متاح — تأكد من نسخ الرابط كاملاً من زر المشاركة.';
+      else if (code.includes('content.post.private') || code.includes('private')) reason = 'المحتوى خاص — لا يمكن تنزيله.';
+      else if (code.includes('content.post.unavailable') || code.includes('unavailable')) reason = 'المنشور محذوف أو غير متاح.';
+      else if (code.includes('content.video.age') || code.includes('age')) reason = 'محتوى مقيد بالعمر — لا يمكن تنزيله.';
+      else if (code.includes('content.video.region') || code.includes('region')) reason = 'المحتوى محجوب في منطقتك.';
+      else if (code.includes('auth')) reason = 'الخدمة ترفض الطلب مؤقتاً — حاول بعد قليل.';
+      else if (errData?.error?.code) reason = `تعذر التنزيل (${String(errData.error.code).replace('error.api.', '')}).`;
+    } catch { /* لا تفاصيل إضافية */ }
+    throw new Error(reason || 'تعذر الوصول إلى خدمة الاستخراج.');
+  }
   const data = await response.json();
   if (Array.isArray(data?.picker) && data.picker.length > 0) {
     const urls = data.picker
