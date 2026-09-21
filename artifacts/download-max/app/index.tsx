@@ -125,6 +125,16 @@ function guessMediaTypeFromUrl(url: string): MediaType | null {
   return null;
 }
 
+/** هل الرابط ملف وسائط مباشر (ينتهي بامتداد صورة/فيديو/صوت)؟ هؤلاء يُفتحون فوراً بدون فحص شبكة. */
+function isDirectMediaLink(url: string): boolean {
+  try {
+    const last = new URL(url).pathname.split('/').filter(Boolean).pop() ?? '';
+    return /\.(jpe?g|png|gif|webp|bmp|svg|heic|heif|avif|mp4|m4v|webm|mov|mkv|avi|3gp|flv|ts|mp3|m4a|wav|aac|ogg|oga|opus|flac|wma)$/i.test(last);
+  } catch {
+    return false;
+  }
+}
+
 function formatBytes(value?: number) {
   if (!value) return '—';
   if (value < 1024) return `${Math.round(value)} B`;
@@ -731,7 +741,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.1</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -795,21 +805,41 @@ export default function HomeScreen() {
     if (extracted) {
       setInput(extracted);
       setActiveTab('home');
-      // مشاركة ذكية: نتعرف على نوع الوسيط من الرابط، ننقل اختيار النوع للتبويب الصحيح، ثم نفتح خيارات الصيغ فوراً.
-      const guessed = guessMediaTypeFromUrl(extracted);
-      if (guessed) {
-        changeType(guessed);
-        if (rememberFormat) {
-          void startDownload(extracted, { type: guessed, format: qualityChoices(guessed)[0].format });
-        } else {
-          setPendingUrl(extracted);
-          setShowFormatSheet(true);
+      // مسار الروابط الاجتماعية: يطبّق التعرف من اسم الموقع ثم يفتح خيارات الصيغ (أو يحمل مع تذكر الاختيار).
+      const applyGuessedShareFlow = (alreadyScanned: boolean) => {
+        const guessed = guessMediaTypeFromUrl(extracted);
+        if (guessed) {
+          changeType(guessed);
+          if (rememberFormat) {
+            void startDownload(extracted, { type: guessed, format: qualityChoices(guessed)[0].format, skipMixedCheck: alreadyScanned });
+          } else {
+            setPendingUrl(extracted);
+            setShowFormatSheet(true);
+          }
+          return;
         }
+        setNotice('تم استلام الرابط من المشاركة');
+      };
+      // روابط الملفات المباشرة (.jpg/.mp4/.mp3...) تُفتح فوراً بدون فحص — لا احتمال محتوى مختلط فيها.
+      if (isDirectMediaLink(extracted)) {
+        applyGuessedShareFlow(false);
         return;
       }
-      setNotice('تم استلام الرابط من المشاركة');
+      // الروابط الاجتماعية (تيك توك/إنستغرام/سناب/فيسبوك...): نفحص المحتوى الفعلي أولاً —
+      // الكاروسيل (صور + نسخة فيديو قصير) يسأل المستخدم دائماً: فيديو أم صور؟ قبل أي تحميل.
+      void (async () => {
+        setNotice('جارٍ فحص الرابط...');
+        const gallery = await previewCarouselImages(extracted);
+        setNotice(null);
+        if (gallery.length > 1) {
+          changeType('video');
+          setMixedPrompt({ url: extracted, imageCount: gallery.length });
+          return;
+        }
+        applyGuessedShareFlow(true);
+      })();
     }
-  }, [resolvedSharedPayloads, clearSharedPayloads, addSharedFile]);
+    }, [resolvedSharedPayloads, clearSharedPayloads, addSharedFile]);
 
   const url = extractUrl(input);
   const hasValidUrl = /^https?:\/\/\S+$/i.test(url);
@@ -856,7 +886,22 @@ export default function HomeScreen() {
   }
 
   /** يبدأ التحميل بالصيغة المختارة (أو الصيغة الممررة صراحةً)؛ إن كان الرابط منشوراً مختلطاً (صور + فيديو) يُسأل المستخدم أولاً عن الشكل المطلوب. */
-  async function startDownload(targetUrl: string, overrides?: { type: MediaType; format: string }) {
+  async function startDownload(targetUrl: string, overrides?: { type: MediaType; format: string; skipMixedCheck?: boolean }) {
+    // فحص المحتوى المختلط يُتخطى فقط عندما فُحص الرابط للتو (مثل مسار المشاركة) — لا إعادة فحص مكررة.
+    if (overrides?.skipMixedCheck) {
+      const type = overrides.type;
+      const format = overrides.format;
+      const count = await addSmartDownload({
+        url: targetUrl,
+        title: guessedTitle(targetUrl),
+        type,
+        format,
+        quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
+      });
+      setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
+      setActiveTab('downloads');
+      return;
+    }
     setNotice('جارٍ تحليل الرابط...');
     try {
       const gallery = await previewCarouselImages(targetUrl);
@@ -1351,7 +1396,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.1</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
