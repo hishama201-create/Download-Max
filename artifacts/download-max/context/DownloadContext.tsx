@@ -61,6 +61,8 @@ export type DownloadItem = {
   deletedAt?: number;
   /** خيارات طلب الاستخراج (جودة الفيديو أو معدل الصوت المطلوبة). */
   requestOptions?: MediaRequestOptions;
+  /** الرابط محفوظ مباشر بالفعل (نتيجة استخراج سابقة) — يُنزَّل كما هو دون إعادة استخراج. */
+  resolvedUrl?: boolean;
   createdAt: number;
 };
 
@@ -73,6 +75,8 @@ type DownloadContextValue = {
   addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
   /** يضيف صور كاروسيل مختارة مسبقاً (روابط مباشرة) كمهام تنزيل. يعيد عددها. */
   addCarouselImages: (input: { urls: string[]; title?: string }) => Promise<number>;
+  /** يحاول جلب رابط فيديو حقيقي لمنشور مختلط (فيديو مدمج بالكاروسيل أو نسخة عرض مولّدة). يعيد null إن لم تتوفر نسخة. */
+  resolveCarouselVideo: (sourceUrl: string, videoQuality: string) => Promise<string | null>;
   /** يجلب حجم الملف المقدّر لجودة معينة قبل التنزيل (بايت) أو null عند الفشل. */
   probeFileSize: (input: { url: string; type: MediaType; format: string }) => Promise<number | null>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
@@ -351,7 +355,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      const [mediaUrl] = await resolveMediaUrls(item.url, item.requestOptions);
+      // روابط ناتجة عن استخراج سابق تُنزَّل كما هي دون إعادة استخراج.
+      const [mediaUrl] = item.resolvedUrl ? [item.url] : await resolveMediaUrls(item.url, item.requestOptions);
       let target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
@@ -639,6 +644,48 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     return created.length;
   }, [commit, enqueue]);
 
+  /** يحاول جلب رابط فيديو حقيقي لمنشور مختلط: فيديو مدمج داخل الكاروسيل (إنستغرام/فيسبوك) أو نسخة العرض المولّدة (تيك توك). */
+  const resolveCarouselVideo = useCallback(async (sourceUrl: string, videoQuality: string): Promise<string | null> => {
+    if (!/^https?:\/\//i.test(sourceUrl)) return null;
+    // 1) خدمة الاستخراج الأساسية: قد تعيد فيديو حقيقياً (tunnel) أو عنصر فيديو داخل قائمة الكاروسيل.
+    try {
+      const response = await fetch(EXTRACTOR_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ url: sourceUrl, videoQuality }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if ((data?.status === 'tunnel' || data?.status === 'stream') && typeof data?.url === 'string' && data.url) return data.url as string;
+        if (Array.isArray(data?.picker)) {
+          const videoEntry = data.picker.find((entry: { type?: unknown; url?: unknown }) => entry?.type === 'video' && typeof entry?.url === 'string' && entry.url);
+          if (videoEntry) return videoEntry.url as string;
+        }
+      }
+    } catch {
+      // ننتقل للمحاولة الاحتياطية
+    }
+    // 2) خدمة احتياطية لنسخة العرض المولّدة (قابلة للتبديل عبر متغير البيئة).
+    try {
+      const fallbackBase = process.env.EXPO_PUBLIC_SLIDESHOW_FALLBACK_URL?.trim() || 'https://tikwm.com/api/';
+      const response = await fetch(`${fallbackBase}?url=${encodeURIComponent(sourceUrl)}&hd=1`);
+      if (response.ok) {
+        const payload = await response.json();
+        const play = payload?.data?.play;
+        const duration = Number(payload?.data?.duration ?? 0);
+        if (typeof play === 'string' && play && duration > 0) {
+          // نسخة العرض الحقيقية لها مدة — نرفض فقط ما ثبت أنه مسار صوتي.
+          const head = await fetch(play, { method: 'HEAD' }).catch(() => null);
+          const mime = head?.headers?.get('content-type') ?? '';
+          if (!mime.startsWith('audio/')) return play;
+        }
+      }
+    } catch {
+      // لا نسخة فيديو متاحة لهذا المنشور
+    }
+    return null;
+  }, []);
+
   /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content:// أو file://) مباشرةً بلا حاجة لرابط إنترنت. */
   const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
     if (Platform.OS === 'web') return;
@@ -786,6 +833,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     addDownload,
     addSmartDownload,
     addCarouselImages,
+    resolveCarouselVideo,
     probeFileSize,
     addSharedFile,
     retryDownload,
@@ -801,7 +849,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
-  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, probeFileSize, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
+  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

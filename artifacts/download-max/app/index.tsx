@@ -730,7 +730,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.7.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.8.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -740,7 +740,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -762,6 +762,8 @@ export default function HomeScreen() {
   const [nowPlaying, setNowPlaying] = useState<DownloadItem | null>(null);
   // شبكة اختيار صور الكاروسيل: الصور مصغّرة مع صح/بدون صح ثم تنزيل المحدد فقط.
   const [carouselGallery, setCarouselGallery] = useState<{ urls: string[]; selected: boolean[]; title?: string } | null>(null);
+  // نافذة المحتوى المختلط: منشور يحتوي صوراً ونسخة فيديو قصير معاً — نسأل المستخدم أيهما يريد.
+  const [mixedPrompt, setMixedPrompt] = useState<{ url: string; imageCount: number } | null>(null);
 
   // مزامنة إعدادات الطابور (المهام المتزامنة + بيانات الجوال) مع سياق التنزيل.
   useEffect(() => {
@@ -852,14 +854,20 @@ export default function HomeScreen() {
     await startDownload(url);
   }
 
-  /** يبدأ التحميل بالصيغة المختارة (أو الصيغة الممررة صراحةً)؛ إن كان الرابط منشور صور تفتح شبكة الاختيار بدل الإضافة التلقائية. */
+  /** يبدأ التحميل بالصيغة المختارة (أو الصيغة الممررة صراحةً)؛ إن كان الرابط منشوراً مختلطاً (صور + فيديو) يُسأل المستخدم أولاً عن الشكل المطلوب. */
   async function startDownload(targetUrl: string, overrides?: { type: MediaType; format: string }) {
     setNotice('جارٍ تحليل الرابط...');
     try {
       const gallery = await previewCarouselImages(targetUrl);
       if (gallery.length > 1) {
-        setCarouselGallery({ urls: gallery, selected: gallery.map(() => true), title: guessedTitle(targetUrl) });
         setNotice(null);
+        // محتوى مختلط: المنشور يحتوي صوراً وغالباً نسخة فيديو قصير — نسأل المستخدم أيهما يريد (كل المنصات).
+        // استثناء: من طلب صوراً صراحةً (تبويب الصور) نفتح شبكة الصور مباشرة بدون سؤال.
+        if (overrides?.type === 'image') {
+          setCarouselGallery({ urls: gallery, selected: gallery.map(() => true), title: guessedTitle(targetUrl) });
+          return;
+        }
+        setMixedPrompt({ url: targetUrl, imageCount: gallery.length });
         return;
       }
     } catch {
@@ -875,6 +883,50 @@ export default function HomeScreen() {
       quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
     });
     setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
+    setActiveTab('downloads');
+  }
+
+  /** اختيار المستخدم في نافذة المحتوى المختلط: نسخة الفيديو القصير (بجودته المختارة) أو كل صور الألبوم. */
+  async function handleMixedChoice(choice: 'video' | 'image') {
+    if (!mixedPrompt) return;
+    const target = mixedPrompt.url;
+    setMixedPrompt(null);
+    if (choice === 'image') {
+      setNotice('جارٍ تحضير صور المنشور...');
+      try {
+        const gallery = await previewCarouselImages(target);
+        setNotice(null);
+        if (gallery.length > 0) {
+          setCarouselGallery({ urls: gallery, selected: gallery.map(() => true), title: guessedTitle(target) });
+          return;
+        }
+      } catch {
+        setNotice(null);
+      }
+      // تعذر جلب الصور — نضيف المهمة كصورة عادية.
+      await addSmartDownload({ url: target, title: guessedTitle(target), type: 'image', format: 'jpg', quality: 'صورة' });
+      setNotice('أُضيف التحميل إلى القائمة');
+      setActiveTab('downloads');
+      return;
+    }
+    // فيديو: نحاول جلب نسخة الفيديو الحقيقية للمنشور المختلط (من أي منصة).
+    setNotice('جارٍ تجهيز نسخة الفيديو...');
+    const quality = selectedFormat.split('-')[1] ?? '720';
+    const videoUrl = await resolveCarouselVideo(target, quality);
+    setNotice(null);
+    if (!videoUrl) {
+      setNotice('لا تتوفر نسخة فيديو لهذا المنشور — جرّب تنزيل الصور 📸');
+      return;
+    }
+    await addDownload({
+      url: videoUrl,
+      title: guessedTitle(target),
+      type: 'video',
+      format: 'mp4',
+      quality: 'نسخة العرض المولّدة',
+      resolvedUrl: true,
+    });
+    setNotice('أُضيف الفيديو إلى القائمة ✓');
     setActiveTab('downloads');
   }
 
@@ -1177,6 +1229,31 @@ export default function HomeScreen() {
       </Modal>
 
       {/* شبكة اختيار صور الكاروسيل: مصغّرات + صح/بدون صح + تنزيل المحدد فقط */}
+      <Modal visible={mixedPrompt !== null} transparent animationType="fade" onRequestClose={() => setMixedPrompt(null)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setMixedPrompt(null)}>
+          <Pressable style={[styles.dialogCard, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+            <View style={[styles.dialogIcon, { backgroundColor: `${colors.primary}14` }]}>
+              <Feather name="layers" size={26} color={colors.primary} />
+            </View>
+            <Text style={[styles.dialogTitle, { color: colors.foreground }]}>هذا المنشور متاح بشكلين</Text>
+            <Text style={[styles.dialogBody, { color: colors.mutedForeground }]}>
+              يحتوي {mixedPrompt?.imageCount ?? 0} صور ونسخة فيديو قصير مدموجة — كيف تريد التنزيل؟
+            </Text>
+            <Pressable testID="mixed-as-video" onPress={() => void handleMixedChoice('video')} style={[styles.dialogButton, { backgroundColor: colors.primary }]}>
+              <Feather name="film" size={17} color={colors.primaryForeground} />
+              <Text style={[styles.dialogButtonText, { color: colors.primaryForeground }]}>تحميل كفيديو قصير 🎬</Text>
+            </Pressable>
+            <Pressable testID="mixed-as-image" onPress={() => void handleMixedChoice('image')} style={[styles.dialogButton, { backgroundColor: `${colors.primary}16` }]}>
+              <Feather name="image" size={17} color={colors.primary} />
+              <Text style={[styles.dialogButtonText, { color: colors.primary }]}>تحميل كصور ({mixedPrompt?.imageCount ?? 0}) 📸</Text>
+            </Pressable>
+            <Pressable onPress={() => setMixedPrompt(null)} style={styles.dialogCancel}>
+              <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       <Modal visible={carouselGallery !== null} transparent animationType="slide" onRequestClose={() => setCarouselGallery(null)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setCarouselGallery(null)}>
           <Pressable style={[styles.sheet, styles.sheetTall, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
@@ -1243,7 +1320,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.7.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.8.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
