@@ -22,6 +22,27 @@ const EXTRACTOR_API_URL =
 export type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'failed';
 export type MediaType = 'video' | 'audio' | 'image';
 
+/** خيارات طلب الاستخراج: جودة الفيديو أو صيغة/معدل الصوت. */
+export type MediaRequestOptions =
+  | { mode: 'video'; videoQuality?: string }
+  | { mode: 'audio'; audioFormat?: string; audioBitrate?: string }
+  | { mode: 'image' };
+
+/** يبني خيارات طلب الاستخراج من نوع الوسائط والصيغة المختارة. */
+export function requestOptionsFor(type: MediaType, format: string): MediaRequestOptions {
+  if (type === 'audio') {
+    // الصيغة بصيغة mp3-320 أو m4a-128
+    const [audioFormat, audioBitrate] = format.split('-');
+    return { mode: 'audio', audioFormat: audioFormat || 'mp3', audioBitrate: audioBitrate || '128' };
+  }
+  if (type === 'video') {
+    // الجودة بصيغة mp4-720 أو webm-480
+    const quality = format.split('-')[1];
+    return { mode: 'video', videoQuality: quality || '1080' };
+  }
+  return { mode: 'image' };
+}
+
 export type DownloadItem = {
   id: string;
   url: string;
@@ -38,6 +59,8 @@ export type DownloadItem = {
   inVault?: boolean;
   /** وقت النقل إلى سلة المحذوفات — وجوده يعني أن الملف في السلة. */
   deletedAt?: number;
+  /** خيارات طلب الاستخراج (جودة الفيديو أو معدل الصوت المطلوبة). */
+  requestOptions?: MediaRequestOptions;
   createdAt: number;
 };
 
@@ -48,6 +71,8 @@ type DownloadContextValue = {
   addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<void>;
   /** يضيف تنزيلاً ذكياً: يكشف كاروسيل الصور وينشئ مهمة لكل صورة. يعيد عدد المهام. */
   addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
+  /** يجلب حجم الملف المقدّر لجودة معينة قبل التنزيل (بايت) أو null عند الفشل. */
+  probeFileSize: (input: { url: string; type: MediaType; format: string }) => Promise<number | null>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
@@ -206,13 +231,22 @@ async function openDownloadedFile(item: DownloadItem) {
 /**
  * يستخرج روابط الوسائط المباشرة من رابط الصفحة.
  * يدعم كاروسيل الصور (تيك توك/إنستجرام/فيسبوك) عبر حقل picker الذي يعيد قائمة بكل الصور.
+ * ويمرر جودة الفيديو أو صيغة/معدل الصوت المطلوبة لخدمة الاستخراج.
  */
-async function resolveMediaUrls(sourceUrl: string): Promise<string[]> {
+async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions): Promise<string[]> {
   if (looksLikeDirectMedia(sourceUrl)) return [sourceUrl];
+  const body: Record<string, unknown> = { url: sourceUrl };
+  if (options?.mode === 'audio') {
+    body.downloadMode = 'audio';
+    if (options.audioFormat) body.audioFormat = options.audioFormat;
+    if (options.audioBitrate) body.audioBitrate = options.audioBitrate;
+  } else if (options?.mode === 'video' && options.videoQuality) {
+    body.videoQuality = options.videoQuality;
+  }
   const response = await fetch(EXTRACTOR_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ url: sourceUrl }),
+    body: JSON.stringify(body),
   });
   if (!response.ok) throw new Error('تعذر الوصول إلى خدمة الاستخراج.');
   const data = await response.json();
@@ -304,7 +338,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      const [mediaUrl] = await resolveMediaUrls(item.url);
+      const [mediaUrl] = await resolveMediaUrls(item.url, item.requestOptions);
       let target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
@@ -513,6 +547,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     enqueue(item.id);
   }, [commit, enqueue]);
 
+  /** يجلب حجم الملف لجودة/معدل محدد عبر طلب استخراج حقيقي ثم ترويسة الحجم. */
+  const probeFileSize = useCallback(async (input: { url: string; type: MediaType; format: string }) => {
+    try {
+      if (!/^https?:\/\//i.test(input.url)) return null;
+      if (input.type === 'image') {
+        const info = await fetchRemoteFileInfo(input.url);
+        return null; // الأحجام تُجلب لكل صورة على حدة في الواجهة
+      }
+      const options = requestOptionsFor(input.type, input.format);
+      const [mediaUrl] = await resolveMediaUrls(input.url, options);
+      const info = await fetchRemoteFileInfo(mediaUrl);
+      return null;
+    } catch {
+      return null;
+    }
+  }, []);
+
   /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. */
   const addSmartDownload = useCallback(async (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => {
     let mediaUrls: string[] = [input.url];
@@ -533,6 +584,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         type: input.type,
         format: input.format,
         quality: input.quality,
+        requestOptions: requestOptionsFor(input.type, input.format),
       });
       return 1;
     }
@@ -700,6 +752,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     waitingForWifi,
     addDownload,
     addSmartDownload,
+    probeFileSize,
     addSharedFile,
     retryDownload,
     removeDownload,
@@ -714,7 +767,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
-  }), [items, waitingForWifi, addDownload, addSmartDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
+  }), [items, waitingForWifi, addDownload, addSmartDownload, probeFileSize, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

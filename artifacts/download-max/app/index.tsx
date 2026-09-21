@@ -3,7 +3,7 @@ import Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useIncomingShare } from 'expo-sharing';
-import { VideoView, useVideoPlayer } from 'expo-video';
+import { isPictureInPictureSupported, VideoView, useVideoPlayer } from 'expo-video';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -42,6 +42,41 @@ const formats: Record<MediaType, { format: string; label: string; detail: string
     { format: 'png', label: 'صورة PNG', detail: 'جودة عالية' },
   ],
 };
+
+/** خيارات جودة الفيديو (تُرسل لخدمة الاستخراج كـ videoQuality). */
+const videoQualities = [
+  { value: '1080', label: '1080p', detail: 'أفضل جودة HD' },
+  { value: '720', label: '720p', detail: 'جودة عالية' },
+  { value: '480', label: '480p', detail: 'جودة متوسطة' },
+  { value: '360', label: '360p', detail: 'توفير البيانات' },
+  { value: '240', label: '240p', detail: 'حجم صغير' },
+  { value: '144', label: '144p', detail: 'أصغر حجم' },
+];
+
+/** خيارات معدل الصوت (تُرسل لخدمة الاستخراج كـ audioBitrate). */
+const audioBitrates = [
+  { value: '320', label: '320K', detail: 'أعلى جودة — حجم أكبر' },
+  { value: '256', label: '256K', detail: 'جودة ممتازة' },
+  { value: '160', label: '160K', detail: 'جودة جيدة جداً' },
+  { value: '128', label: '128K', detail: 'الأفضل للجوال — متوازن' },
+  { value: '70', label: '70K', detail: 'أصغر حجم — للسماعات' },
+];
+
+/** خيارات نافذة المزيد من الصيغ: أزواج (اسم عرض، قيمة تنسيق). */
+function qualityChoices(type: MediaType) {
+  if (type === 'video') {
+    return [
+      ...videoQualities.map((q) => ({ format: `mp4-${q.value}`, label: q.label, detail: q.detail })),
+      ...videoQualities.filter((q) => ['1080', '720', '480'].includes(q.value)).map((q) => ({ format: `webm-${q.value}`, label: `${q.label} WebM`, detail: q.detail })),
+    ];
+  }
+  if (type === 'audio') {
+    return [
+      ...['mp3', 'm4a'].flatMap((fmt) => audioBitrates.map((b) => ({ format: `${fmt}-${b.value}`, label: `${fmt.toUpperCase()} ${b.label}`, detail: b.detail }))),
+    ];
+  }
+  return formats.image.map((entry) => ({ format: entry.format, label: entry.label, detail: entry.detail }));
+}
 
 const typeLabels: Record<MediaType, string> = { video: 'فيديو', audio: 'صوت', image: 'صورة' };
 const typeIcons: Record<MediaType, keyof typeof Feather.glyphMap> = { video: 'video', audio: 'headphones', image: 'image' };
@@ -577,10 +612,22 @@ function PlayerBody({ item }: { item: DownloadItem }) {
   const player = useVideoPlayer(item.fileUri ? { uri: item.fileUri } : null, (instance) => {
     instance.loop = false;
   });
+  const pipSupported = Platform.OS !== 'web' && isPictureInPictureSupported();
   useEffect(() => {
     player.play();
   }, [player]);
-  return <VideoView style={styles.videoView} player={player} contentFit="contain" fullscreenOptions={{ enable: true }} />;
+  return (
+    <VideoView
+      style={styles.videoView}
+      player={player}
+      contentFit="contain"
+      fullscreenOptions={{ enable: true }}
+      allowsPictureInPicture={pipSupported}
+      startsPictureInPictureAutomatically={pipSupported}
+      onPictureInPictureStart={() => undefined}
+      onPictureInPictureStop={() => undefined}
+    />
+  );
 }
 
 function FeatureRow({ icon, text, colors }: { icon: keyof typeof Feather.glyphMap; text: string; colors: Palette }) {
@@ -662,7 +709,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.4.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.5.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -684,6 +731,8 @@ export default function HomeScreen() {
   const [mediaType, setMediaType] = useState<MediaType>('video');
   const [selectedFormat, setSelectedFormat] = useState('mp4');
   const [showFormatSheet, setShowFormatSheet] = useState(false);
+  const [rememberFormat, setRememberFormat] = useState(false);
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | 'youtube' | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -726,7 +775,7 @@ export default function HomeScreen() {
 
   const url = extractUrl(input);
   const hasValidUrl = /^https?:\/\/\S+$/i.test(url);
-  const selectedOption = formats[mediaType].find((option) => option.format === selectedFormat) ?? formats[mediaType][0];
+  const selectedOption = qualityChoices(mediaType).find((option) => option.format === selectedFormat) ?? qualityChoices(mediaType)[0];
   const downloadItems = useMemo(() => [...items].sort((a, b) => b.createdAt - a.createdAt), [items]);
   const visibleItems = useMemo(() => downloadItems.filter((item) => !item.inVault && !item.deletedAt), [downloadItems]);
   const vaultItems = useMemo(() => downloadItems.filter((item) => item.inVault && !item.deletedAt && item.status === 'completed'), [downloadItems]);
@@ -750,7 +799,7 @@ export default function HomeScreen() {
 
   function changeType(type: MediaType) {
     setMediaType(type);
-    setSelectedFormat(formats[type][0].format);
+    setSelectedFormat(qualityChoices(type)[0].format);
     void Haptics.selectionAsync();
   }
 
@@ -760,13 +809,23 @@ export default function HomeScreen() {
       setNotice('ألصق رابطاً صحيحاً يبدأ بـ https://');
       return;
     }
+    if (!rememberFormat) {
+      setPendingUrl(url);
+      setShowFormatSheet(true);
+      return;
+    }
+    await startDownload(url);
+  }
+
+  /** يبدأ التحميل بالصيغة المختارة حالياً (من النافذة أو مباشرة عند تذكر الاختيار). */
+  async function startDownload(targetUrl: string) {
     setNotice('جارٍ تحليل الرابط...');
     const count = await addSmartDownload({
-      url,
-      title: guessedTitle(url),
+      url: targetUrl,
+      title: guessedTitle(targetUrl),
       type: mediaType,
-      format: selectedOption.format,
-      quality: mediaType === 'audio' ? 'أفضل جودة متاحة' : 'المصدر الأصلي',
+      format: selectedFormat,
+      quality: qualityChoices(mediaType).find((entry) => entry.format === selectedFormat)?.label ?? 'المصدر الأصلي',
     });
     setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
     setActiveTab('downloads');
@@ -1043,17 +1102,29 @@ export default function HomeScreen() {
 
       <Modal visible={showFormatSheet} transparent animationType="slide" onRequestClose={() => setShowFormatSheet(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setShowFormatSheet(false)}>
-          <Pressable style={[styles.sheet, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+          <Pressable style={[styles.sheet, styles.sheetTall, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
             <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
-            <Text style={[styles.sheetTitle, { color: colors.foreground }]}>اختر الصيغة</Text>
-            {formats[mediaType].map((option) => {
-              const selected = option.format === selectedFormat;
-              return <TouchableOpacity key={option.format} testID={`format-${option.format}`} onPress={() => { setSelectedFormat(option.format); setShowFormatSheet(false); }} style={[styles.optionRow, { borderColor: colors.border }]}>
-                <View style={[styles.optionRadio, { borderColor: selected ? colors.primary : colors.input }]}>{selected ? <View style={[styles.optionRadioInner, { backgroundColor: colors.primary }]} /> : null}</View>
-                <View style={styles.optionCopy}><Text style={[styles.optionTitle, { color: colors.foreground }]}>{option.label}</Text><Text style={[styles.optionDetail, { color: colors.mutedForeground }]}>{option.detail}</Text></View>
-                {selected ? <Feather name="check" size={19} color={colors.primary} /> : null}
-              </TouchableOpacity>;
-            })}
+            <Text style={[styles.sheetTitle, { color: colors.foreground }]}>المزيد من الصيغ</Text>
+            <FlatList
+              data={qualityChoices(mediaType)}
+              keyExtractor={(entry) => entry.format}
+              style={{ flexGrow: 0 }}
+              renderItem={({ item: option }) => {
+                const selected = option.format === selectedFormat;
+                return <TouchableOpacity key={option.format} testID={`format-${option.format}`} onPress={() => { setSelectedFormat(option.format); }} style={[styles.optionRow, { borderColor: selected ? colors.primary : colors.border }]}>
+                  <View style={[styles.optionRadio, { borderColor: selected ? colors.primary : colors.input }]}>{selected ? <View style={[styles.optionRadioInner, { backgroundColor: colors.primary }]} /> : null}</View>
+                  <View style={styles.optionCopy}><Text style={[styles.optionTitle, { color: colors.foreground }]}>{option.label}</Text><Text style={[styles.optionDetail, { color: colors.mutedForeground }]}>{option.detail}</Text></View>
+                  {selected ? <Feather name="check" size={19} color={colors.primary} /> : null}
+                </TouchableOpacity>;
+              }}
+            />
+            <Pressable onPress={() => setRememberFormat((value) => !value)} style={styles.rememberRow}>
+              <Switch value={rememberFormat} onValueChange={(value) => setRememberFormat(value)} trackColor={{ true: colors.primary, false: colors.muted }} thumbColor="#fff" />
+              <Text style={[styles.rememberText, { color: colors.foreground }]}>تذكر اختياري — تحميل مباشر بدون هذه النافذة</Text>
+            </Pressable>
+            <Pressable testID="confirm-format" onPress={() => { setShowFormatSheet(false); if (pendingUrl) { const target = pendingUrl; setPendingUrl(null); void startDownload(target); } }} style={[styles.sheetConfirm, { backgroundColor: colors.primary }]}>
+              <Text style={[styles.sheetConfirmText, { color: colors.primaryForeground }]}>تحميل الآن</Text>
+            </Pressable>
           </Pressable>
         </Pressable>
       </Modal>
@@ -1071,7 +1142,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.4.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.5.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -1381,4 +1452,9 @@ const styles = StyleSheet.create({
   ytTitle: { fontSize: 13, fontWeight: '700', lineHeight: 18 },
   ytMeta: { fontSize: 11 },
   ytDownloadButton: { width: 40, height: 40, borderRadius: 13, justifyContent: 'center', alignItems: 'center' },
+  sheetTall: { maxHeight: '78%' },
+  rememberRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 12, marginTop: 4 },
+  rememberText: { flex: 1, fontSize: 13, fontWeight: '700', lineHeight: 19 },
+  sheetConfirm: { borderRadius: 15, paddingVertical: 15, alignItems: 'center', marginTop: 6 },
+  sheetConfirmText: { fontSize: 15, fontWeight: '800' },
 });
