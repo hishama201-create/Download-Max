@@ -71,6 +71,8 @@ type DownloadContextValue = {
   addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<void>;
   /** يضيف تنزيلاً ذكياً: يكشف كاروسيل الصور وينشئ مهمة لكل صورة. يعيد عدد المهام. */
   addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
+  /** يضيف صور كاروسيل مختارة مسبقاً (روابط مباشرة) كمهام تنزيل. يعيد عددها. */
+  addCarouselImages: (input: { urls: string[]; title?: string }) => Promise<number>;
   /** يجلب حجم الملف المقدّر لجودة معينة قبل التنزيل (بايت) أو null عند الفشل. */
   probeFileSize: (input: { url: string; type: MediaType; format: string }) => Promise<number | null>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
@@ -260,6 +262,17 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
     throw new Error(data?.text || 'تعذر استخراج رابط الوسائط من هذا الرابط.');
   }
   return [data.url as string];
+}
+
+/** يفحص الرابط مسبقاً: إن كان منشور صور (كاروسيل) يعيد قائمة روابط كل الصور، وإلا قائمة فارغة. */
+export async function previewCarouselImages(sourceUrl: string): Promise<string[]> {
+  try {
+    if (!/^https?:\/\//i.test(sourceUrl) || looksLikeDirectMedia(sourceUrl)) return [];
+    const resolved = await resolveMediaUrls(sourceUrl);
+    return resolved.length > 1 ? resolved : [];
+  } catch {
+    return [];
+  }
 }
 
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
@@ -606,6 +619,26 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     return created.length;
   }, [addDownload, commit, enqueue]);
 
+  /** يضيف الصور المختارة من شبكة الكاروسيل كمهام تنزيل جاهزة (روابط مباشرة بلا تحليل جديد). */
+  const addCarouselImages = useCallback(async (input: { urls: string[]; title?: string }) => {
+    const now = Date.now();
+    const created: DownloadItem[] = input.urls.map((mediaUrl, index) => ({
+      id: createId(),
+      url: mediaUrl,
+      title: input.title ? `${input.title} ${index + 1}` : `صورة ${index + 1} من ${input.urls.length}`,
+      type: 'image' as MediaType,
+      format: 'jpg',
+      quality: 'كاروسيل الصور',
+      status: 'queued' as const,
+      progress: 0,
+      createdAt: now - index,
+    }));
+    commit((current) => [...created, ...current]);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    for (const entry of created) enqueue(entry.id);
+    return created.length;
+  }, [commit, enqueue]);
+
   /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content:// أو file://) مباشرةً بلا حاجة لرابط إنترنت. */
   const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
     if (Platform.OS === 'web') return;
@@ -752,6 +785,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     waitingForWifi,
     addDownload,
     addSmartDownload,
+    addCarouselImages,
     probeFileSize,
     addSharedFile,
     retryDownload,
@@ -767,7 +801,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
-  }), [items, waitingForWifi, addDownload, addSmartDownload, probeFileSize, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
+  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, probeFileSize, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

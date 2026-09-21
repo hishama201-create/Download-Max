@@ -25,7 +25,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 const formats: Record<MediaType, { format: string; label: string; detail: string }[]> = {
@@ -709,7 +709,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.5.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.6.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -719,7 +719,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addSmartDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash } = useDownloads();
+  const { items, activeCount, waitingForWifi, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -739,6 +739,8 @@ export default function HomeScreen() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
   const [nowPlaying, setNowPlaying] = useState<DownloadItem | null>(null);
+  // شبكة اختيار صور الكاروسيل: الصور مصغّرة مع صح/بدون صح ثم تنزيل المحدد فقط.
+  const [carouselGallery, setCarouselGallery] = useState<{ urls: string[]; selected: boolean[]; title?: string } | null>(null);
 
   // مزامنة إعدادات الطابور (المهام المتزامنة + بيانات الجوال) مع سياق التنزيل.
   useEffect(() => {
@@ -817,9 +819,19 @@ export default function HomeScreen() {
     await startDownload(url);
   }
 
-  /** يبدأ التحميل بالصيغة المختارة حالياً (من النافذة أو مباشرة عند تذكر الاختيار). */
+  /** يبدأ التحميل بالصيغة المختارة؛ إن كان الرابط منشور صور تفتح شبكة الاختيار بدل الإضافة التلقائية. */
   async function startDownload(targetUrl: string) {
     setNotice('جارٍ تحليل الرابط...');
+    try {
+      const gallery = await previewCarouselImages(targetUrl);
+      if (gallery.length > 1) {
+        setCarouselGallery({ urls: gallery, selected: gallery.map(() => true), title: guessedTitle(targetUrl) });
+        setNotice(null);
+        return;
+      }
+    } catch {
+      // فشل الفحص المسبق — نكمل مسار التنزيل العادي ويعرض الخطأ داخل المهمة.
+    }
     const count = await addSmartDownload({
       url: targetUrl,
       title: guessedTitle(targetUrl),
@@ -1129,6 +1141,60 @@ export default function HomeScreen() {
         </Pressable>
       </Modal>
 
+      {/* شبكة اختيار صور الكاروسيل: مصغّرات + صح/بدون صح + تنزيل المحدد فقط */}
+      <Modal visible={carouselGallery !== null} transparent animationType="slide" onRequestClose={() => setCarouselGallery(null)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setCarouselGallery(null)}>
+          <Pressable style={[styles.sheet, styles.sheetTall, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+            <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
+            <View style={styles.galleryHeader}>
+              <Text style={[styles.sheetTitle, { color: colors.foreground, marginBottom: 0 }]}>صور المنشور ({carouselGallery?.urls.length ?? 0})</Text>
+              <Pressable testID="gallery-close" accessibilityLabel="إغلاق شبكة الصور" onPress={() => setCarouselGallery(null)} style={styles.galleryClose}>
+                <Feather name="x" size={21} color={colors.mutedForeground} />
+              </Pressable>
+            </View>
+            <Pressable testID="gallery-select-all" accessibilityLabel="تحديد الكل" onPress={() => { void Haptics.selectionAsync(); setCarouselGallery((state) => state ? { ...state, selected: state.urls.map(() => true) } : state); }} style={styles.gallerySelectAll}>
+              <Feather name="check-square" size={17} color={colors.primary} />
+              <Text style={[styles.gallerySelectAllText, { color: colors.primary }]}>تحديد الكل</Text>
+            </Pressable>
+            <FlatList
+              data={carouselGallery?.urls ?? []}
+              keyExtractor={(item, index) => `${index}-${item.slice(-24)}`}
+              numColumns={3}
+              style={{ flexGrow: 0 }}
+              contentContainerStyle={{ gap: 7 }}
+              columnWrapperStyle={{ gap: 7 }}
+              renderItem={({ item, index }) => {
+                const selected = carouselGallery?.selected[index] ?? false;
+                return <TouchableOpacity testID={`gallery-image-${index}`} accessibilityLabel={`صورة ${index + 1}`} onPress={() => { void Haptics.selectionAsync(); setCarouselGallery((state) => state ? { ...state, selected: state.selected.map((value, cursor) => (cursor === index ? !value : value)) } : state); }} activeOpacity={0.85} style={[styles.galleryCell, { borderColor: selected ? colors.primary : 'transparent' }]}>
+                  <Image source={{ uri: item }} style={styles.galleryImage} resizeMode="cover" />
+                  <View style={[styles.galleryCheck, { backgroundColor: selected ? colors.primary : 'rgba(0,0,0,0.55)' }]}>
+                    {selected ? <Feather name="check" size={13} color="#fff" /> : null}
+                  </View>
+                </TouchableOpacity>;
+              }}
+            />
+            <Pressable
+              testID="gallery-download"
+              accessibilityLabel="تنزيل الصور المحددة"
+              disabled={!carouselGallery || carouselGallery.selected.every((value) => !value)}
+              onPress={() => {
+                if (!carouselGallery) return;
+                const picked = carouselGallery.urls.filter((_, index) => carouselGallery.selected[index]);
+                setCarouselGallery(null);
+                void addCarouselImages({ urls: picked, title: carouselGallery.title }).then((count) => {
+                  setNotice(`تمت إضافة ${count} صور للتحميل ✓`);
+                  setActiveTab('downloads');
+                });
+              }}
+              style={[styles.sheetConfirm, styles.galleryDownload, { backgroundColor: colors.primary, opacity: carouselGallery && carouselGallery.selected.some(Boolean) ? 1 : 0.4 }]}
+            >
+              <Feather name="download" size={17} color={colors.primaryForeground} />
+              <Text style={[styles.sheetConfirmText, { color: colors.primaryForeground }]}>تنزيل الصور ({carouselGallery?.selected.filter(Boolean).length ?? 0})</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       <Modal visible={panel !== null} transparent animationType="slide" onRequestClose={() => setPanel(null)}>
         <Pressable style={styles.drawerBackdrop} onPress={() => setPanel(null)}>
           {panel === 'menu' ? (
@@ -1142,7 +1208,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.5.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.6.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -1452,6 +1518,14 @@ const styles = StyleSheet.create({
   ytTitle: { fontSize: 13, fontWeight: '700', lineHeight: 18 },
   ytMeta: { fontSize: 11 },
   ytDownloadButton: { width: 40, height: 40, borderRadius: 13, justifyContent: 'center', alignItems: 'center' },
+  galleryHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
+  galleryClose: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(127,127,127,0.12)' },
+  gallerySelectAll: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 6, marginBottom: 12, paddingHorizontal: 11, paddingVertical: 7, borderRadius: 11, backgroundColor: 'rgba(127,127,127,0.10)' },
+  gallerySelectAllText: { fontSize: 13, fontWeight: '800' },
+  galleryCell: { flex: 1 / 3, aspectRatio: 0.82, borderRadius: 12, borderWidth: 2.5, overflow: 'hidden' },
+  galleryImage: { width: '100%', height: '100%' },
+  galleryCheck: { position: 'absolute', top: 7, right: 7, width: 23, height: 23, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  galleryDownload: { flexDirection: 'row', gap: 8, justifyContent: 'center', marginTop: 12 },
   sheetTall: { maxHeight: '78%' },
   rememberRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 12, marginTop: 4 },
   rememberText: { flex: 1, fontSize: 13, fontWeight: '700', lineHeight: 19 },
