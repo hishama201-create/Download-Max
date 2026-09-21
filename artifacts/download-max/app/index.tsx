@@ -103,6 +103,27 @@ function guessedTitle(url: string) {
   }
 }
 
+/** يخمّن نوع الوسيط من الرابط: امتداد الملف في المسار أو نطاق موقع معروف. يعيد null إن لم يستطع التحديد. */
+function guessMediaTypeFromUrl(url: string): MediaType | null {
+  let path = '';
+  try {
+    const parsed = new URL(url);
+    path = parsed.pathname.toLowerCase();
+    const host = parsed.hostname.replace(/^www\./, '');
+    // نطاقات معروفة بنوعها بغض النظر عن الامتداد (إنستغرام/بينترست صور عادةً، ويوتيوب وتيك توك فيديو...).
+    if (/(^|\.)(youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|dai\.ly|tiktok\.com|twitter\.com|x\.com|twitch\.tv|facebook\.com|fb\.watch)$/.test(host)) return 'video';
+    if (/(^|\.)(soundcloud\.com|spotify\.com|audiomack\.com|anchor\.fm)$/.test(host)) return 'audio';
+    if (/(^|\.)(imgur\.com|flickr\.com|pinterest\.com|pin\.it|unsplash\.com|500px\.com|instagram\.com)$/.test(host)) return 'image';
+  } catch {
+    return null;
+  }
+  const last = path.split('/').filter(Boolean).pop() ?? '';
+  if (/\.(jpe?g|png|gif|webp|bmp|svg|heic|heif|avif)$/.test(last)) return 'image';
+  if (/\.(mp4|m4v|webm|mov|mkv|avi|3gp|flv|ts)$/.test(last)) return 'video';
+  if (/\.(mp3|m4a|wav|aac|ogg|oga|opus|flac|wma)$/.test(last)) return 'audio';
+  return null;
+}
+
 function formatBytes(value?: number) {
   if (!value) return '—';
   if (value < 1024) return `${Math.round(value)} B`;
@@ -709,7 +730,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.6.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.7.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -771,6 +792,18 @@ export default function HomeScreen() {
     if (extracted) {
       setInput(extracted);
       setActiveTab('home');
+      // مشاركة ذكية: نتعرف على نوع الوسيط من الرابط، ننقل اختيار النوع للتبويب الصحيح، ثم نفتح خيارات الصيغ فوراً.
+      const guessed = guessMediaTypeFromUrl(extracted);
+      if (guessed) {
+        changeType(guessed);
+        if (rememberFormat) {
+          void startDownload(extracted, { type: guessed, format: qualityChoices(guessed)[0].format });
+        } else {
+          setPendingUrl(extracted);
+          setShowFormatSheet(true);
+        }
+        return;
+      }
       setNotice('تم استلام الرابط من المشاركة');
     }
   }, [resolvedSharedPayloads, clearSharedPayloads, addSharedFile]);
@@ -819,8 +852,8 @@ export default function HomeScreen() {
     await startDownload(url);
   }
 
-  /** يبدأ التحميل بالصيغة المختارة؛ إن كان الرابط منشور صور تفتح شبكة الاختيار بدل الإضافة التلقائية. */
-  async function startDownload(targetUrl: string) {
+  /** يبدأ التحميل بالصيغة المختارة (أو الصيغة الممررة صراحةً)؛ إن كان الرابط منشور صور تفتح شبكة الاختيار بدل الإضافة التلقائية. */
+  async function startDownload(targetUrl: string, overrides?: { type: MediaType; format: string }) {
     setNotice('جارٍ تحليل الرابط...');
     try {
       const gallery = await previewCarouselImages(targetUrl);
@@ -832,12 +865,14 @@ export default function HomeScreen() {
     } catch {
       // فشل الفحص المسبق — نكمل مسار التنزيل العادي ويعرض الخطأ داخل المهمة.
     }
+    const type = overrides?.type ?? mediaType;
+    const format = overrides?.format ?? selectedFormat;
     const count = await addSmartDownload({
       url: targetUrl,
       title: guessedTitle(targetUrl),
-      type: mediaType,
-      format: selectedFormat,
-      quality: qualityChoices(mediaType).find((entry) => entry.format === selectedFormat)?.label ?? 'المصدر الأصلي',
+      type,
+      format,
+      quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
     });
     setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
     setActiveTab('downloads');
@@ -1208,7 +1243,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.6.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.7.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
