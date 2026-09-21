@@ -22,6 +22,75 @@ const EXTRACTOR_API_URL =
 export type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'failed';
 export type MediaType = 'video' | 'audio' | 'image';
 
+// خدمة يوتيوب الاحتياطية: تشتغل عندما ترفض الخدمة الأساسية الفيديو (youtube.login ومشقاته).
+// تعيد اسم الفيديو الحقيقي + رابط تنزيل نهائي بعد تجهيز الملف.
+const YT_FALLBACK_BASE = 'https://loader.to/ajax/download.php';
+const YT_FALLBACK_QUALITY: Record<string, string> = {
+  '144': '144', '240': '240', '360': '360', '480': '480', '540': '540',
+  '720': '720', '1080': '1080', '1440': '1440', '2160': '2160',
+};
+const YT_AUDIO_FORMATS: Record<string, string> = { mp3: 'mp3', m4a: 'm4a', wav: 'wav', opus: 'opus' };
+
+/** هل الرابط رابط يوتيوب؟ (youtu.be أو youtube.com) */
+export function isYoutubeUrl(url: string): boolean {
+  try {
+    return /(^|\.)(youtube\.com|youtu\.be)$/.test(new URL(url).hostname.replace(/^www\./, ''));
+  } catch {
+    return false;
+  }
+}
+
+/** يستخرج معرف الفيديو من أي صيغة رابط يوتيوب، أو null. */
+export function youtubeVideoId(url: string): string | null {
+  const m = url.match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/)([A-Za-z0-9_-]{6,})/);
+  return m?.[1] ?? null;
+}
+
+export type YoutubeFallbackResult = { url: string; title: string | null };
+
+/**
+ * يجهّز تنزيل يوتيوب عبر الخدمة الاحتياطية ويعيد الرابط النهائي مع اسم الفيديو الحقيقي.
+ * format: 'video' مع جودة رقمية، أو 'audio' مع صيغة صوتية.
+ */
+export async function prepareYoutubeFallback(sourceUrl: string, options: { mode: 'video' | 'audio'; format?: string }): Promise<YoutubeFallbackResult> {
+  const id = youtubeVideoId(sourceUrl);
+  if (!id) throw new Error('تعذر قراءة معرف فيديو يوتيوب من الرابط.');
+  const formatParam = options.mode === 'audio'
+    ? (YT_AUDIO_FORMATS[options.format ?? 'mp3'] ?? 'mp3')
+    : (YT_FALLBACK_QUALITY[options.format ?? '720'] ?? '720');
+  const start = await fetch(`${YT_FALLBACK_BASE}?format=${formatParam}&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}`);
+  if (!start.ok) throw new Error('تعذر بدء تجهيز الفيديو عبر الخدمة الاحتياطية.');
+  const startData = await start.json();
+  if (!startData?.success || !startData?.progress_url) throw new Error('رفضت الخدمة الاحتياطية هذا الفيديو.');
+  const title: string | null = typeof startData?.info?.title === 'string' ? startData.info.title : null;
+  const progressUrl: string = startData.progress_url;
+  // نستفتس حتى يجهز الملف (عادة ثوانٍ).
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const poll = await fetch(progressUrl);
+    if (!poll.ok) continue;
+    const pollData = await poll.json();
+    if (pollData?.success === 1 && typeof pollData?.download_url === 'string' && pollData.download_url) {
+      return { url: pollData.download_url, title };
+    }
+  }
+  throw new Error('انتهت مهلة تجهيز الفيديو — حاول مجدداً.');
+}
+
+/** يجلب اسم فيديو يوتيوب الحقيقي من oEmbed (بدون أي مفاتيح أو تسجيل دخول). */
+export async function fetchYoutubeTitle(sourceUrl: string): Promise<string | null> {
+  const id = youtubeVideoId(sourceUrl);
+  if (!id) return null;
+  try {
+    const response = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}&format=json`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return typeof data?.title === 'string' ? data.title : null;
+  } catch {
+    return null;
+  }
+}
+
 /** خيارات طلب الاستخراج: جودة الفيديو أو صيغة/معدل الصوت. */
 export type MediaRequestOptions =
   | { mode: 'video'; videoQuality?: string }
@@ -260,7 +329,8 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
     try {
       const errData = await response.json();
       const code: string = errData?.error?.code ?? '';
-      if (code.includes('fetch.fail')) reason = 'الرابط غير مكتمل أو المحتوى غير متاح — تأكد من نسخ الرابط كاملاً من زر المشاركة.';
+      if (code.includes('youtube.login')) reason = 'فيديوهات يوتيوب المقيدة تحتاج معالجة إضافية — أعد المحاولة أو استخدم جودة أخرى.';
+      else if (code.includes('fetch.fail')) reason = 'الرابط غير مكتمل أو المحتوى غير متاح — تأكد من نسخ الرابط كاملاً من زر المشاركة.';
       else if (code.includes('content.post.private') || code.includes('private')) reason = 'المحتوى خاص — لا يمكن تنزيله.';
       else if (code.includes('content.post.unavailable') || code.includes('unavailable')) reason = 'المنشور محذوف أو غير متاح.';
       else if (code.includes('content.video.age') || code.includes('age')) reason = 'محتوى مقيد بالعمر — لا يمكن تنزيله.';
@@ -371,12 +441,42 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
 
       // روابط ناتجة عن استخراج سابق تُنزَّل كما هي دون إعادة استخراج.
-      const [mediaUrl] = item.resolvedUrl ? [item.url] : await resolveMediaUrls(item.url, item.requestOptions);
+      // يوتيوب: الخدمة الأساسية كثيراً ما ترفض (youtube.login) — نستخدم الخدمة الاحتياطية مباشرة،
+      // ونفشل إلى الخدمة الأساسية إذا تعذرت الاحتياطية.
+      let mediaUrl: string;
+      let youtubeTitle: string | null = null;
+      if (!item.resolvedUrl && isYoutubeUrl(item.url)) {
+        try {
+          const qualityMatch = item.quality.match(/(144|240|360|480|540|720|1080|1440|2160)/);
+          const prepared = await prepareYoutubeFallback(item.url, {
+            mode: item.type === 'audio' ? 'audio' : 'video',
+            format: item.type === 'audio' ? item.format : (qualityMatch?.[1] ?? (item.format.replace(/[^0-9]/g, '') || '720')),
+          });
+          mediaUrl = prepared.url;
+          youtubeTitle = prepared.title;
+        } catch (fallbackError) {
+          // الاحتياطية فشلت — نجرب الأساسية كمحاولة أخيرة قبل إعلان الفشل.
+          try {
+            [mediaUrl] = await resolveMediaUrls(item.url, item.requestOptions);
+          } catch {
+            throw fallbackError;
+          }
+        }
+      } else {
+        [mediaUrl] = await resolveMediaUrls(item.url, item.requestOptions);
+      }
       let target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
       let resolvedTitle = item.title;
       let resolvedFormat = item.format;
+      // اسم فيديو يوتيوب الحقيقي من الخدمة الاحتياطية (أو oEmbed إن لم يتوفر).
+      if (youtubeTitle) {
+        resolvedTitle = youtubeTitle;
+      } else if (!item.resolvedUrl && isYoutubeUrl(item.url)) {
+        const oembedTitle = await fetchYoutubeTitle(item.url);
+        if (oembedTitle) resolvedTitle = oembedTitle;
+      }
       const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
       const remoteName = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
       if (remoteName) {
@@ -597,8 +697,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. */
+  /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. يوتيوب يجلب اسمه الحقيقي فوراً. */
   const addSmartDownload = useCallback(async (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => {
+    let title = input.title;
+    if ((!title || /^(watch|shorts|\d+)$/i.test(title)) && isYoutubeUrl(input.url)) {
+      const realTitle = await fetchYoutubeTitle(input.url);
+      if (realTitle) title = realTitle;
+    }
     let mediaUrls: string[] = [input.url];
     let carousel = false;
     try {
@@ -613,7 +718,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (!carousel) {
       await addDownload({
         url: mediaUrls[0],
-        title: input.title ?? 'ملف من الإنترنت',
+        title: title ?? 'ملف من الإنترنت',
         type: input.type,
         format: input.format,
         quality: input.quality,
