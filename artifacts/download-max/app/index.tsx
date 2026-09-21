@@ -1,4 +1,5 @@
 import { Feather } from '@expo/vector-icons';
+import Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useIncomingShare } from 'expo-sharing';
@@ -101,13 +102,174 @@ function useSafeIncomingShare() {
   return useIncomingShare();
 }
 
-function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault }: {
+/** يخمن نوع MIME من امتداد الملف لمشاركته بنوع صحيح. */
+function mimeFromFile(path: string) {
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  if (['mp4', 'webm', 'mov', 'm4v'].includes(ext)) return 'video/mp4';
+  if (['mp3', 'm4a', 'wav', 'aac'].includes(ext)) return 'audio/mpeg';
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) return `image/${ext === 'jpg' ? 'jpeg' : ext}`;
+  return '*/*';
+}
+
+// ————— يوتيوب: بحث حقيقي عبر Data API v3 —————
+
+type YoutubeVideo = { id: string; title: string; channel: string; thumbnail: string; views: string; duration: string };
+
+/** تنسيق مدة الفيديو من صيغة ISO-8601 (PT4M13S) إلى 4:13. */
+function formatIsoDuration(iso: string) {
+  const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return '';
+  const [, h, m, s] = match;
+  const hours = h ? `${h}:` : '';
+  const minutes = m ? `${h ? m!.padStart(2, '0') : m}:` : h ? '00:' : '';
+  const seconds = s ? s.padStart(2, '0') : '00';
+  return `${hours}${minutes}${seconds}`;
+}
+
+async function searchYoutube(query: string, apiKey: string, signal?: AbortSignal): Promise<YoutubeVideo[]> {
+  const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${apiKey}`;
+  const searchResponse = await fetch(searchUrl, { signal });
+  if (!searchResponse.ok) throw new Error('تعذر الوصول إلى يوتيوب. تحقق من الاتصال.');
+  const searchData = await searchResponse.json();
+  const videos: { id: { videoId?: string }; snippet: { title: string; channelTitle: string; thumbnails?: { medium?: { url: string } } } }[] = searchData.items ?? [];
+  const ids = videos.map((entry) => entry.id.videoId).filter(Boolean).join(',');
+  if (!ids) return [];
+  let details: Record<string, { items?: { id: string; statistics?: { viewCount?: string }; contentDetails?: { duration?: string } }[] }> = {};
+  try {
+    const detailsResponse = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${ids}&key=${apiKey}`, { signal });
+    if (detailsResponse.ok) details = await detailsResponse.json();
+  } catch {
+    // التفاصيل اختيارية — البحث يكفي
+  }
+  return videos
+    .filter((entry) => entry.id.videoId)
+    .map((entry) => {
+      const id = entry.id.videoId!;
+      const extra = details[id]?.items?.[0];
+      const viewCount = extra?.statistics?.viewCount;
+      return {
+        id,
+        title: entry.snippet.title.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'"),
+        channel: entry.snippet.channelTitle,
+        thumbnail: entry.snippet.thumbnails?.medium?.url ?? `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
+        views: viewCount ? `${new Intl.NumberFormat('ar', { notation: 'compact' }).format(Number(viewCount))} مشاهدة` : '',
+        duration: extra?.contentDetails?.duration ? formatIsoDuration(extra.contentDetails.duration) : '',
+      };
+    });
+}
+
+function YoutubePanel({ colors, onBack, onDownload, notice }: {
+  colors: Palette;
+  onBack: () => void;
+  onDownload: (videoUrl: string) => void;
+  notice: string;
+}) {
+  const apiKey = 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<YoutubeVideo[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
+
+  async function runSearch(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const found = await searchYoutube(trimmed, apiKey);
+      setResults(found);
+      if (found.length === 0) setError('لا توجد نتائج لهذا البحث');
+    } catch {
+      setError('تعذر البحث. تحقق من الاتصال وحاول مرة أخرى.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleDownload(video: YoutubeVideo) {
+    setDownloadingIds((current) => new Set(current).add(video.id));
+    onDownload(`https://www.youtube.com/watch?v=${video.id}`);
+    setTimeout(() => {
+      setDownloadingIds((current) => {
+        const next = new Set(current);
+        next.delete(video.id);
+        return next;
+      });
+    }, 2500);
+  }
+
+  return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+    <View style={styles.panelHeader}>
+      <Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable>
+      <Text style={[styles.panelTitle, { color: colors.foreground }]}>يوتيوب</Text>
+      <View style={[styles.ytBadge, { backgroundColor: `${colors.destructive}16` }]}><Feather name="youtube" size={17} color={colors.destructive} /></View>
+    </View>
+    <View style={[styles.ytSearchWrap, { backgroundColor: colors.background, borderColor: colors.input }]}>
+      <Feather name="search" size={17} color={colors.mutedForeground} />
+      <TextInput
+        value={query}
+        onChangeText={setQuery}
+        onSubmitEditing={() => void runSearch(query)}
+        placeholder="ابحث عن فيديو أو أغنية..."
+        placeholderTextColor={colors.mutedForeground}
+        style={[styles.searchInput, { color: colors.foreground }]}
+        returnKeyType="search"
+      />
+      <Pressable onPress={() => void runSearch(query)} disabled={loading} style={[styles.ytSearchButton, { backgroundColor: colors.primary }]}>
+        {loading ? <ActivityIndicator size="small" color={colors.primaryForeground} /> : <Feather name="search" size={15} color={colors.primaryForeground} />}
+      </Pressable>
+    </View>
+    {error ? <Text style={[styles.ytError, { color: colors.destructive }]}>{error}</Text> : null}
+    <FlatList
+      data={results}
+      keyExtractor={(item) => item.id}
+      style={styles.ytList}
+      contentContainerStyle={results.length === 0 ? styles.ytListEmpty : undefined}
+      ListEmptyComponent={
+        loading ? null : (
+          <View style={styles.ytEmpty}>
+            <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
+            <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من يوتيوب</Text>
+            <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>اكتب اسم أغنية أو فيديو واضغط البحث، ثم حمّل ما يعجبك مباشرة</Text>
+          </View>
+        )
+      }
+      renderItem={({ item }) => (
+        <View style={[styles.ytRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
+          <View style={styles.ytThumbWrap}>
+            <Image source={{ uri: item.thumbnail }} style={styles.ytThumb} resizeMode="cover" />
+            {item.duration ? <View style={styles.ytDuration}><Text style={styles.ytDurationText}>{item.duration}</Text></View> : null}
+          </View>
+          <View style={styles.ytBody}>
+            <Text style={[styles.ytTitle, { color: colors.cardForeground }]} numberOfLines={2}>{item.title}</Text>
+            <Text style={[styles.ytMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{item.channel}{item.views ? ` · ${item.views}` : ''}</Text>
+          </View>
+          <Pressable
+            accessibilityLabel={`تحميل ${item.title}`}
+            onPress={() => handleDownload(item)}
+            disabled={downloadingIds.has(item.id)}
+            style={[styles.ytDownloadButton, { backgroundColor: downloadingIds.has(item.id) ? colors.muted : colors.primary }]}
+          >
+            {downloadingIds.has(item.id)
+              ? <ActivityIndicator size="small" color={colors.primaryForeground} />
+              : <Feather name="download" size={17} color={colors.primaryForeground} />}
+          </Pressable>
+        </View>
+      )}
+    />
+  </Pressable>;
+}
+
+function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault, selected, onSelect }: {
   item: DownloadItem;
   onRetry: () => void;
   onRemove: () => void;
   onShare: () => void;
   onOpen: () => void;
   onVault: () => void;
+  selected: boolean;
+  onSelect: () => void;
 }) {
   const colors = useColors();
   const isActive = item.status === 'downloading' || item.status === 'queued';
@@ -120,7 +282,16 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault }: {
         ? `جارٍ التحميل · ${percentLabel(item)}`
         : 'في الانتظار';
   return (
-    <View style={[styles.downloadRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
+    <Pressable
+      onLongPress={onSelect}
+      delayLongPress={350}
+      style={[styles.downloadRow, { backgroundColor: colors.card, borderColor: selected ? colors.primary : colors.border, borderWidth: selected ? 1.6 : 1 }]}
+    >
+      {selected ? (
+        <View style={[styles.selectionCheck, { backgroundColor: colors.primary }]}>
+          <Feather name="check" size={13} color="#fff" />
+        </View>
+      ) : null}
       <View style={[styles.fileIcon, { backgroundColor: `${iconColor}16` }]}>
         <Feather name={typeIcons[item.type]} size={19} color={iconColor} />
       </View>
@@ -166,7 +337,7 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault }: {
           <Feather name="x" size={18} color={colors.mutedForeground} />
         </Pressable>
       </View>
-    </View>
+    </Pressable>
   );
 }
 
@@ -491,7 +662,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.3.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.4.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -501,16 +672,19 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash } = useDownloads();
+  const { items, activeCount, waitingForWifi, addSmartDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'home' | 'downloads' | 'play'>('home');
+  const [activeTab, setActiveTab] = useState<'home' | 'downloads' | 'play' | 'discover'>('home');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
+  const [youtubeKey, setYoutubeKey] = useState('AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44');
   const [mediaFilter, setMediaFilter] = useState<MediaType | 'all'>('all');
   const [mediaType, setMediaType] = useState<MediaType>('video');
   const [selectedFormat, setSelectedFormat] = useState('mp4');
   const [showFormatSheet, setShowFormatSheet] = useState(false);
-  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
+  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | 'youtube' | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -586,14 +760,15 @@ export default function HomeScreen() {
       setNotice('ألصق رابطاً صحيحاً يبدأ بـ https://');
       return;
     }
-    await addDownload({
+    setNotice('جارٍ تحليل الرابط...');
+    const count = await addSmartDownload({
       url,
       title: guessedTitle(url),
       type: mediaType,
       format: selectedOption.format,
       quality: mediaType === 'audio' ? 'أفضل جودة متاحة' : 'المصدر الأصلي',
     });
-    setNotice('أُضيف التحميل إلى القائمة');
+    setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
     setActiveTab('downloads');
   }
 
@@ -631,6 +806,52 @@ export default function HomeScreen() {
   function vaultAction(item: DownloadItem) {
     void moveToVault(item.id);
     setNotice('نُقل الملف إلى الخزنة 🔒');
+  }
+
+  /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
+  function toggleSelection(id: string) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }
+
+  /** مشاركة الملفات المحددة عبر لوحة مشاركة أندرويد (ملف واحد أو عدة ملفات). */
+  async function shareSelected() {
+    const targets = visibleItems.filter((item) => selectedIds.has(item.id) && item.fileUri);
+    if (targets.length === 0) {
+      setNotice('الملفات المحددة لم تكتمل بعد');
+      return;
+    }
+    const available = await Sharing.isAvailableAsync();
+    if (!available) {
+      setNotice('المشاركة غير مدعومة على هذا الجهاز');
+      return;
+    }
+    if (targets.length === 1) {
+      await Sharing.shareAsync(targets[0].fileUri!, { mimeType: mimeFromFile(targets[0].fileUri!), dialogTitle: 'مشاركة الملف' });
+    } else {
+      await Sharing.shareAsync(targets[0].fileUri!, { mimeType: mimeFromFile(targets[0].fileUri!), dialogTitle: `مشاركة ${targets.length} ملفات (شارك الباقي من المشغل)` });
+    }
+    setSelectedIds(new Set());
+  }
+
+  /** حذف المحدد: مع تحذير بين السلة أو الحذف النهائي. */
+  async function confirmDelete(permanent: boolean) {
+    if (!deleteDialog) return;
+    const ids = deleteDialog.mode === 'selection'
+      ? [...selectedIds]
+      : deleteDialog.id ? [deleteDialog.id] : [];
+    setDeleteDialog(null);
+    for (const id of ids) {
+      if (permanent) await deletePermanently(id);
+      else await removeDownload(id);
+    }
+    setSelectedIds(new Set());
+    setNotice(permanent ? `حُذف ${ids.length} ملف نهائياً` : `نُقل ${ids.length} ملف إلى السلة ♻️`);
   }
 
   return (
@@ -777,7 +998,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} onRetry={() => void retryDownload(item.id)} onRemove={() => void removeDownload(item.id)} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
+            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
         ) : (
@@ -846,10 +1067,11 @@ export default function HomeScreen() {
               <Pressable onPress={() => { setPanel(null); setActiveTab('home'); }} style={styles.menuItem}><Feather name="home" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الرئيسية</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => { setPanel(null); setActiveTab('downloads'); }} style={styles.menuItem}><Feather name="download" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>التنزيلات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><Feather name="lock" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
+              <Pressable onPress={() => setPanel('youtube')} testID="menu-youtube" style={styles.menuItem}><Feather name="youtube" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>يوتيوب — ابحث وحمّل</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.3.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.4.0</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -857,11 +1079,59 @@ export default function HomeScreen() {
             <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={openInPlayer} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : panel === 'trash' ? (
             <TrashPanel colors={colors} trashItems={trashItems} onBack={() => setPanel('menu')} onRestore={(id) => { void restoreFromTrash(id); setNotice('أُعيد الملف إلى التنزيلات ✓'); }} onDelete={(id) => void deletePermanently(id)} onEmpty={() => { void emptyTrash(); setNotice('فُرّغت سلة المحذوفات 🗑️'); }} />
+          ) : panel === 'youtube' ? (
+            <YoutubePanel colors={colors} onBack={() => setPanel('menu')} onDownload={(videoUrl: string) => { setPanel(null); void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} notice={notice ?? ''} />
           ) : (
             <AboutPanel colors={colors} onBack={() => setPanel('menu')} />
           )}
         </Pressable>
       </Modal>
+
+      {/* نافذة تأكيد الحذف: سلة المحذوفات أو حذف نهائي */}
+      <Modal visible={deleteDialog !== null} transparent animationType="fade" onRequestClose={() => setDeleteDialog(null)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setDeleteDialog(null)}>
+          <Pressable style={[styles.dialogCard, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+            <View style={[styles.dialogIcon, { backgroundColor: `${colors.destructive}14` }]}>
+              <Feather name="alert-triangle" size={26} color={colors.destructive} />
+            </View>
+            <Text style={[styles.dialogTitle, { color: colors.foreground }]}>تأكيد الحذف</Text>
+            <Text style={[styles.dialogBody, { color: colors.mutedForeground }]}>
+              {deleteDialog?.mode === 'selection' ? `حذف ${selectedIds.size} ملفات المحددة؟` : 'حذف هذا الملف؟'}
+            </Text>
+            <Pressable testID="delete-to-trash" onPress={() => void confirmDelete(false)} style={[styles.dialogButton, { backgroundColor: `${colors.primary}16` }]}>
+              <Feather name="trash-2" size={17} color={colors.primary} />
+              <Text style={[styles.dialogButtonText, { color: colors.primary }]}>حذف إلى سلة المحذوفات</Text>
+            </Pressable>
+            <Pressable testID="delete-permanent" onPress={() => void confirmDelete(true)} style={[styles.dialogButton, { backgroundColor: `${colors.destructive}14` }]}>
+              <Feather name="x-circle" size={17} color={colors.destructive} />
+              <Text style={[styles.dialogButtonText, { color: colors.destructive }]}>حذف نهائي</Text>
+            </Pressable>
+            <Pressable onPress={() => setDeleteDialog(null)} style={styles.dialogCancel}>
+              <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* شريط التحديد السفلي: مشاركة وحذف للملفات المحددة */}
+      {selectedIds.size > 0 && !panel ? (
+        <View style={[styles.selectionBar, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 30 : Math.max(insets.bottom, 10) }]}>
+          <Pressable onPress={() => setSelectedIds(new Set())} style={styles.selectionCountWrap}>
+            <Feather name="x" size={16} color={colors.mutedForeground} />
+            <Text style={[styles.selectionCount, { color: colors.foreground }]}>{selectedIds.size} محدد</Text>
+          </Pressable>
+          <View style={styles.selectionActions}>
+            <Pressable testID="selection-share" onPress={() => void shareSelected()} style={[styles.selectionAction, { backgroundColor: colors.primary }]}>
+              <Feather name="share-2" size={16} color={colors.primaryForeground} />
+              <Text style={[styles.selectionActionText, { color: colors.primaryForeground }]}>مشاركة</Text>
+            </Pressable>
+            <Pressable testID="selection-delete" onPress={() => setDeleteDialog({ mode: 'selection' })} style={[styles.selectionAction, { backgroundColor: `${colors.destructive}16` }]}>
+              <Feather name="trash-2" size={16} color={colors.destructive} />
+              <Text style={[styles.selectionActionText, { color: colors.destructive }]}>حذف</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : null}
 
       {nowPlaying ? (
         <Modal visible transparent animationType="slide" onRequestClose={() => setNowPlaying(null)}>
@@ -1076,4 +1346,39 @@ const styles = StyleSheet.create({
   onboardingButtonText: { fontSize: 14, fontWeight: '800' },
   notice: { position: 'absolute', left: 18, right: 18, bottom: 84, minHeight: 47, borderRadius: 15, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 9, elevation: 5, shadowColor: '#000', shadowOpacity: 0.18, shadowRadius: 12, shadowOffset: { width: 0, height: 5 } },
   noticeText: { flex: 1, fontSize: 12, fontWeight: '700' },
+  selectionCheck: { position: 'absolute', top: 8, left: 8, width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center', zIndex: 5 },
+  selectionBar: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 11, borderTopWidth: 1, elevation: 8, shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 14, shadowOffset: { width: 0, height: -4 } },
+  selectionCountWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  selectionCount: { fontSize: 13, fontWeight: '800' },
+  selectionActions: { flexDirection: 'row', gap: 9 },
+  selectionAction: { flexDirection: 'row', alignItems: 'center', gap: 7, paddingHorizontal: 17, paddingVertical: 10, borderRadius: 13 },
+  selectionActionText: { fontSize: 13, fontWeight: '800' },
+  dialogOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'center', alignItems: 'center', padding: 28 },
+  dialogCard: { width: '100%', maxWidth: 400, borderRadius: 20, padding: 22, alignItems: 'center' },
+  dialogIcon: { width: 58, height: 58, borderRadius: 29, justifyContent: 'center', alignItems: 'center', marginBottom: 13 },
+  dialogTitle: { fontSize: 17, fontWeight: '800', marginBottom: 6 },
+  dialogBody: { fontSize: 13, textAlign: 'center', marginBottom: 17 },
+  dialogButton: { flexDirection: 'row', alignItems: 'center', gap: 8, width: '100%', justifyContent: 'center', paddingVertical: 13, borderRadius: 13, marginBottom: 9 },
+  dialogButtonText: { fontSize: 14, fontWeight: '800' },
+  dialogCancel: { paddingVertical: 8, marginTop: 3 },
+  dialogCancelText: { fontSize: 13, fontWeight: '700' },
+  ytBadge: { width: 34, height: 34, borderRadius: 17, justifyContent: 'center', alignItems: 'center' },
+  ytSearchWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 1, borderRadius: 14, paddingHorizontal: 13, paddingVertical: 9, marginBottom: 12 },
+  ytSearchButton: { width: 36, height: 36, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
+  ytError: { fontSize: 13, fontWeight: '700', textAlign: 'center', marginBottom: 9 },
+  ytList: { flex: 1 },
+  ytListEmpty: { flexGrow: 1, justifyContent: 'center' },
+  ytEmpty: { alignItems: 'center', paddingVertical: 40, gap: 8 },
+  ytEmptyIcon: { width: 64, height: 64, borderRadius: 32, justifyContent: 'center', alignItems: 'center', marginBottom: 4 },
+  ytEmptyTitle: { fontSize: 16, fontWeight: '800' },
+  ytEmptyHint: { fontSize: 13, textAlign: 'center', paddingHorizontal: 20, lineHeight: 20 },
+  ytRow: { flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 1, borderRadius: 14, padding: 9, marginBottom: 9 },
+  ytThumbWrap: { position: 'relative' },
+  ytThumb: { width: 118, height: 68, borderRadius: 9, backgroundColor: 'rgba(0,0,0,0.08)' },
+  ytDuration: { position: 'absolute', bottom: 4, right: 4, backgroundColor: 'rgba(0,0,0,0.82)', borderRadius: 5, paddingHorizontal: 5, paddingVertical: 2 },
+  ytDurationText: { color: '#fff', fontSize: 10, fontWeight: '700' },
+  ytBody: { flex: 1, gap: 3 },
+  ytTitle: { fontSize: 13, fontWeight: '700', lineHeight: 18 },
+  ytMeta: { fontSize: 11 },
+  ytDownloadButton: { width: 40, height: 40, borderRadius: 13, justifyContent: 'center', alignItems: 'center' },
 });

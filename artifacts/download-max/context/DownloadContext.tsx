@@ -46,6 +46,8 @@ type DownloadContextValue = {
   activeCount: number;
   waitingForWifi: boolean;
   addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<void>;
+  /** يضيف تنزيلاً ذكياً: يكشف كاروسيل الصور وينشئ مهمة لكل صورة. يعيد عدد المهام. */
+  addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
@@ -201,8 +203,12 @@ async function openDownloadedFile(item: DownloadItem) {
   });
 }
 
-async function resolveMediaUrl(sourceUrl: string): Promise<string> {
-  if (looksLikeDirectMedia(sourceUrl)) return sourceUrl;
+/**
+ * يستخرج روابط الوسائط المباشرة من رابط الصفحة.
+ * يدعم كاروسيل الصور (تيك توك/إنستجرام/فيسبوك) عبر حقل picker الذي يعيد قائمة بكل الصور.
+ */
+async function resolveMediaUrls(sourceUrl: string): Promise<string[]> {
+  if (looksLikeDirectMedia(sourceUrl)) return [sourceUrl];
   const response = await fetch(EXTRACTOR_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -210,10 +216,16 @@ async function resolveMediaUrl(sourceUrl: string): Promise<string> {
   });
   if (!response.ok) throw new Error('تعذر الوصول إلى خدمة الاستخراج.');
   const data = await response.json();
-  if (data.status === 'error' || !data.url) {
-    throw new Error(data.text || 'تعذر استخراج رابط الوسائط من هذا الرابط.');
+  if (Array.isArray(data?.picker) && data.picker.length > 0) {
+    const urls = data.picker
+      .map((entry: { url?: unknown }) => (typeof entry?.url === 'string' ? entry.url : null))
+      .filter((value: unknown): value is string => typeof value === 'string');
+    if (urls.length > 0) return urls;
   }
-  return data.url as string;
+  if (data?.status === 'error' || typeof data?.url !== 'string' || !data.url) {
+    throw new Error(data?.text || 'تعذر استخراج رابط الوسائط من هذا الرابط.');
+  }
+  return [data.url as string];
 }
 
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
@@ -292,7 +304,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      const mediaUrl = await resolveMediaUrl(item.url);
+      const [mediaUrl] = await resolveMediaUrls(item.url);
       let target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
@@ -501,6 +513,47 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     enqueue(item.id);
   }, [commit, enqueue]);
 
+  /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. */
+  const addSmartDownload = useCallback(async (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => {
+    let mediaUrls: string[] = [input.url];
+    let carousel = false;
+    try {
+      const resolved = await resolveMediaUrls(input.url);
+      if (resolved.length > 1) {
+        mediaUrls = resolved;
+        carousel = true;
+      }
+    } catch {
+      // تعذر التحليل المسبق — تُضاف المهمة كالمعتاد ويعرض الخطأ داخلها عند التنفيذ.
+    }
+    if (!carousel) {
+      await addDownload({
+        url: mediaUrls[0],
+        title: input.title ?? 'ملف من الإنترنت',
+        type: input.type,
+        format: input.format,
+        quality: input.quality,
+      });
+      return 1;
+    }
+    const now = Date.now();
+    const created: DownloadItem[] = mediaUrls.map((mediaUrl, index) => ({
+      id: createId(),
+      url: mediaUrl,
+      title: `صورة ${index + 1} من ${mediaUrls.length}`,
+      type: 'image' as MediaType,
+      format: 'jpg',
+      quality: 'كاروسيل الصور',
+      status: 'queued' as const,
+      progress: 0,
+      createdAt: now - index,
+    }));
+    commit((current) => [...created, ...current]);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    for (const entry of created) enqueue(entry.id);
+    return created.length;
+  }, [addDownload, commit, enqueue]);
+
   /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content:// أو file://) مباشرةً بلا حاجة لرابط إنترنت. */
   const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
     if (Platform.OS === 'web') return;
@@ -646,6 +699,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     activeCount: items.filter((item) => item.status === 'queued' || item.status === 'downloading').length,
     waitingForWifi,
     addDownload,
+    addSmartDownload,
     addSharedFile,
     retryDownload,
     removeDownload,
@@ -660,7 +714,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
-  }), [items, waitingForWifi, addDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
+  }), [items, waitingForWifi, addDownload, addSmartDownload, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }
