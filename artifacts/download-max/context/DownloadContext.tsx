@@ -9,6 +9,8 @@ import { MaxTasks } from '@/context/SettingsContext';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
+/** مفتاح حفظ نقطة استئناف كل مهمة متوقفة مؤقتاً (جزء الملف المحمّل). */
+const RESUME_KEY_PREFIX = '@download-max/resume/';
 /** مدة بقاء الملفات في سلة المحذوفات قبل حذفها تلقائياً (30 يوماً). */
 const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -19,7 +21,7 @@ const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const EXTRACTOR_API_URL =
   process.env.EXPO_PUBLIC_EXTRACTOR_URL?.trim() || 'https://api-production-85a7.up.railway.app/';
 
-export type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'failed';
+export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed';
 export type MediaType = 'video' | 'audio' | 'image';
 
 // خدمة يوتيوب الاحتياطية: تشتغل عندما ترفض الخدمة الأساسية الفيديو (youtube.login ومشقاته).
@@ -151,6 +153,10 @@ type DownloadContextValue = {
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
+  /** إيقاف مؤقت لتنزيل جارٍ/منتظر مع حفظ الجزء المحمّل. */
+  pauseDownload: (id: string) => Promise<void>;
+  /** استئناف تنزيل متوقف من نفس النقطة. */
+  resumeDownload: (id: string) => Promise<void>;
   removeDownload: (id: string) => Promise<void>;
   clearCompleted: () => Promise<void>;
   openFile: (item: DownloadItem) => Promise<void>;
@@ -380,6 +386,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
   const progressRef = useRef(new Map<string, { progress: number; at: number }>());
   const bytesRef = useRef(new Map<string, { bytesWritten: number; totalBytes?: number }>());
+  /** مهام طلب المستخدم إيقافها — تمييز الإيقاف المقصود عن الإلغاء داخل runJob. */
+  const pauseRequestedRef = useRef(new Set<string>());
   const pumpRef = useRef<() => void>(() => undefined);
   const runJobRef = useRef<(id: string) => void>(() => undefined);
 
@@ -490,36 +498,87 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         await patchItem(id, { title: resolvedTitle, format: resolvedFormat });
       }
 
-      // إزالة أي بقايا من محاولة سابقة حتى يبدأ التقدم من الصفر.
-      const existing = await FileSystem.getInfoAsync(target);
-      if (existing.exists) await FileSystem.deleteAsync(target, { idempotent: true });
-
       let lastAt = 0;
-      const resumable = FileSystem.createDownloadResumable(
-        mediaUrl,
-        target,
-        {},
-        (progress) => {
-          const expected = progress.totalBytesExpectedToWrite;
-          const nextProgress = expected > 0 ? progress.totalBytesWritten / expected : 0;
-          if (nextProgress <= 0 || nextProgress >= 1) return;
-          const now = Date.now();
-          if (now - lastAt < 250 && nextProgress - (progressRef.current.get(id)?.progress ?? 0) < 0.02) return;
-          lastAt = now;
-          progressRef.current.set(id, { progress: nextProgress, at: now });
-          bytesRef.current.set(id, { bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
-          patchItem(id, { progress: nextProgress, bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
-        },
-      );
+      const onProgress = (progress: { totalBytesWritten: number; totalBytesExpectedToWrite: number }) => {
+        const expected = progress.totalBytesExpectedToWrite;
+        const nextProgress = expected > 0 ? progress.totalBytesWritten / expected : 0;
+        if (nextProgress <= 0 || nextProgress >= 1) return;
+        const now = Date.now();
+        // تحديث لحظي كل ربع ثانية بغض النظر عن حجم القفزة — حتى لا يبدو التقدم متجمداً في الملفات الكبيرة.
+        if (now - lastAt < 250) return;
+        lastAt = now;
+        progressRef.current.set(id, { progress: nextProgress, at: now });
+        bytesRef.current.set(id, { bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
+        patchItem(id, { progress: nextProgress, bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
+      };
+
+      // استئناف من نقطة توقف محفوظة (إن وُجدت) بدل البدء من الصفر.
+      let resumable: FileSystem.DownloadResumable | null = null;
+      let resumedFromPause = false;
+      try {
+        const savedRaw = await AsyncStorage.getItem(RESUME_KEY_PREFIX + id);
+        if (savedRaw) {
+          const saved = JSON.parse(savedRaw) as { url?: string; fileUri?: string; resumeData?: string };
+          if (saved?.url === mediaUrl && saved.fileUri) {
+            const partial = await FileSystem.getInfoAsync(saved.fileUri);
+            if (partial.exists) {
+              target = saved.fileUri;
+              resumable = FileSystem.createDownloadResumable(saved.url, saved.fileUri, {}, onProgress, saved.resumeData);
+              resumedFromPause = true;
+            }
+          }
+          if (!resumedFromPause) await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id);
+        }
+      } catch { /* حالة الاستئناف غير صالحة — بدء عادي */ }
+
+      if (!resumable) {
+        // إزالة أي بقايا من محاولة سابقة حتى يبدأ التقدم من الصفر.
+        const existing = await FileSystem.getInfoAsync(target);
+        if (existing.exists) await FileSystem.deleteAsync(target, { idempotent: true });
+        resumable = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
+      }
       resumablesRef.current.set(id, resumable);
 
-      const result = await resumable.downloadAsync();
+      // الحفاظ على البايتات المحمّلة سابقاً عند الاستئناف (قد لا يصل حدث تقدم جديد قبل الاكتمال).
+      const currentItem = itemsRef.current.find((candidate) => candidate.id === id);
+      if (!bytesRef.current.has(id) && currentItem?.bytesWritten) {
+        bytesRef.current.set(id, { bytesWritten: currentItem.bytesWritten, totalBytes: currentItem.totalBytes });
+      }
+
+      let result: FileSystem.FileSystemDownloadResult | undefined;
+      try {
+        result = resumedFromPause ? await resumable.resumeAsync() : await resumable.downloadAsync();
+      } catch (resumeError) {
+        if (!resumedFromPause) throw resumeError;
+        // الخادم لا يدعم الاستئناف من نقطة التوقف — نمسح الجزء المحمّل ونعيد من الصفر.
+        await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
+        try {
+          const partial = await FileSystem.getInfoAsync(target);
+          if (partial.exists) await FileSystem.deleteAsync(target, { idempotent: true });
+        } catch { /* تجاهل */ }
+        progressRef.current.delete(id);
+        bytesRef.current.delete(id);
+        patchItem(id, { progress: 0 });
+        const fresh = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
+        resumablesRef.current.set(id, fresh);
+        result = await fresh.downloadAsync();
+      }
+      // ننظف حالة الاستئناف فقط عند انتهاء حقيقي — الإيقاف المؤقت يحتاجها للاستئناف لاحقاً.
+      if (result) await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
       const finalBytes = bytesRef.current.get(id);
       resumablesRef.current.delete(id);
       progressRef.current.delete(id);
       bytesRef.current.delete(id);
 
-      if (result?.status === 200) {
+      if (!result) {
+        // المهمة توقفت مؤقتاً بطلب المستخدم أو أُلغيت (حذف من القائمة) — لا تعتبر فشلاً.
+        const wasPaused = pauseRequestedRef.current.has(id);
+        pauseRequestedRef.current.delete(id);
+        if (wasPaused) {
+          const live = itemsRef.current.find((candidate) => candidate.id === id);
+          if (live && !live.deletedAt) await patchItem(id, { status: 'paused' });
+        }
+      } else if (result.status === 200) {
         // ضمان صيغة صحيحة: إن كان الرابط المباشر يحمل امتداداً واضحاً نعتمده.
         let finalFormat = resolvedFormat;
         const uriExt = result.uri.split('.').pop()?.toLowerCase();
@@ -656,6 +715,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             patchItem(item.id, { status: 'queued', progress: 0, error: undefined });
             enqueue(item.id);
           }
+          // المهام المتوقفة تبقى متوقفة كما أوقفها المستخدم — لا تُعاد للتحميل تلقائياً.
         }
       })
       .then(() => {
@@ -836,6 +896,39 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     enqueue(id);
   }, [patchItem, enqueue]);
 
+  /** إيقاف مؤقت لتنزيل جارٍ أو منتظر مع حفظ الجزء المحمّل لاستئنافه لاحقاً. */
+  const pauseDownload = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    if (!item || item.status === 'completed' || item.status === 'failed' || item.status === 'paused') return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    if (item.status === 'queued') {
+      // لم يبدأ بعد — نخرجه من الطابور ونضعه في حالة إيقاف.
+      queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
+      patchItem(id, { status: 'paused', error: undefined });
+      return;
+    }
+    const resumable = resumablesRef.current.get(id);
+    if (!resumable) return;
+    pauseRequestedRef.current.add(id);
+    try {
+      const state = await resumable.pauseAsync();
+      await AsyncStorage.setItem(RESUME_KEY_PREFIX + id, JSON.stringify(state));
+      patchItem(id, { status: 'paused', error: undefined });
+    } catch {
+      pauseRequestedRef.current.delete(id);
+      // تعذر الإيقاف — يكمل التنزيل تلقائياً.
+    }
+  }, [patchItem]);
+
+  /** استئناف تنزيل متوقف من نفس النقطة (أو من الصفر إن رفض الخادم الاستئناف). */
+  const resumeDownload = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    if (!item || item.status !== 'paused') return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    patchItem(id, { status: 'queued', progress: item.progress, error: undefined });
+    enqueue(id);
+  }, [patchItem, enqueue]);
+
   /** الحذف العادي ينقل الملف إلى سلة المحذوفات لمدة 30 يوماً. */
   const removeDownload = useCallback(async (id: string) => {
     queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
@@ -955,10 +1048,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     addCarouselImages,
     resolveCarouselVideo,
     probeFileSize,
-    addSharedFile,
-    retryDownload,
-    removeDownload,
-    clearCompleted,
+  addSharedFile,
+  retryDownload,
+  pauseDownload,
+  resumeDownload,
+  removeDownload,
+  clearCompleted,
     openFile,
     shareFile,
     moveToVault,
@@ -969,7 +1064,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
-  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
+  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile,
+    retryDownload,
+    pauseDownload,
+    resumeDownload,
+    removeDownload,
+    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

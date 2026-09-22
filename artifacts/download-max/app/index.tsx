@@ -372,9 +372,11 @@ function YoutubePanel({ colors, onBack, onDownload, notice }: {
   </Pressable>;
 }
 
-function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault, selected, onSelect }: {
+function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, selected, onSelect }: {
   item: DownloadItem;
   onRetry: () => void;
+  onPause: () => void;
+  onResume: () => void;
   onRemove: () => void;
   onShare: () => void;
   onOpen: () => void;
@@ -384,14 +386,17 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault, select
 }) {
   const colors = useColors();
   const isActive = item.status === 'downloading' || item.status === 'queued';
-  const iconColor = item.status === 'completed' ? colors.accentForeground : item.status === 'failed' ? colors.destructive : colors.primary;
+  const isPaused = item.status === 'paused';
+  const iconColor = item.status === 'completed' ? colors.accentForeground : item.status === 'failed' ? colors.destructive : isPaused ? colors.mutedForeground : colors.primary;
   const statusLabel = item.status === 'completed'
     ? 'اكتمل'
     : item.status === 'failed'
       ? 'تعذر التحميل'
-      : isActive
-        ? `جارٍ التحميل · ${percentLabel(item)}`
-        : 'في الانتظار';
+      : isPaused
+        ? `متوقف مؤقتاً · ${percentLabel(item)}`
+        : isActive
+          ? `جارٍ التحميل · ${percentLabel(item)}`
+          : 'في الانتظار';
   return (
     <Pressable
       onLongPress={onSelect}
@@ -410,15 +415,15 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault, select
         <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
         <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
           {typeLabels[item.type]} · {item.format.toUpperCase()} · {statusLabel}
-          {isActive && item.bytesWritten ? ` · ${formatBytes(item.bytesWritten)}` : ''}
+          {(isActive || isPaused) && item.bytesWritten ? ` · ${formatBytes(item.bytesWritten)}` : ''}
           {item.totalBytes ? ` / ${formatBytes(item.totalBytes)}` : ''}
         </Text>
-        {isActive ? (
+        {isActive || isPaused ? (
           <View style={styles.progressLine}>
             <View style={[styles.progressTrack, { backgroundColor: colors.muted }]}>
-              <View style={[styles.progressFill, { backgroundColor: colors.primary, width: `${Math.max(item.progress * 100, 4)}%` }]} />
+              <View style={[styles.progressFill, { backgroundColor: isPaused ? colors.mutedForeground : colors.primary, width: `${Math.max(item.progress * 100, 4)}%` }]} />
             </View>
-            <Text style={[styles.progressPercent, { color: colors.primary }]}>{percentLabel(item)}</Text>
+            <Text style={[styles.progressPercent, { color: isPaused ? colors.mutedForeground : colors.primary }]}>{percentLabel(item)}</Text>
           </View>
         ) : item.error ? (
           <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
@@ -441,8 +446,14 @@ function DownloadRow({ item, onRetry, onRemove, onShare, onOpen, onVault, select
           <Pressable testID="retry-download" accessibilityLabel="إعادة المحاولة" onPress={onRetry} style={styles.iconButton}>
             <Feather name="refresh-cw" size={18} color={colors.primary} />
           </Pressable>
+        ) : isPaused ? (
+          <Pressable testID="resume-download" accessibilityLabel="استئناف التحميل" onPress={onResume} style={styles.iconButton}>
+            <Feather name="play" size={18} color={colors.primary} />
+          </Pressable>
         ) : (
-          <ActivityIndicator size="small" color={colors.primary} />
+          <Pressable testID="pause-download" accessibilityLabel="إيقاف مؤقت" onPress={onPause} style={styles.iconButton}>
+            <Feather name="pause" size={18} color={colors.primary} />
+          </Pressable>
         )}
         <Pressable testID="remove-download" accessibilityLabel="حذف من السجل" onPress={onRemove} style={styles.iconButton}>
           <Feather name="x" size={18} color={colors.mutedForeground} />
@@ -744,7 +755,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.4</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.5</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -754,7 +765,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1239,7 +1250,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
+            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
         ) : null}
@@ -1377,7 +1388,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.4</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.5</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />

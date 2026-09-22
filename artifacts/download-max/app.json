@@ -2,7 +2,7 @@
   "expo": {
     "name": "Download Max",
     "slug": "download-max",
-    "version": "1.9.4",
+    "version": "1.9.5",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "download-max",
@@ -47,6 +47,13 @@
         "expo-video",
         {
           "supportsPictureInPicture": true
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "savePhotosPermission": "يحتاج التطبيق إذن حفظ الوسائط لعرض ملفاتك في الاستوديو والمعرض.",
+          "isAccessMediaLocationEnabled": false
         }
       ]
     ],
