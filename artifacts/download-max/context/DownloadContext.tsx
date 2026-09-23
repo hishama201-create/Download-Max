@@ -8,6 +8,7 @@ import Constants from 'expo-constants';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
+import { extractAudioFromVideo } from '@/context/audio';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
@@ -177,6 +178,8 @@ type DownloadContextValue = {
   deletePermanently: (id: string) => Promise<void>;
   /** تفريغ سلة المحذوفات بالكامل. */
   emptyTrash: () => Promise<void>;
+  /** يحوّل فيديو مكتمل إلى ملف صوتي (MP3/M4A) عبر FFmpeg ويضيفه كصف جديد في القائمة. يعيد true عند النجاح. */
+  convertVideoToAudio: (id: string, format: 'mp3' | 'm4a', onProgress?: (message: string) => void) => Promise<boolean>;
 };
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -1052,6 +1055,42 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [patchItem]);
 
+  /**
+   * يحوّل فيديو مكتمل إلى ملف صوتي عبر FFmpeg ثم يضيف الناتج كصف جديد مكتمل في القائمة.
+   * الملف الصوتي يُحفظ ويظهر بكل أزرار التشغيل والمشاركة والخزنة كأي ملف آخر.
+   */
+  const convertVideoToAudio = useCallback(async (id: string, format: 'mp3' | 'm4a', onProgress?: (message: string) => void) => {
+    const source = itemsRef.current.find((candidate) => candidate.id === id);
+    if (!source || source.status !== 'completed' || !source.fileUri) return false;
+    if (Platform.OS === 'web') return false;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const result = await extractAudioFromVideo({
+      videoUri: source.fileUri,
+      title: source.title.replace(/\.[^.]+$/, ''),
+      format,
+      onProgress,
+    });
+    if (!result.ok || !result.fileUri) return false;
+    // نضيف الملف الصوتي كصف جديد مكتمل مباشرة (بلا طابور — التحويل اكتمل بالفعل).
+    const audioItem: DownloadItem = {
+      id: createId(),
+      url: result.fileUri,
+      title: `${source.title.replace(/\.[^.]+$/, '')} — صوت`,
+      type: 'audio',
+      format,
+      quality: 'محوّل من الفيديو',
+      status: 'completed',
+      progress: 1,
+      bytesWritten: result.size,
+      totalBytes: result.size,
+      fileUri: result.fileUri,
+      createdAt: Date.now(),
+    };
+    commit((current) => [audioItem, ...current]);
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    return true;
+  }, [commit]);
+
   const setQueueOptions = useCallback((options: { maxTasks: MaxTasks; allowMobileData: boolean }) => {
     maxTasksRef.current = options.maxTasks;
     allowMobileDataRef.current = options.allowMobileData;
@@ -1105,12 +1144,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
+    convertVideoToAudio,
   }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile,
     retryDownload,
     pauseDownload,
     resumeDownload,
     removeDownload,
-    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash]);
+    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

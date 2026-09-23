@@ -372,7 +372,7 @@ function YoutubePanel({ colors, onBack, onDownload, notice }: {
   </Pressable>;
 }
 
-function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, selected, onSelect }: {
+function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected, onSelect }: {
   item: DownloadItem;
   onRetry: () => void;
   onPause: () => void;
@@ -381,6 +381,7 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
   onShare: () => void;
   onOpen: () => void;
   onVault: () => void;
+  onMore: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -435,6 +436,14 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
           <>
             <Pressable testID="open-file" accessibilityLabel="فتح الملف" onPress={onOpen} style={[styles.iconButton, styles.openButton, { backgroundColor: colors.primary }]}>
               <Feather name="play" size={15} color={colors.primaryForeground} />
+            </Pressable>
+            <Pressable
+              testID="more-actions"
+              accessibilityLabel="خيارات إضافية"
+              onPress={onMore}
+              style={styles.iconButton}
+            >
+              <Feather name="more-vertical" size={18} color={colors.mutedForeground} />
             </Pressable>
             <Pressable testID="share-file" accessibilityLabel="مشاركة الملف" onPress={onShare} style={styles.iconButton}>
               <Feather name="share-2" size={18} color={colors.primary} />
@@ -756,7 +765,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.7</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.8</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -766,13 +775,19 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
   const [activeTab, setActiveTab] = useState<'home' | 'downloads'>('home');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
+  /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
+  const [moreMenu, setMoreMenu] = useState<DownloadItem | null>(null);
+  /** صيغة الصوت المختارة في نافذة التحويل. */
+  const [convertFormat, setConvertFormat] = useState<'mp3' | 'm4a'>('mp3');
+  /** التحويل قيد التنفيذ — لمنع الضغط المزدوج. */
+  const [converting, setConverting] = useState(false);
   const [youtubeKey, setYoutubeKey] = useState('AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44');
   const [mediaFilter, setMediaFilter] = useState<MediaType | 'all'>('all');
   const [mediaType, setMediaType] = useState<MediaType>('video');
@@ -1061,6 +1076,25 @@ export default function HomeScreen() {
     setNotice('نُقل الملف إلى الخزنة 🔒');
   }
 
+  /** يبدأ تحويل الفيديو المختار إلى صوت بالصيغة المحددة. */
+  async function runConvert() {
+    const target = moreMenu;
+    if (!target || converting) return;
+    setConverting(true);
+    setNotice('جارٍ تحويل الفيديو إلى صوت...');
+    try {
+      const ok = await convertVideoToAudio(target.id, convertFormat, (message) => setNotice(message));
+      if (ok) {
+        setNotice(`تم التحويل إلى ${convertFormat.toUpperCase()} ✓ الملف في القائمة`);
+      } else {
+        setNotice('تعذّر التحويل — تأكد أن الملف فيديو سليم وحاول مجدداً');
+      }
+    } finally {
+      setConverting(false);
+      setMoreMenu(null);
+    }
+  }
+
   /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
   function toggleSelection(id: string) {
     setSelectedIds((current) => {
@@ -1251,7 +1285,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} />}
+            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
         ) : null}
@@ -1425,6 +1459,50 @@ export default function HomeScreen() {
               <Text style={[styles.dialogButtonText, { color: colors.destructive }]}>حذف نهائي</Text>
             </Pressable>
             <Pressable onPress={() => setDeleteDialog(null)} style={styles.dialogCancel}>
+              <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* القائمة السياقية لزر النقاط ⋮: تحويل الفيديو إلى صوت */}
+      <Modal visible={moreMenu !== null} transparent animationType="fade" onRequestClose={() => setMoreMenu(null)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setMoreMenu(null)}>
+          <Pressable style={[styles.dialogCard, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+            <View style={[styles.dialogIcon, { backgroundColor: `${colors.primary}14` }]}>
+              <Feather name="music" size={26} color={colors.primary} />
+            </View>
+            <Text style={[styles.dialogTitle, { color: colors.foreground }]}>تحويل الفيديو إلى صوت</Text>
+            <Text style={[styles.dialogBody, { color: colors.mutedForeground }]} numberOfLines={2}>
+              {moreMenu?.title ?? ''}
+            </Text>
+            <View style={styles.convertFormatRow}>
+              {([['mp3', 'MP3', 'أوسع توافق'], ['m4a', 'M4A', 'جودة أصلية']] as const).map(([value, label, detail]) => (
+                <Pressable
+                  key={value}
+                  testID={`convert-${value}`}
+                  onPress={() => setConvertFormat(value)}
+                  style={[styles.convertFormatCard, { borderColor: convertFormat === value ? colors.primary : colors.border, backgroundColor: convertFormat === value ? `${colors.primary}12` : 'transparent' }]}
+                >
+                  <Text style={[styles.convertFormatLabel, { color: convertFormat === value ? colors.primary : colors.foreground }]}>{label}</Text>
+                  <Text style={[styles.convertFormatDetail, { color: colors.mutedForeground }]}>{detail}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable
+              testID="convert-run"
+              onPress={() => void runConvert()}
+              disabled={converting}
+              style={[styles.dialogButton, { backgroundColor: colors.primary, opacity: converting ? 0.6 : 1 }]}
+            >
+              {converting ? (
+                <ActivityIndicator size="small" color={colors.primaryForeground} />
+              ) : (
+                <Feather name="music" size={17} color={colors.primaryForeground} />
+              )}
+              <Text style={[styles.dialogButtonText, { color: colors.primaryForeground }]}>{converting ? 'جارٍ التحويل...' : 'تحويل الآن'}</Text>
+            </Pressable>
+            <Pressable onPress={() => setMoreMenu(null)} style={styles.dialogCancel}>
               <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
             </Pressable>
           </Pressable>
@@ -1656,6 +1734,10 @@ const styles = StyleSheet.create({
   dialogTitle: { fontSize: 17, fontWeight: '800', marginBottom: 6 },
   dialogBody: { fontSize: 13, textAlign: 'center', marginBottom: 17 },
   dialogButton: { flexDirection: 'row', alignItems: 'center', gap: 8, width: '100%', justifyContent: 'center', paddingVertical: 13, borderRadius: 13, marginBottom: 9 },
+  convertFormatRow: { flexDirection: 'row', gap: 10, width: '100%', marginBottom: 14 },
+  convertFormatCard: { flex: 1, borderWidth: 1.6, borderRadius: 13, paddingVertical: 11, alignItems: 'center', gap: 2 },
+  convertFormatLabel: { fontSize: 15, fontWeight: '800' },
+  convertFormatDetail: { fontSize: 11 },
   dialogButtonText: { fontSize: 14, fontWeight: '800' },
   dialogCancel: { paddingVertical: 8, marginTop: 3 },
   dialogCancelText: { fontSize: 13, fontWeight: '700' },
