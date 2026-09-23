@@ -331,10 +331,15 @@ async function openWithViewer(item: DownloadItem) {
   }
   // نرمّز كل مقطع من المسار حتى يقرأه FileProvider بشكل صحيح (أسماء عربية، فراغات...).
   const relative = item.fileUri.slice(filesDir.length).split('/').map(encodeURIComponent).join('/');
+  // نوع MIME يُستنتج من امتداد الملف الفعلي؛ وإن فشل الاستنتاج نستخدم نوع المهمة (فيديو/صوت/صورة)
+  // حتى لا تظهر قائمة التطبيقات عامة (*/*) أبداً — بل مشغلات النوع الصحيح فقط.
+  const mime = mimeFor(item.fileUri) !== '*/*'
+    ? mimeFor(item.fileUri)
+    : item.type === 'image' ? 'image/*' : item.type === 'audio' ? 'audio/*' : 'video/*';
   try {
     await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
       data: `content://${applicationId}.SharingFileProvider/expo_files/${relative}`,
-      type: mimeFor(item.fileUri),
+      type: mime,
       flags: 1, // FLAG_GRANT_READ_URI_PERMISSION — إذن قراءة مؤقت للتطبيق الذي يفتح الملف
     });
   } catch {
