@@ -2,7 +2,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
+import * as IntentLauncher from 'expo-intent-launcher';
 import * as Sharing from 'expo-sharing';
+import Constants from 'expo-constants';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
@@ -150,6 +152,10 @@ type DownloadContextValue = {
   resolveCarouselVideo: (sourceUrl: string, videoQuality: string) => Promise<string | null>;
   /** يجلب حجم الملف المقدّر لجودة معينة قبل التنزيل (بايت) أو null عند الفشل. */
   probeFileSize: (input: { url: string; type: MediaType; format: string }) => Promise<number | null>;
+  /** يشغّل الملف بنية فتح باستخدام (قائمة مشغلات الفيديو/الصوت/الصور المدعومة). */
+  openFile: (item: DownloadItem) => Promise<void>;
+  /** يشارك الملف عبر لوحة مشاركة أندرويد (التطبيقات التي تقبل مشاركة الملفات). */
+  shareFile: (item: DownloadItem) => Promise<void>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
@@ -159,8 +165,6 @@ type DownloadContextValue = {
   resumeDownload: (id: string) => Promise<void>;
   removeDownload: (id: string) => Promise<void>;
   clearCompleted: () => Promise<void>;
-  openFile: (item: DownloadItem) => Promise<void>;
-  shareFile: (item: DownloadItem) => Promise<void>;
   moveToVault: (id: string) => Promise<void>;
   removeFromVault: (id: string) => Promise<void>;
   setQueueOptions: (options: { maxTasks: MaxTasks; allowMobileData: boolean }) => void;
@@ -296,17 +300,49 @@ function mimeFor(filename: string) {
 }
 
 /**
- * يفتح الملف الذي تم تنزيله عبر لوحة مشاركة أندرويد،
- * فيمكن تشغيله بأي مشغل فيديو/صوت أو عارض صور مثبّت على الجهاز.
+ * يفتح الملف الذي تم تنزيله عبر لوحة مشاركة أندرويد (ACTION_SEND)،
+ * للتطبيقات والخصائص التي تقبل مشاركة الملفات.
  */
-async function openDownloadedFile(item: DownloadItem) {
+async function shareDownloadedFile(item: DownloadItem) {
   if (Platform.OS === 'web' || !item.fileUri) return;
   const available = await Sharing.isAvailableAsync();
   if (!available) throw new Error('المشاركة غير مدعومة على هذا الجهاز.');
   await Sharing.shareAsync(item.fileUri, {
     mimeType: mimeFor(item.fileUri),
-    dialogTitle: 'فتح أو مشاركة الملف',
+    dialogTitle: 'مشاركة الملف',
   });
+}
+
+/**
+ * يشغّل الملف الذي تم تنزيله بنية "فتح باستخدام" (ACTION_VIEW):
+ * يعرض أندرويد قائمة التطبيقات المدعومة لهذا النوع فقط
+ * (مشغلات فيديو/صوت، عارضات صور...) دون المرور بلوحة المشاركة.
+ * نمرر الملف عبر مزود ملفات expo-sharing (content://…SharingFileProvider/expo_files/…)
+ * مع إذن قراءة مؤقت حتى يستطيع المشغل الخارجي قراءته.
+ * عند عدم وجود تطبيق مناسب أو فشل الفتح نرجع للوحة المشاركة كبديل.
+ */
+async function openWithViewer(item: DownloadItem) {
+  if (Platform.OS === 'web' || !item.fileUri) return;
+  const applicationId = Constants.expoConfig?.android?.package;
+  const filesDir = FileSystem.documentDirectory;
+  if (!applicationId || !filesDir || !item.fileUri.startsWith(filesDir)) {
+    await shareDownloadedFile(item);
+    return;
+  }
+  // نرمّز كل مقطع من المسار حتى يقرأه FileProvider بشكل صحيح (أسماء عربية، فراغات...).
+  const relative = item.fileUri.slice(filesDir.length).split('/').map(encodeURIComponent).join('/');
+  try {
+    await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
+      data: `content://${applicationId}.SharingFileProvider/expo_files/${relative}`,
+      type: mimeFor(item.fileUri),
+      flags: 1, // FLAG_GRANT_READ_URI_PERMISSION — إذن قراءة مؤقت للتطبيق الذي يفتح الملف
+    });
+  } catch {
+    // لا مشغل مناسب لهذا النوع أو فشل الفتح — لوحة المشاركة كبديل حتى لا يبقى الزر ميتاً.
+    try {
+      await shareDownloadedFile(item);
+    } catch { /* تجاهل */ }
+  }
 }
 
 /**
@@ -992,13 +1028,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const openFile = useCallback(async (item: DownloadItem) => {
     if (item.status !== 'completed' || !item.fileUri) return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    await openDownloadedFile(item);
+    await openWithViewer(item);
   }, []);
 
   const shareFile = useCallback(async (item: DownloadItem) => {
     if (item.status !== 'completed' || !item.fileUri) return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    await openDownloadedFile(item);
+    await shareDownloadedFile(item);
   }, []);
 
   const moveToVault = useCallback(async (id: string) => {
