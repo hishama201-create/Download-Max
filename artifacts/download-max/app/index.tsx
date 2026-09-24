@@ -445,12 +445,6 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
             >
               <Feather name="more-vertical" size={18} color={colors.mutedForeground} />
             </Pressable>
-            <Pressable testID="share-file" accessibilityLabel="مشاركة الملف" onPress={onShare} style={styles.iconButton}>
-              <Feather name="share-2" size={18} color={colors.primary} />
-            </Pressable>
-            <Pressable testID="vault-file" accessibilityLabel="نقل إلى الخزنة" onPress={onVault} style={styles.iconButton}>
-              <Feather name="lock" size={16} color={colors.primary} />
-            </Pressable>
           </>
         ) : item.status === 'failed' ? (
           <Pressable testID="retry-download" accessibilityLabel="إعادة المحاولة" onPress={onRetry} style={styles.iconButton}>
@@ -765,7 +759,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.8</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.9</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -1465,45 +1459,68 @@ export default function HomeScreen() {
         </Pressable>
       </Modal>
 
-      {/* القائمة السياقية لزر النقاط ⋮: تحويل الفيديو إلى صوت */}
-      <Modal visible={moreMenu !== null} transparent animationType="fade" onRequestClose={() => setMoreMenu(null)}>
-        <Pressable style={styles.dialogOverlay} onPress={() => setMoreMenu(null)}>
-          <Pressable style={[styles.dialogCard, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
-            <View style={[styles.dialogIcon, { backgroundColor: `${colors.primary}14` }]}>
-              <Feather name="music" size={26} color={colors.primary} />
-            </View>
-            <Text style={[styles.dialogTitle, { color: colors.foreground }]}>تحويل الفيديو إلى صوت</Text>
-            <Text style={[styles.dialogBody, { color: colors.mutedForeground }]} numberOfLines={2}>
-              {moreMenu?.title ?? ''}
-            </Text>
-            <View style={styles.convertFormatRow}>
-              {([['mp3', 'MP3', 'أوسع توافق'], ['m4a', 'M4A', 'جودة أصلية']] as const).map(([value, label, detail]) => (
-                <Pressable
-                  key={value}
-                  testID={`convert-${value}`}
-                  onPress={() => setConvertFormat(value)}
-                  style={[styles.convertFormatCard, { borderColor: convertFormat === value ? colors.primary : colors.border, backgroundColor: convertFormat === value ? `${colors.primary}12` : 'transparent' }]}
-                >
-                  <Text style={[styles.convertFormatLabel, { color: convertFormat === value ? colors.primary : colors.foreground }]}>{label}</Text>
-                  <Text style={[styles.convertFormatDetail, { color: colors.mutedForeground }]}>{detail}</Text>
-                </Pressable>
-              ))}
-            </View>
-            <Pressable
-              testID="convert-run"
-              onPress={() => void runConvert()}
-              disabled={converting}
-              style={[styles.dialogButton, { backgroundColor: colors.primary, opacity: converting ? 0.6 : 1 }]}
-            >
-              {converting ? (
-                <ActivityIndicator size="small" color={colors.primaryForeground} />
-              ) : (
-                <Feather name="music" size={17} color={colors.primaryForeground} />
-              )}
-              <Text style={[styles.dialogButtonText, { color: colors.primaryForeground }]}>{converting ? 'جارٍ التحويل...' : 'تحويل الآن'}</Text>
+      {/* القائمة الذكية لزر النقاط ⋮ — ورقة سفلية برأس الملف وإجراءات تتكيف مع النوع */}
+      <Modal visible={moreMenu !== null} transparent animationType="slide" onRequestClose={() => setMoreMenu(null)}>
+        <Pressable style={styles.sheetBackdrop} onPress={() => setMoreMenu(null)}>
+          <Pressable style={[styles.moreSheet, { backgroundColor: colors.card, paddingBottom: Platform.OS === 'web' ? 24 : Math.max(insets.bottom, 16) }]} onPress={(event) => event.stopPropagation()}>
+            <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
+            {moreMenu ? (
+              <View style={[styles.moreHeader, { borderBottomColor: colors.border }]}>
+                <View style={[styles.moreHeaderIcon, { backgroundColor: `${colors.primary}14` }]}>
+                  <Feather name={typeIcons[moreMenu.type]} size={22} color={colors.primary} />
+                </View>
+                <View style={styles.moreHeaderText}>
+                  <Text style={[styles.moreHeaderTitle, { color: colors.foreground }]} numberOfLines={2}>{moreMenu.title}</Text>
+                  <Text style={[styles.moreHeaderMeta, { color: colors.mutedForeground }]}>{typeLabels[moreMenu.type]} · {moreMenu.format.toUpperCase()}{moreMenu.totalBytes ? ` · ${formatBytes(moreMenu.totalBytes)}` : ''}</Text>
+                </View>
+              </View>
+            ) : null}
+            {moreMenu?.type === 'video' ? (
+              <View style={styles.convertFormatRow}>
+                {([['mp3', 'MP3', 'أوسع توافق'], ['m4a', 'M4A', 'جودة أصلية']] as const).map(([value, label, detail]) => (
+                  <Pressable
+                    key={value}
+                    testID={`convert-${value}`}
+                    onPress={() => setConvertFormat(value)}
+                    style={[styles.convertFormatCard, { borderColor: convertFormat === value ? colors.primary : colors.border, backgroundColor: convertFormat === value ? `${colors.primary}12` : 'transparent' }]}
+                  >
+                    <Text style={[styles.convertFormatLabel, { color: convertFormat === value ? colors.primary : colors.foreground }]}>{label}</Text>
+                    <Text style={[styles.convertFormatDetail, { color: colors.mutedForeground }]}>{detail}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+            {moreMenu?.type === 'video' ? (
+              <Pressable
+                testID="convert-run"
+                onPress={() => void runConvert()}
+                disabled={converting}
+                style={[styles.moreRow, { opacity: converting ? 0.6 : 1 }]}
+              >
+                <View style={[styles.moreRowIcon, { backgroundColor: `${colors.primary}12` }]}>
+                  {converting ? <ActivityIndicator size="small" color={colors.primary} /> : <Feather name="music" size={18} color={colors.primary} />}
+                </View>
+                <Text style={[styles.moreRowText, { color: colors.foreground }]}>{converting ? 'جارٍ التحويل...' : `تحويل إلى صوت (${convertFormat.toUpperCase()})`}</Text>
+              </Pressable>
+            ) : null}
+            <Pressable testID="menu-vault" onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) vaultAction(target); }} style={styles.moreRow}>
+              <View style={[styles.moreRowIcon, { backgroundColor: `${colors.accentForeground}14` }]}>
+                <Feather name="lock" size={18} color={colors.accentForeground} />
+              </View>
+              <Text style={[styles.moreRowText, { color: colors.foreground }]}>القفل في الخزنة</Text>
             </Pressable>
-            <Pressable onPress={() => setMoreMenu(null)} style={styles.dialogCancel}>
-              <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
+            <Pressable testID="menu-share" onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) showShare(target); }} style={styles.moreRow}>
+              <View style={[styles.moreRowIcon, { backgroundColor: `${colors.primary}12` }]}>
+                <Feather name="share-2" size={18} color={colors.primary} />
+              </View>
+              <Text style={[styles.moreRowText, { color: colors.foreground }]}>مشاركة</Text>
+            </Pressable>
+            <Pressable testID="menu-delete" onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) setDeleteDialog({ mode: 'single', id: target.id }); }} style={styles.moreRow}>
+              <View style={[styles.moreRowIcon, { backgroundColor: `${colors.destructive}12` }]}>
+                <Feather name="trash-2" size={18} color={colors.destructive} />
+              </View>
+              <Text style={[styles.moreRowText, { color: colors.destructive }]}>حذف الملف</Text>
+              <Text style={[styles.moreRowHint, { color: colors.mutedForeground }]}>سلة 30 يوماً أو نهائي</Text>
             </Pressable>
           </Pressable>
         </Pressable>
@@ -1738,6 +1755,17 @@ const styles = StyleSheet.create({
   convertFormatCard: { flex: 1, borderWidth: 1.6, borderRadius: 13, paddingVertical: 11, alignItems: 'center', gap: 2 },
   convertFormatLabel: { fontSize: 15, fontWeight: '800' },
   convertFormatDetail: { fontSize: 11 },
+  sheetBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  moreSheet: { borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingTop: 10, paddingHorizontal: 18 },
+  moreHeader: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, paddingVertical: 14, borderBottomWidth: 1 },
+  moreHeaderIcon: { width: 44, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  moreHeaderText: { flex: 1 },
+  moreHeaderTitle: { fontSize: 15, fontWeight: '800', textAlign: 'right' },
+  moreHeaderMeta: { fontSize: 12, marginTop: 2, textAlign: 'right' },
+  moreRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 13, paddingVertical: 13 },
+  moreRowIcon: { width: 38, height: 38, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
+  moreRowText: { flex: 1, fontSize: 15, fontWeight: '700', textAlign: 'right' },
+  moreRowHint: { fontSize: 11 },
   dialogButtonText: { fontSize: 14, fontWeight: '800' },
   dialogCancel: { paddingVertical: 8, marginTop: 3 },
   dialogCancelText: { fontSize: 13, fontWeight: '700' },
