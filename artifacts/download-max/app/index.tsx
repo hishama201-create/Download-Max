@@ -410,9 +410,27 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
           <Feather name="check" size={13} color="#fff" />
         </View>
       ) : null}
-      <View style={[styles.fileIcon, { backgroundColor: `${iconColor}16` }]}>
-        <Feather name={typeIcons[item.type]} size={19} color={iconColor} />
-      </View>
+      {item.status === 'completed' && item.thumbnailUri ? (
+        <View style={[styles.fileThumbWrap, { backgroundColor: colors.muted }]}>
+          <Image source={{ uri: item.thumbnailUri }} style={styles.fileThumbImage} resizeMode="cover" />
+          {item.type === 'video' ? (
+            <View style={styles.fileThumbBadge}>
+              <Feather name="play" size={10} color="#fff" />
+            </View>
+          ) : null}
+        </View>
+      ) : item.status === 'completed' && item.type === 'audio' ? (
+        <View style={[styles.vinylDisc, { backgroundColor: colors.background }]}>
+          <View style={styles.vinylGrooves} />
+          <View style={[styles.vinylLabel, { backgroundColor: iconColor }]}>
+            <Feather name="headphones" size={13} color="#fff" />
+          </View>
+        </View>
+      ) : (
+        <View style={[styles.fileIcon, { backgroundColor: `${iconColor}16` }]}>
+          <Feather name={typeIcons[item.type]} size={19} color={iconColor} />
+        </View>
+      )}
       <View style={styles.rowBody}>
         <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
         <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
@@ -759,7 +777,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.9.9</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.10.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -1652,6 +1670,12 @@ const styles = StyleSheet.create({
   filterText: { fontSize: 11, fontWeight: '700' },
   downloadRow: { borderRadius: 17, borderWidth: 1, padding: 13, flexDirection: 'row', alignItems: 'center' },
   fileIcon: { width: 42, height: 42, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
+  fileThumbWrap: { width: 56, height: 56, borderRadius: 12, overflow: 'hidden', justifyContent: 'center', alignItems: 'center' },
+  fileThumbImage: { width: '100%', height: '100%' },
+  fileThumbBadge: { position: 'absolute', bottom: 3, right: 3, width: 16, height: 16, borderRadius: 8, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center' },
+  vinylDisc: { width: 56, height: 56, borderRadius: 28, alignItems: 'center', justifyContent: 'center' },
+  vinylGrooves: { position: 'absolute', width: 56, height: 56, borderRadius: 28, borderWidth: 5, borderColor: 'rgba(128,128,128,0.18)', top: 0, left: 0 },
+  vinylLabel: { width: 24, height: 24, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   rowBody: { flex: 1, marginLeft: 11, minWidth: 0 },
   rowTitle: { fontSize: 13, fontWeight: '800' },
   rowMeta: { fontSize: 10, marginTop: 4 },

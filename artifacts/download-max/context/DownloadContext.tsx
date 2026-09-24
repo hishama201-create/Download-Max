@@ -9,6 +9,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 import { extractAudioFromVideo } from '@/context/audio';
+import { generateVideoThumbnail } from '@/context/thumbnails';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
@@ -135,6 +136,8 @@ export type DownloadItem = {
   deletedAt?: number;
   /** خيارات طلب الاستخراج (جودة الفيديو أو معدل الصوت المطلوبة). */
   requestOptions?: MediaRequestOptions;
+  /** صورة مصغّرة للملف (لقطة من الفيديو) — تُولَّد بعد اكتمال التنزيل. */
+  thumbnailUri?: string;
   /** الرابط محفوظ مباشر بالفعل (نتيجة استخراج سابقة) — يُنزَّل كما هو دون إعادة استخراج. */
   resolvedUrl?: boolean;
   createdAt: number;
@@ -489,6 +492,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           fileUri: target,
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        if (item.type === 'video') {
+          void generateVideoThumbnail(target)
+            .then((thumb) => { if (thumb) patchItem(id, { thumbnailUri: thumb }); })
+            .catch(() => undefined);
+        }
         return;
       }
 
@@ -649,6 +657,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           format: finalFormat,
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        // توليد صورة مصغّرة للفيديو في الخلفية — فشلها لا يؤثر على اكتمال الملف.
+        if (item.type === 'video') {
+          void generateVideoThumbnail(target)
+            .then((thumb) => { if (thumb) patchItem(id, { thumbnailUri: thumb }); })
+            .catch(() => undefined);
+        }
       } else {
         await patchItem(id, { status: 'failed', error: `تعذر تنزيل الملف (رمز ${result?.status ?? 'مجهول'}).` });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
