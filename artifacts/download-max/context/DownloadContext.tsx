@@ -56,6 +56,19 @@ export function youtubeVideoId(url: string): string | null {
 export type YoutubeFallbackResult = { url: string; title: string | null };
 
 /**
+ * يجهّز رابط فيديو يوتيوب للتشغيل الفوري داخل المشغّل الأصلي.
+ * يستخدم نفس خدمة الاستخراج التي يعتمدها التنزيل، مع الخدمة الاحتياطية كخطة بديلة،
+ * لأن مشغّل يوتيوب المدمج (WebView) يرفض التشغيل داخل تطبيقات أندرويد.
+ */
+export async function resolveStreamUrl(youtubeUrl: string): Promise<{ url: string; title: string | null }> {
+  try {
+    const [url] = await resolveMediaUrls(youtubeUrl, { mode: 'video', videoQuality: '720' });
+    if (url) return { url, title: await fetchYoutubeTitle(youtubeUrl) };
+  } catch { /* نجرّب الاحتياطية */ }
+  return prepareYoutubeFallback(youtubeUrl, { mode: 'video', format: '720' });
+}
+
+/**
  * يجهّز تنزيل يوتيوب عبر الخدمة الاحتياطية ويعيد الرابط النهائي مع اسم الفيديو الحقيقي.
  * format: 'video' مع جودة رقمية، أو 'audio' مع صيغة صوتية.
  */
@@ -266,6 +279,46 @@ function subfolderFor(type: MediaType): string {
   return 'Image';
 }
 
+/** اسم مجلد التنزيلات الافتراضي داخل مساحة التطبيق. */
+const APP_DIR_NAME = 'Download Max';
+
+/** المجلد الأساسي: «Download Max» افتراضياً، ويُنشأ تلقائياً عند أول تنزيل. */
+async function baseDownloadDir(): Promise<string | null> {
+  const root = FileSystem.documentDirectory;
+  if (!root) return null;
+  const dir = `${root}${APP_DIR_NAME}/`;
+  try {
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  } catch {
+    return root;
+  }
+  return dir;
+}
+
+/** ملفات المستخدم التي لا يعرفها التطبيق (بعد إعادة التثبيت) — تُعاد later إلى القائمة. */
+async function orphanFilesIn(dir: string): Promise<string[]> {
+  try {
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists || !info.isDirectory) return [];
+    const names = await FileSystem.readDirectoryAsync(dir);
+    // نتجاهل المجلدات المعروفة (Video/Audio/Image) ونأخذ كل ما عداها كملفات مستعادة.
+    const folders = ['Video', 'Audio', 'Image'];
+    return names.filter((name) => !name.startsWith('.') && !folders.includes(name));
+  } catch {
+    return [];
+  }
+}
+
+/** يستنتج نوع الملف من امتداده: فيديو أو صوت أو صورة. */
+function mediaTypeOf(filename: string): MediaType | null {
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  if (VIDEO_EXTS.has(ext)) return 'video';
+  if (AUDIO_EXTS.has(ext)) return 'audio';
+  if (IMAGE_EXTS.has(ext)) return 'image';
+  return null;
+}
+
 /** يجهز مجلد النوع الفرعي ويعيد المسار مع فاصله. يعيد '' إذا تعذر الإنشاء. */
 async function ensureTypeDir(baseDirectory: string, type: MediaType): Promise<string> {
   try {
@@ -321,6 +374,10 @@ const MIME_TYPES: Record<string, string> = {
   webp: 'image/webp',
   gif: 'image/gif',
 };
+
+const VIDEO_EXTS = new Set(['mp4', 'm4v', 'webm', 'mkv', 'mov', 'avi', '3gp']);
+const AUDIO_EXTS = new Set(['mp3', 'm4a', 'aac', 'opus', 'ogg', 'wav', 'flac']);
+const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic']);
 
 function mimeFor(filename: string) {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
@@ -496,7 +553,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
-      const baseDirectory = FileSystem.documentDirectory;
+      const baseDirectory = await baseDownloadDir();
       if (!baseDirectory) throw new Error('تعذر الوصول إلى مساحة التخزين.');
 
       // الملفات المحلية المشارَكة (content:// أو file://) تُنسخ مباشرة بلا تنزيل شبكي.
@@ -811,6 +868,51 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           // المهام المتوقفة تبقى متوقفة كما أوقفها المستخدم — لا تُعاد للتحميل تلقائياً.
         }
       })
+      .then(async () => {
+        // بعد إعادة تثبيت التطبيق يبقى السجل في الذاكرة فقط، والملفات موجودة على الجهاز.
+        // نعيد تسجيل ما لا يعرفه التطبيق حتى لا تختفي مكتبته من المستخدم.
+        if (!cancelled) {
+          const root = FileSystem.documentDirectory;
+          const base = (await baseDownloadDir()) ?? root;
+          if (root && base) {
+            const dirs = [base, `${root}.vault/`];
+            const known = new Set(itemsRef.current.map((item) => item.fileUri));
+            const adopted: DownloadItem[] = [];
+            for (const dir of dirs) {
+              for (const filename of await orphanFilesIn(dir)) {
+                const uri = `${dir}${filename}`;
+                if (known.has(uri)) continue;
+                const type = mediaTypeOf(filename);
+                if (!type) continue;
+                const stat = await FileSystem.getInfoAsync(uri);
+                const size = 'size' in stat && typeof stat.size === 'number' ? stat.size : undefined;
+                const createdAt = 'modificationTime' in stat && typeof stat.modificationTime === 'number'
+                  ? stat.modificationTime * 1000
+                  : Date.now();
+                adopted.push({
+                  id: `restored-${uri}`,
+                  url: uri,
+                  title: filename.replace(/\.[^.]+$/, ''),
+                  type,
+                  format: filename.split('.').pop()?.toLowerCase() ?? 'mp4',
+                  quality: 'مستعاد من الجهاز',
+                  status: 'completed',
+                  progress: 1,
+                  bytesWritten: size,
+                  totalBytes: size,
+                  fileUri: uri,
+                  inVault: dir.includes('/.vault/'),
+                  resolvedUrl: true,
+                  createdAt,
+                });
+              }
+            }
+            if (adopted.length > 0) {
+              commit((current) => [...adopted, ...current].sort((a, b) => b.createdAt - a.createdAt));
+            }
+          }
+        }
+      })
       .then(() => {
         if (!cancelled) void purgeExpiredTrash();
       })
@@ -1099,7 +1201,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     // اخفاء فعلي: نقل الملف الى مجلد خاص مخفي (.vault) مع .nomedia لاخفائه من ماسح الوسائط
     if (item?.fileUri && !/^https?:\/\//i.test(item.fileUri) && Platform.OS !== 'web') {
       try {
-        const baseDirectory = FileSystem.documentDirectory;
+        const baseDirectory = await baseDownloadDir();
         if (baseDirectory) {
           const filename = item.fileUri.split('/').pop() ?? '';
           const vaultDir = `${baseDirectory}.vault/`;
@@ -1129,9 +1231,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     // الاصدار من الخزنة: اعادة الملف الى مجلد التطبيق الظاهر واضافته للمعرض.
     if (item?.fileUri?.includes('/.vault/') && Platform.OS !== 'web') {
       try {
-        const baseDirectory = FileSystem.documentDirectory;
+        const baseDirectory = (await baseDownloadDir()) ?? FileSystem.documentDirectory;
         const filename = item.fileUri.split('/').pop() ?? '';
-        const restoredUri = `${baseDirectory}${filename}`;
+        const restoredUri = `${baseDirectory ?? ''}${filename}`;
         const existing = await FileSystem.getInfoAsync(restoredUri);
         if (existing.exists) await FileSystem.deleteAsync(restoredUri, { idempotent: true });
         await FileSystem.moveAsync({ from: item.fileUri, to: restoredUri });

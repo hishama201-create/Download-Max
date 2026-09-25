@@ -9,6 +9,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
+  BackHandler,
   FlatList,
   Image,
   Keyboard,
@@ -28,6 +29,8 @@ import {
 } from 'react-native';
 import Constants from 'expo-constants';
 import { WebView } from 'react-native-webview';
+import { useVideoPlayer, VideoView } from 'expo-video';
+import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { DownloadItem, MediaType, useDownloads, previewCarouselImages } from '@/context/DownloadContext';
@@ -351,7 +354,37 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   const [nextPageToken, setNextPageToken] = useState<string | undefined>(undefined);
   const [exhausted, setExhausted] = useState(false);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [streamTitle, setStreamTitle] = useState<string | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  const [preparing, setPreparing] = useState(true);
+
+  // مشغّل أصلي بدل WebView: يوتيوب يمنع تشغيل الفيديو داخل WebView غير مسجّل (خطأ 153).
+  // نجلب رابط البث من نفس خدمة الاستخراج المستخدمة في التنزيل، ثم نشغّله بـ expo-video.
+  const player = useVideoPlayer(streamUrl, (instance) => {
+    instance.loop = false;
+    instance.play();
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreparing(true);
+    setPlayerError(null);
+    setStreamUrl(null);
+    resolveStreamUrl(`https://www.youtube.com/watch?v=${video.id}`)
+      .then((result) => {
+        if (cancelled) return;
+        setStreamUrl(result.url);
+        setStreamTitle(result.title);
+        setPreparing(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setPreparing(false);
+        setPlayerError('تعذّر تجهيز هذا الفيديو للتشغيل.');
+      });
+    return () => { cancelled = true; };
+  }, [video.id]);
 
   // جلب المقترحات: نفس عنوان الفيديو (نتائج مشابهة) — وكل سحب لأسفل يجلب صفحة جديدة
   useEffect(() => {
@@ -412,27 +445,20 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
     <View style={styles.ytScreen}>
       {/* المشغل المثبت (Sticky Player) — يبقى أعلى الشاشة أثناء تمرير المقترحات */}
       <View style={[styles.ytPlayerWrap, { backgroundColor: '#000' }]}>
-        <WebView
-          key={video.id}
-          source={{ uri: embedUrl }}
-          style={styles.ytPlayer}
-          userAgent={YT_MOBILE_UA}
-          originWhitelist={['https://*', 'http://*']}
-          allowsFullscreenVideo
-          allowsInlineMediaPlayback
-          mediaPlaybackRequiresUserAction={false}
-          javaScriptEnabled
-          domStorageEnabled
-          thirdPartyCookiesEnabled
-          setSupportMultipleWindows={false}
-          mixedContentMode="always"
-          onError={() => setPlayerError('تعذّر تحميل مشغّل يوتيوب داخل التطبيق.')}
-          onHttpError={(event) => {
-            const status = event?.nativeEvent?.statusCode;
-            if (typeof status === 'number' && status >= 400) setPlayerError('مشغّل يوتيوب لم يستجب (خطأ ' + status + ').');
-          }}
-          onRenderProcessGone={() => setPlayerError('توقّف مشغّل يوتيوب على هذا الجهاز.')}
-        />
+        {preparing ? (
+          <View style={styles.ytPlayerStatus}>
+            <ActivityIndicator color="#fff" />
+            <Text style={styles.ytPlayerStatusText}>جارٍ تجهيز الفيديو…</Text>
+          </View>
+        ) : streamUrl && !playerError ? (
+          <VideoView
+            style={styles.ytPlayer}
+            player={player}
+            nativeControls
+            contentFit="contain"
+            allowsPictureInPicture
+          />
+        ) : null}
         {playerError ? (
           <View style={styles.ytPlayerError}>
             <Feather name="alert-triangle" size={22} color="#fff" />
@@ -454,7 +480,7 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
           <Feather name="arrow-right" size={18} color={colors.foreground} />
         </Pressable>
         <View style={styles.ytWatchBarCopy}>
-          <Text style={[styles.ytWatchBarTitle, { color: colors.foreground }]} numberOfLines={1}>{video.title}</Text>
+          <Text style={[styles.ytWatchBarTitle, { color: colors.foreground }]} numberOfLines={1}>{streamTitle ?? video.title}</Text>
           <Text style={[styles.ytWatchBarMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{video.channel}{video.views ? ` · ${video.views}` : ''}</Text>
         </View>
         <Pressable
@@ -529,54 +555,18 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
 }
 
 /** تبويب جوجل: بحث جوجل الكامل (ويب/صور/فيديو) داخل التطبيق عبر WebView بإعدادات متصفح جوّال. */
-function GoogleScreen({ colors }: { colors: Palette }) {
-  const [query, setQuery] = useState('');
-  const [submitted, setSubmitted] = useState('');
-  const target = submitted
-    ? `https://www.google.com/search?q=${encodeURIComponent(submitted)}&hl=ar`
-    : 'https://www.google.com/webhp?hl=ar';
-
-  function clear() {
-    setQuery('');
-    setSubmitted('');
-  }
+function GoogleScreen({ colors, googleRef, onHistoryChange }: {
+  colors: Palette;
+  googleRef: React.RefObject<WebView | null>;
+  onHistoryChange: (canGoBack: boolean) => void;
+}) {
+  // صفحة جوجل نفسها تحمل شريط البحث والاقتراحات، فلا نكرّره فوقها.
+  const target = 'https://www.google.com/webhp?hl=ar';
 
   return (
     <View style={[styles.googleScreen, { backgroundColor: colors.background }]}>
-      <View style={[styles.googleBar, { backgroundColor: colors.card, borderBottomColor: colors.border }]}>
-        <View style={[styles.googleInputWrap, { backgroundColor: colors.background, borderColor: colors.input }]}>
-          <Feather name="search" size={16} color={colors.mutedForeground} />
-          <TextInput
-            testID="google-input"
-            accessibilityLabel="البحث في جوجل"
-            value={query}
-            onChangeText={setQuery}
-            onSubmitEditing={() => setSubmitted(query.trim())}
-            placeholder="ابحث في جوجل"
-            placeholderTextColor={colors.mutedForeground}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="search"
-            style={[styles.googleInput, { color: colors.foreground }]}
-          />
-          {query.length > 0 ? (
-            <Pressable accessibilityLabel="مسح البحث" onPress={clear}>
-              <Feather name="x-circle" size={16} color={colors.mutedForeground} />
-            </Pressable>
-          ) : null}
-        </View>
-        <Pressable
-          testID="google-submit"
-          accessibilityLabel="تنفيذ البحث"
-          onPress={() => setSubmitted(query.trim())}
-          style={[styles.googleSubmitBtn, { backgroundColor: colors.primary }]}
-        >
-          <Feather name="search" size={15} color={colors.primaryForeground} />
-          <Text style={[styles.googleSubmitText, { color: colors.primaryForeground }]}>بحث</Text>
-        </Pressable>
-      </View>
       <WebView
-        key={submitted}
+        ref={googleRef}
         source={{ uri: target }}
         style={styles.googleWeb}
         userAgent={YT_MOBILE_UA}
@@ -589,6 +579,7 @@ function GoogleScreen({ colors }: { colors: Palette }) {
         thirdPartyCookiesEnabled
         setSupportMultipleWindows={false}
         mixedContentMode="always"
+        onNavigationStateChange={(navigation) => onHistoryChange(!!navigation.canGoBack)}
       />
     </View>
   );
@@ -608,6 +599,16 @@ function YoutubeScreen({ colors, onDownload }: {
   const [ytFilter, setYtFilter] = useState<'all' | 'video' | 'channel'>('all');
   // صفحة المشاهدة: الفيديو المفتوح (Sticky Player + مقترحات)
   const [watching, setWatching] = useState<YoutubeVideo | null>(null);
+
+  // داخل شاشة المشاهدة زر الرجوع يرجع لقائمة النتائج بدل الخروج من التطبيق.
+  useEffect(() => {
+    if (!watching) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setWatching(null);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [watching]);
   // شريط البحث القابل للطي: يطوي رأس الصفحة تلقائياً عند السحب لأعلى
   const scrollY = useRef(new Animated.Value(0)).current;
   const headerCollapse = scrollY.interpolate({ inputRange: [0, 64], outputRange: [64, 0], extrapolate: 'clamp' });
@@ -1175,7 +1176,7 @@ function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void })
     <ScrollView style={styles.panelScroll} contentContainerStyle={styles.panelScrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
     <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار {APP_VERSION}</Text></View>
-    <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
+    <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>Hisham Al-Sabri</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>    </ScrollView>
 
   </Pressable>;
@@ -1206,6 +1207,8 @@ export default function HomeScreen() {
   const [rememberFormat, setRememberFormat] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
+  const googleRef = useRef<WebView | null>(null);
+  const [googleCanGoBack, setGoogleCanGoBack] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -1505,6 +1508,31 @@ export default function HomeScreen() {
     }
   }
 
+  // زر الرجوع في الجهاز: يغلق اللوحة المفتوحة، ثم يرجع في تاريخ صفحات جوجل،
+  // ثم يلغي التحديد، وبعدها يعود للرئيسية — ولا يخرج التطبيق إلا من الصفحة الأولى.
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (panel !== null) {
+        setPanel(null);
+        return true;
+      }
+      if (activeTab === 'google' && googleCanGoBack && googleRef.current) {
+        googleRef.current.goBack();
+        return true;
+      }
+      if (selectedIds.size > 0) {
+        setSelectedIds(new Set());
+        return true;
+      }
+      if (activeTab !== 'home') {
+        setActiveTab('home');
+        return true;
+      }
+      return false;
+    });
+    return () => subscription.remove();
+  }, [panel, activeTab, googleCanGoBack, selectedIds.size]);
+
   /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
   function toggleSelection(id: string) {
     setSelectedIds((current) => {
@@ -1576,9 +1604,6 @@ export default function HomeScreen() {
               <Feather name="arrow-down" size={17} color={colors.primaryForeground} />
             </View>
             <Text style={[styles.brandName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text>
-            <View testID="version-badge" accessibilityLabel={`الإصدار ${APP_VERSION}`} style={[styles.versionBadge, { backgroundColor: `${colors.primary}1A`, borderColor: `${colors.primary}38` }]}>
-              <Text style={[styles.versionBadgeText, { color: colors.primary }]}>v{APP_VERSION}</Text>
-            </View>
           </View>
           <Text style={[styles.brandSubline, { color: colors.mutedForeground }]}>تحميلك، بطريقة أبسط</Text>
         </View>
@@ -1676,7 +1701,7 @@ export default function HomeScreen() {
         ) : activeTab === 'youtube' ? (
           <YoutubeScreen colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
         ) : activeTab === 'google' ? (
-          <GoogleScreen colors={colors} />
+          <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
           <FlatList
             data={filteredItems}
@@ -2115,11 +2140,6 @@ const styles = StyleSheet.create({
   legalNote: { fontSize: 10, textAlign: 'center', marginTop: 12 },
   bottomNav: { minHeight: 68, borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
   googleScreen: { flex: 1 },
-  googleBar: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 12, paddingVertical: 9, borderBottomWidth: 1 },
-  googleInputWrap: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 42, borderRadius: 21, borderWidth: 1, paddingHorizontal: 13 },
-  googleInput: { flex: 1, fontSize: 14, paddingVertical: 0 },
-  googleSubmitBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 13, paddingVertical: 10, borderRadius: 999 },
-  googleSubmitText: { fontSize: 12, fontWeight: '800' },
   googleWeb: { flex: 1, backgroundColor: 'transparent' },
   navItem: { minWidth: 90, alignItems: 'center', gap: 4 },
   navLabel: { fontSize: 11, fontWeight: '700' },
@@ -2283,8 +2303,6 @@ const styles = StyleSheet.create({
   ytEmptyIcon: { width: 64, height: 64, borderRadius: 32, justifyContent: 'center', alignItems: 'center', marginBottom: 4 },
   ytEmptyTitle: { fontSize: 16, fontWeight: '800' },
   ytEmptyHint: { fontSize: 13, textAlign: 'center', paddingHorizontal: 20, lineHeight: 20 },
-  versionBadge: { marginRight: 8, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 999, borderWidth: 1 },
-  versionBadgeText: { fontSize: 10, fontWeight: '800' },
   ytDuration: { position: 'absolute', bottom: 6, right: 6, backgroundColor: 'rgba(0,0,0,0.82)', borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 },
   ytDurationText: { color: '#fff', fontSize: 10, fontWeight: '700' },
   // — شرائح الفلترة (Filter Chips — Material 3) —
@@ -2308,6 +2326,8 @@ const styles = StyleSheet.create({
   // — صفحة المشاهدة (Watch Page) —
   ytPlayerWrap: { width: '100%', aspectRatio: 16 / 9 },
   ytPlayer: { flex: 1 },
+  ytPlayerStatus: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10 },
+  ytPlayerStatusText: { color: '#e7ecf5', fontSize: 12 },
   ytPlayerError: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 18, backgroundColor: 'rgba(4,7,12,0.88)' },
   ytPlayerErrorText: { color: '#e7ecf5', fontSize: 12, textAlign: 'center', lineHeight: 18 },
   ytPlayerFallbackBtn: { marginTop: 4, flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
