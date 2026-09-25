@@ -7,7 +7,7 @@ import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
 import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { Platform } from 'react-native';
+import { Linking, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 import { extractAudioFromVideo } from '@/context/audio';
 import { generateVideoThumbnail } from '@/context/thumbnails';
@@ -189,6 +189,8 @@ type DownloadContextValue = {
   /** مجلد التنزيل المختار (SAF URI) أو null للحفظ الداخلي. */
   downloadDir: string | null;
   setDownloadDir: (uri: string | null) => Promise<void>;
+  /** يقرأ ملفات الوسائط الموجودة في مجلد التنزيلات على الجهاز ويسجّلها (قراءة فقط). يعيد عدد الملفات المضافة. */
+  refreshFromDevice: () => Promise<number>;
   /** إعادة ملف من سلة المحذوفات إلى القائمة. */
   restoreFromTrash: (id: string) => Promise<void>;
   /** حذف ملف من السلة نهائياً مع ملفه الفعلي. */
@@ -274,17 +276,45 @@ function typeFromMime(mimeType: string | null): MediaType {
 /** يفصل امتداد الملف من اسمه الأصلي أو من نوع MIME، مع بدائل صالحة دائماً. */
 /** اسم المجلد الفرعي حسب نوع الوسيط (تنظيم على طريقة مجلدات التنزيل المعروفة). */
 function subfolderFor(type: MediaType): string {
-  if (type === 'video') return 'Video';
-  if (type === 'audio') return 'Audio';
-  return 'Image';
+  if (type === 'video') return 'video';
+  if (type === 'audio') return 'voice';
+  return 'image';
 }
 
-/** اسم مجلد التنزيلات الافتراضي داخل مساحة التطبيق. */
+/** اسم مجلد التنزيلات الافتراضي. */
 const APP_DIR_NAME = 'Download Max';
+/** الجذر العام للتخزين الداخلي في أندرويد — يحتاج صلاحية «الوصول لجميع الملفات». */
+const PUBLIC_ROOT = '/storage/emulated/0/';
+/** مجلد التنزيلات العام في الجهاز. */
+const PUBLIC_DOWNLOAD_DIR = `${PUBLIC_ROOT}Download/`;
 
-/** المجلد الأساسي: «Download Max» افتراضياً، ويُنشأ تلقائياً عند أول تنزيل. */
+/** هل لدينا صلاحية الوصول لجميع الملفات؟ نتحقق عملياً بقراءة المجلد العام. */
+export async function hasStorageAccess(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
+  try {
+    await FileSystem.readDirectoryAsync(PUBLIC_DOWNLOAD_DIR);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** يفتح شاشة «All files access» الخاصة بتطبيقنا مباشرة في إعدادات النظام. */
+export async function openAllFilesAccessSettings(): Promise<void> {
+  const applicationId = Constants.expoConfig?.android?.package;
+  try {
+    await IntentLauncher.startActivityAsync('android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION', {
+      data: `package:${applicationId ?? 'com.anonymous.downloadmax'}`,
+      flags: 1,
+    });
+  } catch {
+    await Linking.openSettings();
+  }
+}
+
+/** مجلد «Download Max» المرئي في جهاز المستخدم، أو المجلد الخاص إن لم تصل الصلاحية. */
 async function baseDownloadDir(): Promise<string | null> {
-  const root = FileSystem.documentDirectory;
+  const root = (await hasStorageAccess()) ? PUBLIC_DOWNLOAD_DIR : FileSystem.documentDirectory;
   if (!root) return null;
   const dir = `${root}${APP_DIR_NAME}/`;
   try {
@@ -296,14 +326,36 @@ async function baseDownloadDir(): Promise<string | null> {
   return dir;
 }
 
-/** ملفات المستخدم التي لا يعرفها التطبيق (بعد إعادة التثبيت) — تُعاد later إلى القائمة. */
+/** ملفات الوسائط داخل مجلد معيّن (قراءة فقط — لا حذف ولا تعديل). */
+async function mediaFilesIn(dir: string, depth = 0): Promise<string[]> {
+  let names: string[];
+  try {
+    names = await FileSystem.readDirectoryAsync(dir);
+  } catch {
+    return [];
+  }
+  const found: string[] = [];
+  for (const name of names) {
+    if (name.startsWith('.')) continue;
+    const uri = `${dir}${name}`;
+    const info = await FileSystem.getInfoAsync(uri).catch(() => null);
+    if (info?.isDirectory) {
+      if (depth < 2) found.push(...(await mediaFilesIn(uri, depth + 1)));
+      continue;
+    }
+    if (mediaTypeOf(name)) found.push(uri);
+  }
+  return found;
+}
+
+/** ملفات المستخدم التي لا يعرفها التطبيق (بعد إعادة التثبيت) — تُعاد للّقائمة. */
 async function orphanFilesIn(dir: string): Promise<string[]> {
   try {
     const info = await FileSystem.getInfoAsync(dir);
     if (!info.exists || !info.isDirectory) return [];
     const names = await FileSystem.readDirectoryAsync(dir);
     // نتجاهل المجلدات المعروفة (Video/Audio/Image) ونأخذ كل ما عداها كملفات مستعادة.
-    const folders = ['Video', 'Audio', 'Image'];
+    const folders = ['video', 'voice', 'image', 'Video', 'Audio', 'Image'];
     return names.filter((name) => !name.startsWith('.') && !folders.includes(name));
   } catch {
     return [];
@@ -543,7 +595,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    await patchItem(id, { status: 'downloading', progress: 0, error: undefined });
+    await patchItem(id, { status: 'downloading', progress: item.progress > 0 ? item.progress : 0, error: undefined });
 
     if (Platform.OS === 'web') {
       await patchItem(id, { status: 'failed', error: 'التنزيل المباشر متاح من تطبيق Android فقط.' });
@@ -638,6 +690,29 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
 
       let lastAt = 0;
+
+      // (6) أحداث التقدّم من expo-file-system القديمة لا تصل تحت New Architecture، فيبقى
+      // الشريط عند 0% حتى يكتمل الملف. نقيس حجم الملف على القرص بأنفسنا كل ~350ms.
+      let watchStopped = false;
+      const progressWatcher = setInterval(() => {
+        if (watchStopped) return;
+        void (async () => {
+          try {
+            const stat = await FileSystem.getInfoAsync(target);
+            if (!('size' in stat) || typeof stat.size !== 'number' || stat.size <= 0) return;
+            const expected = remoteLengthRef.current ?? item.totalBytes ?? 0;
+            if (expected <= 0) return;
+            const ratio = stat.size / expected;
+            if (ratio <= 0 || ratio >= 1) return;
+            const now = Date.now();
+            if (now - lastAt < 300) return;
+            lastAt = now;
+            progressRef.current.set(id, { progress: ratio, at: now });
+            bytesRef.current.set(id, { bytesWritten: stat.size, totalBytes: expected });
+            patchItem(id, { progress: ratio, bytesWritten: stat.size, totalBytes: expected });
+          } catch { /* الملف لم يُنشأ بعد — ننتظر الدورة القادمة */ }
+        })();
+      }, 350);
       const onProgress = (progress: { totalBytesWritten: number; totalBytesExpectedToWrite: number }) => {
         const expected = progress.totalBytesExpectedToWrite > 0
           ? progress.totalBytesExpectedToWrite
@@ -706,10 +781,16 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
       // ننظف حالة الاستئناف فقط عند انتهاء حقيقي — الإيقاف المؤقت يحتاجها للاستئناف لاحقاً.
       if (result) await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
+      watchStopped = true;
+      clearInterval(progressWatcher);
+      // (6) التنظيف ينتمي لهذه المهمة فقط: الطريقة القديمة كانت تمسح الـ resumable
+      // الذي سجّلته مهمة استئناف جديدة، فيفشل الإيقاف في المرة الثانية.
+      if (resumablesRef.current.get(id) === resumable) {
+        resumablesRef.current.delete(id);
+        progressRef.current.delete(id);
+        bytesRef.current.delete(id);
+      }
       const finalBytes = bytesRef.current.get(id);
-      resumablesRef.current.delete(id);
-      progressRef.current.delete(id);
-      bytesRef.current.delete(id);
 
       if (!result) {
         // المهمة توقفت مؤقتاً بطلب المستخدم أو أُلغيت (حذف من القائمة) — لا تعتبر فشلاً.
@@ -876,6 +957,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           const base = (await baseDownloadDir()) ?? root;
           if (root && base) {
             const dirs = [base, `${root}.vault/`];
+            if (await hasStorageAccess()) dirs.unshift(PUBLIC_DOWNLOAD_DIR);
             const known = new Set(itemsRef.current.map((item) => item.fileUri));
             const adopted: DownloadItem[] = [];
             for (const dir of dirs) {
@@ -1310,6 +1392,47 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       .catch(() => undefined);
   }, []);
 
+  /**
+   * (7) يقرأ ملفات الوسائط الموجودة في مجلد التنزيلات على الجهاز ويسجّلها في القائمة.
+   * قراءة فقط: لا يُحذف ولا يُعدَّل أي ملف. يُستدعى بعد منح صلاحية الوصول لجميع الملفات.
+   */
+  const refreshFromDevice = useCallback(async () => {
+    if (!(await hasStorageAccess())) return 0;
+    const known = new Set(itemsRef.current.map((item) => item.fileUri));
+    const uris = await mediaFilesIn(PUBLIC_DOWNLOAD_DIR);
+    const adopted: DownloadItem[] = [];
+    for (const uri of uris) {
+      if (known.has(uri)) continue;
+      const filename = uri.split('/').pop() ?? '';
+      const type = mediaTypeOf(filename);
+      if (!type) continue;
+      const stat = await FileSystem.getInfoAsync(uri).catch(() => null);
+      const size = stat && 'size' in stat && typeof stat.size === 'number' ? stat.size : undefined;
+      const createdAt = stat && 'modificationTime' in stat && typeof stat.modificationTime === 'number'
+        ? stat.modificationTime * 1000
+        : Date.now();
+      adopted.push({
+        id: `device-${uri}`,
+        url: uri,
+        title: filename.replace(/\.[^.]+$/, ''),
+        type,
+        format: filename.split('.').pop()?.toLowerCase() ?? 'mp4',
+        quality: 'من تخزين الجهاز',
+        status: 'completed',
+        progress: 1,
+        bytesWritten: size,
+        totalBytes: size,
+        fileUri: uri,
+        resolvedUrl: true,
+        createdAt,
+      });
+    }
+    if (adopted.length > 0) {
+      commit((current) => [...adopted, ...current].sort((a, b) => b.createdAt - a.createdAt));
+    }
+    return adopted.length;
+  }, [commit]);
+
   const setDownloadDir = useCallback(async (uri: string | null) => {
     setDownloadDirState(uri);
     downloadDirRef.current = uri;
@@ -1342,6 +1465,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     setQueueOptions,
     downloadDir,
     setDownloadDir,
+    refreshFromDevice,
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
@@ -1351,7 +1475,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pauseDownload,
     resumeDownload,
     removeDownload,
-    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio]);
+    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

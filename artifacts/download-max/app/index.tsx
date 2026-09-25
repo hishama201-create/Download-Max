@@ -9,6 +9,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
+  AppState,
   BackHandler,
   FlatList,
   Image,
@@ -27,17 +28,21 @@ import {
   useColorScheme,
   View,
 } from 'react-native';
-import Constants from 'expo-constants';
 import { WebView } from 'react-native-webview';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, openAllFilesAccessSettings } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 /** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
-const APP_VERSION: string = String((Constants.expoConfig?.version as string | undefined) ?? '1.16.0');
+/**
+ * رقم الإصدار المعروض في «حول التطبيق» وتذييل القائمة الجانبية.
+ * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
+ * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
+ */
+const APP_VERSION = '1.19.0';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -611,7 +616,7 @@ function YoutubeScreen({ colors, onDownload }: {
   }, [watching]);
   // شريط البحث القابل للطي: يطوي رأس الصفحة تلقائياً عند السحب لأعلى
   const scrollY = useRef(new Animated.Value(0)).current;
-  const headerCollapse = scrollY.interpolate({ inputRange: [0, 64], outputRange: [64, 0], extrapolate: 'clamp' });
+  const headerCollapse = scrollY.interpolate({ inputRange: [0, 92], outputRange: [92, 0], extrapolate: 'clamp' });
   const headerFade = scrollY.interpolate({ inputRange: [0, 36], outputRange: [1, 0], extrapolate: 'clamp' });
 
   async function runSearch(text: string) {
@@ -663,8 +668,8 @@ function YoutubeScreen({ colors, onDownload }: {
     <View style={styles.ytScreen}>
       <Animated.View style={{ height: headerCollapse, opacity: headerFade, overflow: 'hidden' }}>
         <View style={styles.ytPageHeader}>
-          <Text style={[styles.pageTitle, { color: colors.foreground }]}>يوتيوب</Text>
-          <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>ابحث عن فيديو أو أغنية وحمّلها مباشرة</Text>
+          <Text style={[styles.pageTitle, { color: colors.foreground }]}>YouTube</Text>
+          <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>ابحث وحمّل من YouTube</Text>
         </View>
       </Animated.View>
       <View style={[styles.ytSearchWrap, { backgroundColor: colors.card, borderColor: colors.input }]}>
@@ -740,7 +745,7 @@ function YoutubeScreen({ colors, onDownload }: {
             ) : (
               <View style={styles.ytEmpty}>
                 <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
-                <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من يوتيوب</Text>
+                <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من YouTube</Text>
                 <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>اكتب اسم أغنية أو فيديو واضغط البحث، ثم حمّل ما يعجبك مباشرة</Text>
               </View>
             )
@@ -1186,7 +1191,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1207,6 +1212,8 @@ export default function HomeScreen() {
   const [rememberFormat, setRememberFormat] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
+  // (7) صلاحية الوصول لجميع الملفات: بدونها تبقى التنزيلات داخل التطبيق فقط.
+  const [storageGranted, setStorageGranted] = useState<boolean | null>(null);
   const googleRef = useRef<WebView | null>(null);
   const [googleCanGoBack, setGoogleCanGoBack] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -1508,6 +1515,32 @@ export default function HomeScreen() {
     }
   }
 
+  // فحص صلاحية الوصول للملفات عند فتح التطبيق، وعند كل رجوع من إعدادات النظام.
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      setStorageGranted(true);
+      return;
+    }
+    let cancelled = false;
+    const check = async () => {
+      const granted = await hasStorageAccess();
+      if (cancelled) return;
+      setStorageGranted(granted);
+      if (granted) {
+        const added = await refreshFromDevice();
+        if (!cancelled && added > 0) setNotice(`استرجعنا ${added} ملف من تخزين الجهاز 📁`);
+      }
+    };
+    void check();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void check();
+    });
+    return () => {
+      cancelled = true;
+      subscription.remove();
+    };
+  }, [refreshFromDevice]);
+
   // زر الرجوع في الجهاز: يغلق اللوحة المفتوحة، ثم يرجع في تاريخ صفحات جوجل،
   // ثم يلغي التحديد، وبعدها يعود للرئيسية — ولا يخرج التطبيق إلا من الصفحة الأولى.
   useEffect(() => {
@@ -1703,6 +1736,23 @@ export default function HomeScreen() {
         ) : activeTab === 'google' ? (
           <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
+          storageGranted === false && Platform.OS === 'android' ? (
+            <View style={styles.storageGate}>
+              <View style={[styles.storageGateIcon, { backgroundColor: `${colors.primary}14` }]}>
+                <Feather name="clock" size={40} color={colors.primary} />
+              </View>
+              <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>السماح بالوصول إلى الملفات التي تم تنزيلها</Text>
+              <Pressable
+                testID="storage-permission"
+                accessibilityLabel="السماح بالوصول للملفات"
+                onPress={() => { void openAllFilesAccessSettings(); }}
+                style={[styles.storageGateButton, { backgroundColor: colors.card, borderColor: colors.border }]}
+              >
+                <Feather name="folder" size={18} color={colors.foreground} />
+                <Text style={[styles.storageGateButtonText, { color: colors.foreground }]}>السماح</Text>
+              </Pressable>
+            </View>
+          ) : (
           <FlatList
             data={filteredItems}
             keyExtractor={(item) => item.id}
@@ -1750,6 +1800,7 @@ export default function HomeScreen() {
             renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
+          )
         ) : null}
       </View>
 
@@ -1760,7 +1811,7 @@ export default function HomeScreen() {
         </Pressable>
         <Pressable testID="tab-youtube" accessibilityLabel="يوتيوب" onPress={() => setActiveTab('youtube')} style={styles.navItem}>
           <Feather name="youtube" size={21} color={activeTab === 'youtube' ? colors.destructive : colors.mutedForeground} />
-          <Text style={[styles.navLabel, { color: activeTab === 'youtube' ? colors.destructive : colors.mutedForeground }]}>يوتيوب</Text>
+          <Text style={[styles.navLabel, { color: activeTab === 'youtube' ? colors.destructive : colors.mutedForeground }]}>YouTube</Text>
         </Pressable>
         <Pressable testID="tab-google" accessibilityLabel="جوجل" onPress={() => setActiveTab('google')} style={styles.navItem}>
           <Feather name="search" size={21} color={activeTab === 'google' ? colors.primary : colors.mutedForeground} />
@@ -2139,6 +2190,11 @@ const styles = StyleSheet.create({
   downloadButtonText: { fontSize: 15, fontWeight: '800' },
   legalNote: { fontSize: 10, textAlign: 'center', marginTop: 12 },
   bottomNav: { minHeight: 68, borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
+  storageGate: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32, gap: 16 },
+  storageGateIcon: { width: 92, height: 92, borderRadius: 46, alignItems: 'center', justifyContent: 'center' },
+  storageGateTitle: { fontSize: 16, fontWeight: '700', textAlign: 'center', lineHeight: 26 },
+  storageGateButton: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 26, paddingVertical: 13, borderRadius: 999, borderWidth: 1 },
+  storageGateButtonText: { fontSize: 15, fontWeight: '700' },
   googleScreen: { flex: 1 },
   googleWeb: { flex: 1, backgroundColor: 'transparent' },
   navItem: { minWidth: 90, alignItems: 'center', gap: 4 },

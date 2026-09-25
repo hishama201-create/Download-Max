@@ -2,7 +2,7 @@
   "expo": {
     "name": "Download Max",
     "slug": "download-max",
-    "version": "1.18.0",
+    "version": "1.19.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "download-max",
@@ -37,7 +37,12 @@
         }
       ],
       "package": "com.anonymous.downloadmax",
-      "predictiveBackGesture": false
+      "predictiveBackGesture": false,
+      "permissions": [
+        "android.permission.MANAGE_EXTERNAL_STORAGE",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
       "favicon": "./assets/images/icon.png"

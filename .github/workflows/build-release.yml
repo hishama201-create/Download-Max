@@ -66,9 +66,11 @@ jobs:
       # + x86_64 (محاكيات فقط). reactNativeArchitectures هو الطريقة الرسمية
       # في React Native لحصر المعماريات (يشمل كل مكتبات native مثل ffmpeg-kit
       # و webview) — نتجنب تعديل build.gradle يدوياً الذي قد يكسر إعدادات Expo.
-      - name: Pin Android ABIs (arm64-v8a + x86_64)
+      - name: Pin Android ABI (arm64-v8a only)
         run: |
-          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a,x86_64/' android/gradle.properties
+          # arm64 وحدها تغطي كل هواتف 2016 فصاعداً، وت-halّف حجم الـ APK إلى النصف
+          # لأن المكتبات الأصلية (ffmpeg) تُبنى مرة واحدة بدل مرتين (arm64 + x86_64).
+          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' android/gradle.properties
           grep -E "^reactNativeArchitectures=" android/gradle.properties
 
       - name: Build release APK
