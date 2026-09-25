@@ -63,17 +63,13 @@ jobs:
         run: pnpm exec expo prebuild --platform android --clean --no-install
 
       # حصر المعماريات بعد الـ prebuild: arm64-v8a (كل الهواتف الحديثة 2016+)
-      # + x86_64 (محاكيات فقط). النتيجة: حجم APK أصغر وتشغيل أسرع.
+      # + x86_64 (محاكيات فقط). reactNativeArchitectures هو الطريقة الرسمية
+      # في React Native لحصر المعماريات (يشمل كل مكتبات native مثل ffmpeg-kit
+      # و webview) — نتجنب تعديل build.gradle يدوياً الذي قد يكسر إعدادات Expo.
       - name: Pin Android ABIs (arm64-v8a + x86_64)
         run: |
           sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a,x86_64/' android/gradle.properties
-          grep reactNativeArchitectures android/gradle.properties
-
-      # نفس الحصر على مستوى plugin.build.gradle.app (يشمل مكتبات native مثل ffmpeg-kit)
-      - name: Enforce abiFilters in app build.gradle
-        run: |
-          sed -i '/android {/a\\        ndk { abiFilters "arm64-v8a", "x86_64" }' android/app/build.gradle
-          grep -n "abiFilters" android/app/build.gradle
+          grep -E "^reactNativeArchitectures=" android/gradle.properties
 
       - name: Build release APK
         working-directory: artifacts/download-max/android
