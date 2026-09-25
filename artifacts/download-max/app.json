@@ -2,7 +2,7 @@
   "expo": {
     "name": "Download Max",
     "slug": "download-max",
-    "version": "1.16.0",
+    "version": "1.17.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "download-max",
@@ -36,7 +36,8 @@
           ]
         }
       ],
-      "package": "com.anonymous.downloadmax"
+      "package": "com.anonymous.downloadmax",
+      "predictiveBackGesture": false
     },
     "web": {
       "favicon": "./assets/images/icon.png"

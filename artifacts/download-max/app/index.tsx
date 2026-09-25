@@ -528,6 +528,72 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   );
 }
 
+/** تبويب جوجل: بحث جوجل الكامل (ويب/صور/فيديو) داخل التطبيق عبر WebView بإعدادات متصفح جوّال. */
+function GoogleScreen({ colors }: { colors: Palette }) {
+  const [query, setQuery] = useState('');
+  const [submitted, setSubmitted] = useState('');
+  const target = submitted
+    ? `https://www.google.com/search?q=${encodeURIComponent(submitted)}&hl=ar`
+    : 'https://www.google.com/webhp?hl=ar';
+
+  function clear() {
+    setQuery('');
+    setSubmitted('');
+  }
+
+  return (
+    <View style={[styles.googleScreen, { backgroundColor: colors.background }]}>
+      <View style={[styles.googleBar, { backgroundColor: colors.card, borderBottomColor: colors.border }]}>
+        <View style={[styles.googleInputWrap, { backgroundColor: colors.background, borderColor: colors.input }]}>
+          <Feather name="search" size={16} color={colors.mutedForeground} />
+          <TextInput
+            testID="google-input"
+            accessibilityLabel="البحث في جوجل"
+            value={query}
+            onChangeText={setQuery}
+            onSubmitEditing={() => setSubmitted(query.trim())}
+            placeholder="ابحث في جوجل"
+            placeholderTextColor={colors.mutedForeground}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            style={[styles.googleInput, { color: colors.foreground }]}
+          />
+          {query.length > 0 ? (
+            <Pressable accessibilityLabel="مسح البحث" onPress={clear}>
+              <Feather name="x-circle" size={16} color={colors.mutedForeground} />
+            </Pressable>
+          ) : null}
+        </View>
+        <Pressable
+          testID="google-submit"
+          accessibilityLabel="تنفيذ البحث"
+          onPress={() => setSubmitted(query.trim())}
+          style={[styles.googleSubmitBtn, { backgroundColor: colors.primary }]}
+        >
+          <Feather name="search" size={15} color={colors.primaryForeground} />
+          <Text style={[styles.googleSubmitText, { color: colors.primaryForeground }]}>بحث</Text>
+        </Pressable>
+      </View>
+      <WebView
+        key={submitted}
+        source={{ uri: target }}
+        style={styles.googleWeb}
+        userAgent={YT_MOBILE_UA}
+        originWhitelist={['https://*', 'http://*']}
+        allowsFullscreenVideo
+        allowsInlineMediaPlayback
+        mediaPlaybackRequiresUserAction={false}
+        javaScriptEnabled
+        domStorageEnabled
+        thirdPartyCookiesEnabled
+        setSupportMultipleWindows={false}
+        mixedContentMode="always"
+      />
+    </View>
+  );
+}
+
 /** شاشة يوتيوب بملء الشاشة: بحث ببطاقات Material 3 + Top Result + شرائح فلترة، وصفحة مشاهدة كاملة. */
 function YoutubeScreen({ colors, onDownload }: {
   colors: Palette;
@@ -714,7 +780,7 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
     <Pressable
       onLongPress={onSelect}
       delayLongPress={350}
-      onPress={item.status === 'completed' && item.fileUri ? onOpen : undefined}
+      onPress={selected ? onSelect : item.status === 'completed' && item.fileUri ? onOpen : undefined}
       style={[styles.downloadRow, { backgroundColor: colors.card, borderColor: selected ? colors.primary : colors.border, borderWidth: selected ? 1.6 : 1 }]}
     >
       {selected ? (
@@ -1123,7 +1189,7 @@ export default function HomeScreen() {
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'downloads'>('home');
+  const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
@@ -1450,6 +1516,22 @@ export default function HomeScreen() {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }
 
+  /** يحدد كل الملفات الظاهرة دفعة واحدة (سلوك «تحديد الكل» في مدير الملفات). */
+  function selectAll() {
+    const all = new Set(visibleItems.map((item) => item.id));
+    setSelectedIds((current) => (current.size === all.size ? new Set() : all));
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  }
+
+  /** ينقل كل الملفات المحددة إلى الخزنة دفعة واحدة. */
+  function vaultSelected() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    for (const id of ids) void moveToVault(id);
+    setSelectedIds(new Set());
+    setNotice(`نُقل ${ids.length} ملف إلى الخزنة 🔒`);
+  }
+
   /** مشاركة الملفات المحددة عبر لوحة مشاركة أندرويد (ملف واحد أو عدة ملفات). */
   async function shareSelected() {
     const targets = visibleItems.filter((item) => selectedIds.has(item.id) && item.fileUri);
@@ -1593,6 +1675,8 @@ export default function HomeScreen() {
           />
         ) : activeTab === 'youtube' ? (
           <YoutubeScreen colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
+        ) : activeTab === 'google' ? (
+          <GoogleScreen colors={colors} />
         ) : activeTab === 'downloads' ? (
           <FlatList
             data={filteredItems}
@@ -1652,6 +1736,10 @@ export default function HomeScreen() {
         <Pressable testID="tab-youtube" accessibilityLabel="يوتيوب" onPress={() => setActiveTab('youtube')} style={styles.navItem}>
           <Feather name="youtube" size={21} color={activeTab === 'youtube' ? colors.destructive : colors.mutedForeground} />
           <Text style={[styles.navLabel, { color: activeTab === 'youtube' ? colors.destructive : colors.mutedForeground }]}>يوتيوب</Text>
+        </Pressable>
+        <Pressable testID="tab-google" accessibilityLabel="جوجل" onPress={() => setActiveTab('google')} style={styles.navItem}>
+          <Feather name="search" size={21} color={activeTab === 'google' ? colors.primary : colors.mutedForeground} />
+          <Text style={[styles.navLabel, { color: activeTab === 'google' ? colors.primary : colors.mutedForeground }]}>جوجل</Text>
         </Pressable>
         <Pressable testID="tab-downloads" accessibilityLabel="التنزيلات" onPress={() => setActiveTab('downloads')} style={styles.navItem}>
           <View><Feather name="download" size={21} color={activeTab === 'downloads' ? colors.primary : colors.mutedForeground} />{activeCount > 0 ? <View style={[styles.navDot, { backgroundColor: colors.primary }]} /> : null}</View>
@@ -1775,6 +1863,7 @@ export default function HomeScreen() {
               <View style={[styles.drawerDivider, { backgroundColor: colors.border }]} />
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>تصفّح</Text>
               <Pressable onPress={() => { setPanel(null); setActiveTab('home'); }} style={[styles.menuItem, { backgroundColor: activeTab === 'home' ? `${colors.primary}14` : 'transparent' }]}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="home" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: activeTab === 'home' ? colors.primary : colors.foreground }]}>الرئيسية</Text></Pressable>
+              <Pressable onPress={() => { setPanel(null); setActiveTab('google'); }} style={[styles.menuItem, { backgroundColor: activeTab === 'google' ? `${colors.primary}14` : 'transparent' }]}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="search" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: activeTab === 'google' ? colors.primary : colors.foreground }]}>جوجل</Text></Pressable>
               <Pressable onPress={() => { setPanel(null); setActiveTab('downloads'); }} style={[styles.menuItem, { backgroundColor: activeTab === 'downloads' ? `${colors.primary}14` : 'transparent' }]}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="download" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: activeTab === 'downloads' ? colors.primary : colors.foreground }]}>التنزيلات</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.primary}16` }]}><Text style={[styles.menuBadgeText, { color: colors.primary }]}>{visibleItems.length}</Text></View></Pressable>
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>مكتبتي</Text>
               <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.accentForeground}14` }]}><Feather name="lock" size={16} color={colors.accentForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.accentForeground}16` }]}><Text style={[styles.menuBadgeText, { color: colors.accentForeground }]}>{vaultItems.length}</Text></View></Pressable>
@@ -1903,11 +1992,21 @@ export default function HomeScreen() {
       {/* شريط التحديد السفلي: مشاركة وحذف للملفات المحددة */}
       {selectedIds.size > 0 && !panel ? (
         <View style={[styles.selectionBar, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 30 : Math.max(insets.bottom, 10) }]}>
-          <Pressable onPress={() => setSelectedIds(new Set())} style={styles.selectionCountWrap}>
-            <Feather name="x" size={16} color={colors.mutedForeground} />
-            <Text style={[styles.selectionCount, { color: colors.foreground }]}>{selectedIds.size} محدد</Text>
-          </Pressable>
+          <View style={styles.selectionCountWrap}>
+            <Pressable accessibilityLabel="إلغاء التحديد" onPress={() => setSelectedIds(new Set())} style={styles.selectionCountWrap}>
+              <Feather name="x" size={16} color={colors.mutedForeground} />
+              <Text style={[styles.selectionCount, { color: colors.foreground }]}>{selectedIds.size} محدد</Text>
+            </Pressable>
+            <Pressable testID="selection-select-all" accessibilityLabel="تحديد الكل" onPress={selectAll} style={[styles.selectAllPill, { backgroundColor: `${colors.primary}18` }]}>
+              <Feather name={selectedIds.size === visibleItems.length && visibleItems.length > 0 ? 'minus-square' : 'check-square'} size={14} color={colors.primary} />
+              <Text style={[styles.selectAllText, { color: colors.primary }]}>تحديد الكل</Text>
+            </Pressable>
+          </View>
           <View style={styles.selectionActions}>
+            <Pressable testID="selection-vault" accessibilityLabel="نقل المحدد للخزنة" onPress={vaultSelected} style={[styles.selectionAction, { backgroundColor: `${colors.accentForeground}16` }]}>
+              <Feather name="lock" size={16} color={colors.accentForeground} />
+              <Text style={[styles.selectionActionText, { color: colors.accentForeground }]}>خزنة</Text>
+            </Pressable>
             <Pressable testID="selection-share" onPress={() => void shareSelected()} style={[styles.selectionAction, { backgroundColor: colors.primary }]}>
               <Feather name="share-2" size={16} color={colors.primaryForeground} />
               <Text style={[styles.selectionActionText, { color: colors.primaryForeground }]}>مشاركة</Text>
@@ -2015,6 +2114,13 @@ const styles = StyleSheet.create({
   downloadButtonText: { fontSize: 15, fontWeight: '800' },
   legalNote: { fontSize: 10, textAlign: 'center', marginTop: 12 },
   bottomNav: { minHeight: 68, borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
+  googleScreen: { flex: 1 },
+  googleBar: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 12, paddingVertical: 9, borderBottomWidth: 1 },
+  googleInputWrap: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 42, borderRadius: 21, borderWidth: 1, paddingHorizontal: 13 },
+  googleInput: { flex: 1, fontSize: 14, paddingVertical: 0 },
+  googleSubmitBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 13, paddingVertical: 10, borderRadius: 999 },
+  googleSubmitText: { fontSize: 12, fontWeight: '800' },
+  googleWeb: { flex: 1, backgroundColor: 'transparent' },
   navItem: { minWidth: 90, alignItems: 'center', gap: 4 },
   navLabel: { fontSize: 11, fontWeight: '700' },
   navDot: { position: 'absolute', width: 7, height: 7, borderRadius: 4, top: -2, right: -5 },
@@ -2131,6 +2237,8 @@ const styles = StyleSheet.create({
   selectionCheck: { position: 'absolute', top: 8, left: 8, width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center', zIndex: 5 },
   selectionBar: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 11, borderTopWidth: 1, elevation: 8, shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 14, shadowOffset: { width: 0, height: -4 } },
   selectionCountWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  selectAllPill: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  selectAllText: { fontSize: 11, fontWeight: '800' },
   selectionCount: { fontSize: 13, fontWeight: '800' },
   selectionActions: { flexDirection: 'row', gap: 9 },
   selectionAction: { flexDirection: 'row', alignItems: 'center', gap: 7, paddingHorizontal: 17, paddingVertical: 10, borderRadius: 13 },
