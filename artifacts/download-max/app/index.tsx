@@ -270,11 +270,10 @@ async function searchYoutube(query: string, apiKey: string, signal?: AbortSignal
     });
 }
 
-function YoutubePanel({ colors, onBack, onDownload, notice }: {
+/** شاشة يوتيوب بملء الشاشة (تبويب مستقل مثل التنزيلات): بحث ثم قائمة نتائج مع زر تحميل لكل نتيجة. */
+function YoutubeScreen({ colors, onDownload }: {
   colors: Palette;
-  onBack: () => void;
   onDownload: (videoUrl: string) => void;
-  notice: string;
 }) {
   const apiKey = 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
   const [query, setQuery] = useState('');
@@ -311,66 +310,67 @@ function YoutubePanel({ colors, onBack, onDownload, notice }: {
     }, 2500);
   }
 
-  return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
-    <View style={styles.panelHeader}>
-      <Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable>
-      <Text style={[styles.panelTitle, { color: colors.foreground }]}>يوتيوب</Text>
-      <View style={[styles.ytBadge, { backgroundColor: `${colors.destructive}16` }]}><Feather name="youtube" size={17} color={colors.destructive} /></View>
-    </View>
-    <View style={[styles.ytSearchWrap, { backgroundColor: colors.background, borderColor: colors.input }]}>
-      <Feather name="search" size={17} color={colors.mutedForeground} />
-      <TextInput
-        value={query}
-        onChangeText={setQuery}
-        onSubmitEditing={() => void runSearch(query)}
-        placeholder="ابحث عن فيديو أو أغنية..."
-        placeholderTextColor={colors.mutedForeground}
-        style={[styles.searchInput, { color: colors.foreground }]}
-        returnKeyType="search"
+  return (
+    <View style={styles.ytScreen}>
+      <View style={styles.ytPageHeader}>
+        <Text style={[styles.pageTitle, { color: colors.foreground }]}>يوتيوب</Text>
+        <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>ابحث عن فيديو أو أغنية وحمّلها مباشرة</Text>
+      </View>
+      <View style={[styles.ytSearchWrap, { backgroundColor: colors.card, borderColor: colors.input }]}>
+        <Feather name="search" size={17} color={colors.mutedForeground} />
+        <TextInput
+          value={query}
+          onChangeText={setQuery}
+          onSubmitEditing={() => void runSearch(query)}
+          placeholder="ابحث عن فيديو أو أغنية..."
+          placeholderTextColor={colors.mutedForeground}
+          style={[styles.searchInput, { color: colors.foreground }]}
+          returnKeyType="search"
+        />
+        <Pressable onPress={() => void runSearch(query)} disabled={loading} style={[styles.ytSearchButton, { backgroundColor: colors.primary }]}>
+          {loading ? <ActivityIndicator size="small" color={colors.primaryForeground} /> : <Feather name="search" size={15} color={colors.primaryForeground} />}
+        </Pressable>
+      </View>
+      {error ? <Text style={[styles.ytError, { color: colors.destructive }]}>{error}</Text> : null}
+      <FlatList
+        data={results}
+        keyExtractor={(item) => item.id}
+        style={styles.ytList}
+        contentContainerStyle={results.length === 0 ? [styles.ytListContent, styles.ytListEmpty] : styles.ytListContent}
+        ListEmptyComponent={
+          loading ? null : (
+            <View style={styles.ytEmpty}>
+              <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
+              <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من يوتيوب</Text>
+              <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>اكتب اسم أغنية أو فيديو واضغط البحث، ثم حمّل ما يعجبك مباشرة</Text>
+            </View>
+          )
+        }
+        renderItem={({ item }) => (
+          <View style={[styles.ytRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <View style={styles.ytThumbWrap}>
+              <Image source={{ uri: item.thumbnail }} style={styles.ytThumb} resizeMode="cover" />
+              {item.duration ? <View style={styles.ytDuration}><Text style={styles.ytDurationText}>{item.duration}</Text></View> : null}
+            </View>
+            <View style={styles.ytBody}>
+              <Text style={[styles.ytTitle, { color: colors.cardForeground }]} numberOfLines={2}>{item.title}</Text>
+              <Text style={[styles.ytMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{item.channel}{item.views ? ` · ${item.views}` : ''}</Text>
+            </View>
+            <Pressable
+              accessibilityLabel={`تحميل ${item.title}`}
+              onPress={() => handleDownload(item)}
+              disabled={downloadingIds.has(item.id)}
+              style={[styles.ytDownloadButton, { backgroundColor: downloadingIds.has(item.id) ? colors.muted : colors.primary }]}
+            >
+              {downloadingIds.has(item.id)
+                ? <ActivityIndicator size="small" color={colors.primaryForeground} />
+                : <Feather name="download" size={17} color={colors.primaryForeground} />}
+            </Pressable>
+          </View>
+        )}
       />
-      <Pressable onPress={() => void runSearch(query)} disabled={loading} style={[styles.ytSearchButton, { backgroundColor: colors.primary }]}>
-        {loading ? <ActivityIndicator size="small" color={colors.primaryForeground} /> : <Feather name="search" size={15} color={colors.primaryForeground} />}
-      </Pressable>
     </View>
-    {error ? <Text style={[styles.ytError, { color: colors.destructive }]}>{error}</Text> : null}
-    <FlatList
-      data={results}
-      keyExtractor={(item) => item.id}
-      style={styles.ytList}
-      contentContainerStyle={results.length === 0 ? styles.ytListEmpty : undefined}
-      ListEmptyComponent={
-        loading ? null : (
-          <View style={styles.ytEmpty}>
-            <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
-            <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من يوتيوب</Text>
-            <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>اكتب اسم أغنية أو فيديو واضغط البحث، ثم حمّل ما يعجبك مباشرة</Text>
-          </View>
-        )
-      }
-      renderItem={({ item }) => (
-        <View style={[styles.ytRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
-          <View style={styles.ytThumbWrap}>
-            <Image source={{ uri: item.thumbnail }} style={styles.ytThumb} resizeMode="cover" />
-            {item.duration ? <View style={styles.ytDuration}><Text style={styles.ytDurationText}>{item.duration}</Text></View> : null}
-          </View>
-          <View style={styles.ytBody}>
-            <Text style={[styles.ytTitle, { color: colors.cardForeground }]} numberOfLines={2}>{item.title}</Text>
-            <Text style={[styles.ytMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{item.channel}{item.views ? ` · ${item.views}` : ''}</Text>
-          </View>
-          <Pressable
-            accessibilityLabel={`تحميل ${item.title}`}
-            onPress={() => handleDownload(item)}
-            disabled={downloadingIds.has(item.id)}
-            style={[styles.ytDownloadButton, { backgroundColor: downloadingIds.has(item.id) ? colors.muted : colors.primary }]}
-          >
-            {downloadingIds.has(item.id)
-              ? <ActivityIndicator size="small" color={colors.primaryForeground} />
-              : <Feather name="download" size={17} color={colors.primaryForeground} />}
-          </Pressable>
-        </View>
-      )}
-    />
-  </Pressable>;
+  );
 }
 
 function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected, onSelect }: {
@@ -789,7 +789,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.11.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.12.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -803,7 +803,7 @@ export default function HomeScreen() {
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'home' | 'downloads'>('home');
+  const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'downloads'>('home');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
@@ -819,7 +819,7 @@ export default function HomeScreen() {
   const [showFormatSheet, setShowFormatSheet] = useState(false);
   const [rememberFormat, setRememberFormat] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
-  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | 'youtube' | null>(null);
+  const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -1268,6 +1268,8 @@ export default function HomeScreen() {
               </>
             )}
           />
+        ) : activeTab === 'youtube' ? (
+          <YoutubeScreen colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
         ) : activeTab === 'downloads' ? (
           <FlatList
             data={filteredItems}
@@ -1324,9 +1326,9 @@ export default function HomeScreen() {
           <Feather name="home" size={21} color={activeTab === 'home' ? colors.primary : colors.mutedForeground} />
           <Text style={[styles.navLabel, { color: activeTab === 'home' ? colors.primary : colors.mutedForeground }]}>الرئيسية</Text>
         </Pressable>
-        <Pressable testID="tab-youtube" accessibilityLabel="يوتيوب" onPress={() => setPanel('youtube')} style={styles.navItem}>
-          <Feather name="youtube" size={21} color={colors.destructive} />
-          <Text style={[styles.navLabel, { color: colors.mutedForeground }]}>يوتيوب</Text>
+        <Pressable testID="tab-youtube" accessibilityLabel="يوتيوب" onPress={() => setActiveTab('youtube')} style={styles.navItem}>
+          <Feather name="youtube" size={21} color={activeTab === 'youtube' ? colors.destructive : colors.mutedForeground} />
+          <Text style={[styles.navLabel, { color: activeTab === 'youtube' ? colors.destructive : colors.mutedForeground }]}>يوتيوب</Text>
         </Pressable>
         <Pressable testID="tab-downloads" accessibilityLabel="التنزيلات" onPress={() => setActiveTab('downloads')} style={styles.navItem}>
           <View><Feather name="download" size={21} color={activeTab === 'downloads' ? colors.primary : colors.mutedForeground} />{activeCount > 0 ? <View style={[styles.navDot, { backgroundColor: colors.primary }]} /> : null}</View>
@@ -1457,7 +1459,7 @@ export default function HomeScreen() {
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
-              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.11.0 · صُنع بعناية</Text></View>
+              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.12.0 · صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -1465,8 +1467,6 @@ export default function HomeScreen() {
             <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={showOpen} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : panel === 'trash' ? (
             <TrashPanel colors={colors} trashItems={trashItems} onBack={() => setPanel('menu')} onRestore={(id) => { void restoreFromTrash(id); setNotice('أُعيد الملف إلى التنزيلات ✓'); }} onDelete={(id) => void deletePermanently(id)} onEmpty={() => { void emptyTrash(); setNotice('فُرّغت سلة المحذوفات 🗑️'); }} />
-          ) : panel === 'youtube' ? (
-            <YoutubePanel colors={colors} onBack={() => setPanel('menu')} onDownload={(videoUrl: string) => { setPanel(null); void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} notice={notice ?? ''} />
           ) : (
             <AboutPanel colors={colors} onBack={() => setPanel('menu')} />
           )}
@@ -1838,10 +1838,13 @@ const styles = StyleSheet.create({
   dialogCancel: { paddingVertical: 8, marginTop: 3 },
   dialogCancelText: { fontSize: 13, fontWeight: '700' },
   ytBadge: { width: 34, height: 34, borderRadius: 17, justifyContent: 'center', alignItems: 'center' },
-  ytSearchWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 1, borderRadius: 14, paddingHorizontal: 13, paddingVertical: 9, marginBottom: 12 },
+  ytSearchWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 1, borderRadius: 14, paddingHorizontal: 13, paddingVertical: 9, marginHorizontal: 20, marginBottom: 10 },
   ytSearchButton: { width: 36, height: 36, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
-  ytError: { fontSize: 13, fontWeight: '700', textAlign: 'center', marginBottom: 9 },
+  ytError: { fontSize: 13, fontWeight: '700', textAlign: 'center', marginBottom: 9, marginHorizontal: 20 },
   ytList: { flex: 1 },
+  ytScreen: { flex: 1 },
+  ytPageHeader: { paddingHorizontal: 20, paddingTop: 8, marginBottom: 12 },
+  ytListContent: { paddingHorizontal: 20, paddingBottom: 30 },
   ytListEmpty: { flexGrow: 1, justifyContent: 'center' },
   ytEmpty: { alignItems: 'center', paddingVertical: 40, gap: 8 },
   ytEmptyIcon: { width: 64, height: 64, borderRadius: 32, justifyContent: 'center', alignItems: 'center', marginBottom: 4 },
