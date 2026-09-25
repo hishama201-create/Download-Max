@@ -3,7 +3,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type AccentKey = 'blue' | 'violet' | 'emerald' | 'coral' | 'orange';
-export type MaxTasks = 1 | 2 | 3;
+export type MaxTasks = 1 | 2 | 3 | 4;
 export const accentSwatches: Record<AccentKey, string> = {
   blue: '#2f7df6',
   violet: '#7657e8',
@@ -17,11 +17,13 @@ type SettingsValue = {
   accent: AccentKey;
   hasSeenOnboarding: boolean;
   maxTasks: MaxTasks;
+  maxTasksCellular: MaxTasks;
   allowMobileData: boolean;
   vaultPin: string | null;
   setThemeMode: (mode: ThemeMode) => void;
   setAccent: (accent: AccentKey) => void;
   setMaxTasks: (value: MaxTasks) => void;
+  setMaxTasksCellular: (value: MaxTasks) => void;
   setAllowMobileData: (value: boolean) => void;
   setVaultPin: (pin: string | null) => void;
   completeOnboarding: () => void;
@@ -34,7 +36,8 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [themeMode, setThemeModeState] = useState<ThemeMode>('system');
   const [accent, setAccentState] = useState<AccentKey>('blue');
   const [hasSeenOnboarding, setHasSeenOnboarding] = useState(false);
-  const [maxTasks, setMaxTasksState] = useState<MaxTasks>(2);
+  const [maxTasks, setMaxTasksState] = useState<MaxTasks>(3);
+  const [maxTasksCellular, setMaxTasksCellularState] = useState<MaxTasks>(2);
   const [allowMobileData, setAllowMobileDataState] = useState(true);
   const [vaultPin, setVaultPinState] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -47,7 +50,8 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
         if (parsed.themeMode) setThemeModeState(parsed.themeMode);
         if (parsed.accent) setAccentState(parsed.accent);
         if (parsed.hasSeenOnboarding) setHasSeenOnboarding(true);
-        if (parsed.maxTasks === 1 || parsed.maxTasks === 2 || parsed.maxTasks === 3) setMaxTasksState(parsed.maxTasks);
+        if (parsed.maxTasks === 1 || parsed.maxTasks === 2 || parsed.maxTasks === 3 || parsed.maxTasks === 4) setMaxTasksState(parsed.maxTasks);
+        if (parsed.maxTasksCellular === 1 || parsed.maxTasksCellular === 2 || parsed.maxTasksCellular === 3 || parsed.maxTasksCellular === 4) setMaxTasksCellularState(parsed.maxTasksCellular);
         if (typeof parsed.allowMobileData === 'boolean') setAllowMobileDataState(parsed.allowMobileData);
         if (typeof parsed.vaultPin === 'string' || parsed.vaultPin === null) setVaultPinState(parsed.vaultPin ?? null);
       })
@@ -55,7 +59,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
       .finally(() => setLoaded(true));
   }, []);
 
-  const save = useCallback((patch: Partial<Pick<SettingsValue, 'themeMode' | 'accent' | 'hasSeenOnboarding' | 'maxTasks' | 'allowMobileData' | 'vaultPin'>>) => {
+  const save = useCallback((patch: Partial<Pick<SettingsValue, 'themeMode' | 'accent' | 'hasSeenOnboarding' | 'maxTasks' | 'maxTasksCellular' | 'allowMobileData' | 'vaultPin'>>) => {
     void AsyncStorage.mergeItem(STORAGE_KEY, JSON.stringify(patch));
   }, []);
 
@@ -79,6 +83,11 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     save({ maxTasks: value });
   }, [save]);
 
+  const setMaxTasksCellular = useCallback((value: MaxTasks) => {
+    setMaxTasksCellularState(value);
+    save({ maxTasksCellular: value });
+  }, [save]);
+
   const setAllowMobileData = useCallback((value: boolean) => {
     setAllowMobileDataState(value);
     save({ allowMobileData: value });
@@ -94,16 +103,18 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     accent,
     hasSeenOnboarding,
     maxTasks,
+    maxTasksCellular,
     allowMobileData,
     vaultPin,
     loaded,
     setThemeMode,
     setAccent,
     setMaxTasks,
+    setMaxTasksCellular,
     setAllowMobileData,
     setVaultPin,
     completeOnboarding,
-  }), [themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, loaded, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding]);
+  }), [themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, loaded, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding]);
 
   return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
 }

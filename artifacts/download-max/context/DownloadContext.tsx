@@ -5,6 +5,7 @@ import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
+import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
@@ -171,7 +172,7 @@ type DownloadContextValue = {
   clearCompleted: () => Promise<void>;
   moveToVault: (id: string) => Promise<void>;
   removeFromVault: (id: string) => Promise<void>;
-  setQueueOptions: (options: { maxTasks: MaxTasks; allowMobileData: boolean }) => void;
+  setQueueOptions: (options: { maxTasks: MaxTasks; maxTasksCellular: MaxTasks; allowMobileData: boolean }) => void;
   /** مجلد التنزيل المختار (SAF URI) أو null للحفظ الداخلي. */
   downloadDir: string | null;
   setDownloadDir: (uri: string | null) => Promise<void>;
@@ -212,11 +213,13 @@ function prettyNameFromUrl(url: string): string | null {
 }
 
 /** يجلب اسم الملف الحقيقي ونوعه من ترويسات الخادم قبل التنزيل. */
-async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string | null; mime: string | null }> {
+async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string | null; mime: string | null; length: number | null }> {
   try {
     const response = await fetch(mediaUrl, { method: 'HEAD' });
     const disposition = response.headers.get('content-disposition');
     const mime = response.headers.get('content-type')?.split(';')[0]?.trim() ?? null;
+    const lengthHeader = response.headers.get('content-length');
+    const length = lengthHeader ? Number(lengthHeader) : null;
     let filename: string | null = null;
     if (disposition) {
       const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
@@ -230,9 +233,9 @@ async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string
         }
       }
     }
-    return { filename: filename?.trim() || null, mime };
+    return { filename: filename?.trim() || null, mime, length: length && Number.isFinite(length) && length > 0 ? length : null };
   } catch {
-    return { filename: null, mime: null };
+    return { filename: null, mime: null, length: null };
   }
 }
 
@@ -256,6 +259,25 @@ function typeFromMime(mimeType: string | null): MediaType {
 }
 
 /** يفصل امتداد الملف من اسمه الأصلي أو من نوع MIME، مع بدائل صالحة دائماً. */
+/** اسم المجلد الفرعي حسب نوع الوسيط (تنظيم على طريقة مجلدات التنزيل المعروفة). */
+function subfolderFor(type: MediaType): string {
+  if (type === 'video') return 'Video';
+  if (type === 'audio') return 'Audio';
+  return 'Image';
+}
+
+/** يجهز مجلد النوع الفرعي ويعيد المسار مع فاصله. يعيد '' إذا تعذر الإنشاء. */
+async function ensureTypeDir(baseDirectory: string, type: MediaType): Promise<string> {
+  try {
+    const dir = `${baseDirectory}${subfolderFor(type)}/`;
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+    return dir;
+  } catch {
+    return '';
+  }
+}
+
 function extensionFor(mimeType: string | null, originalName: string | null, type: MediaType) {
   const fromName = originalName?.includes('.') ? originalName.split('.').pop() : null;
   if (fromName && /^[a-z0-9]{2,5}$/i.test(fromName)) return fromName.toLowerCase();
@@ -426,8 +448,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const itemsRef = useRef<DownloadItem[]>([]);
   const queueRef = useRef<string[]>([]);
   const activeIdsRef = useRef<Set<string>>(new Set());
-  const maxTasksRef = useRef<MaxTasks>(2);
+  const maxTasksRef = useRef<MaxTasks>(3);
+  const maxTasksCellularRef = useRef<MaxTasks>(2);
   const allowMobileDataRef = useRef(true);
+  const isCellularRef = useRef(false);
+  /** طول الملف من فحص HEAD — مرجع احتياطي لحساب النسبة حين يحجب الخادم الطول أثناء البث. */
+  const remoteLengthRef = useRef<number | null>(null);
   const downloadDirRef = useRef<string | null>(null);
   const canDownloadRef = useRef(true);
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
@@ -477,7 +503,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!/^https?:\/\//i.test(item.url)) {
         // الاسم الأصلي من نظام المشاركة محفوظ في العنوان، ونضمن امتداداً صالحاً دائماً.
         const filename = safeFilename(item.title, extensionFor(mimeFor(item.format), item.title, item.type));
-        const target = `${baseDirectory}${filename}`;
+        const typeDir = await ensureTypeDir(baseDirectory, item.type);
+        const target = `${typeDir || baseDirectory}${filename}`;
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
@@ -525,7 +552,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       } else {
         [mediaUrl] = await resolveMediaUrls(item.url, item.requestOptions);
       }
-      let target = `${baseDirectory}${safeFilename(item.title, item.format)}`;
+      const initialTypeDir = await ensureTypeDir(baseDirectory, item.type);
+      let target = `${initialTypeDir || baseDirectory}${safeFilename(item.title, item.format)}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
       let resolvedTitle = item.title;
@@ -538,6 +566,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         if (oembedTitle) resolvedTitle = oembedTitle;
       }
       const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
+      // يوتيوب غالباً يبث بدون ترويسة طول أثناء التنزيل نفسه — نستخدم طول HEAD كمرجع للنسبة.
+      remoteLengthRef.current = remoteInfo.length ?? null;
       const remoteName = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
       if (remoteName) {
         const remoteExt = remoteName.includes('.') ? remoteName.split('.').pop()?.toLowerCase() : null;
@@ -552,7 +582,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
       let lastAt = 0;
       const onProgress = (progress: { totalBytesWritten: number; totalBytesExpectedToWrite: number }) => {
-        const expected = progress.totalBytesExpectedToWrite;
+        const expected = progress.totalBytesExpectedToWrite > 0
+          ? progress.totalBytesExpectedToWrite
+          : remoteLengthRef.current ?? 0;
         const nextProgress = expected > 0 ? progress.totalBytesWritten / expected : 0;
         if (nextProgress <= 0 || nextProgress >= 1) return;
         const now = Date.now();
@@ -684,7 +716,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
   /** يشغّل المهام التالية في الطابور حتى بلوغ حد التنزيلات المتزامنة. */
   const pump = useCallback(() => {
-    if (activeIdsRef.current.size >= maxTasksRef.current) return;
+    const limit = isCellularRef.current ? maxTasksCellularRef.current : maxTasksRef.current;
+    if (activeIdsRef.current.size >= limit) return;
     const headId = queueRef.current[0];
     const headItem = headId ? itemsRef.current.find((candidate) => candidate.id === headId) : undefined;
     // النسخ المحلي من الملفات المشاركة لا يحتاج اتصالاً بالإنترنت.
@@ -703,7 +736,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
     activeIdsRef.current.add(nextId);
     runJobRef.current(nextId);
-    if (activeIdsRef.current.size < maxTasksRef.current && queueRef.current.length > 0) {
+    const activeLimit = isCellularRef.current ? maxTasksCellularRef.current : maxTasksRef.current;
+    if (activeIdsRef.current.size < activeLimit && queueRef.current.length > 0) {
       pumpRef.current();
     }
   }, []);
@@ -726,6 +760,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const update = (state: NetInfoState) => {
       const isConnected = !!state.isConnected && !!state.isInternetReachable;
       const isCellular = state.type === 'cellular';
+      isCellularRef.current = isCellular;
       canDownloadRef.current = isConnected && (!isCellular || allowMobileDataRef.current);
       pumpRef.current();
     };
@@ -1060,11 +1095,60 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const moveToVault = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    // اخفاء فعلي: نقل الملف الى مجلد خاص مخفي (.vault) مع .nomedia لاخفائه من ماسح الوسائط
+    if (item?.fileUri && !/^https?:\/\//i.test(item.fileUri) && Platform.OS !== 'web') {
+      try {
+        const baseDirectory = FileSystem.documentDirectory;
+        if (baseDirectory) {
+          const filename = item.fileUri.split('/').pop() ?? '';
+          const vaultDir = `${baseDirectory}.vault/`;
+          const vaultMarker = `${vaultDir}.nomedia`;
+          const dirInfo = await FileSystem.getInfoAsync(vaultDir);
+          if (!dirInfo.exists) await FileSystem.makeDirectoryAsync(vaultDir, { intermediates: true });
+          const markerInfo = await FileSystem.getInfoAsync(vaultMarker);
+          if (!markerInfo.exists) await FileSystem.writeAsStringAsync(vaultMarker, '', { encoding: FileSystem.EncodingType.UTF8 });
+          const movedUri = `${vaultDir}${filename}`;
+          const existing = await FileSystem.getInfoAsync(movedUri);
+          if (existing.exists) await FileSystem.deleteAsync(movedUri, { idempotent: true });
+          await FileSystem.moveAsync({ from: item.fileUri, to: movedUri });
+          patchItem(id, { inVault: true, fileUri: movedUri });
+          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          return;
+        }
+      } catch {
+        // فشل النقل الفعلي — نكتفي بالإخفاء المنطقي حتى لا يفقد المستخدم الملف.
+      }
+    }
     patchItem(id, { inVault: true });
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   }, [patchItem]);
 
   const removeFromVault = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    // الاصدار من الخزنة: اعادة الملف الى مجلد التطبيق الظاهر واضافته للمعرض.
+    if (item?.fileUri?.includes('/.vault/') && Platform.OS !== 'web') {
+      try {
+        const baseDirectory = FileSystem.documentDirectory;
+        const filename = item.fileUri.split('/').pop() ?? '';
+        const restoredUri = `${baseDirectory}${filename}`;
+        const existing = await FileSystem.getInfoAsync(restoredUri);
+        if (existing.exists) await FileSystem.deleteAsync(restoredUri, { idempotent: true });
+        await FileSystem.moveAsync({ from: item.fileUri, to: restoredUri });
+        if (item.type === 'image' || item.type === 'video') {
+          try {
+            await MediaLibrary.saveToLibraryAsync(restoredUri);
+          } catch {
+            // فشل الإضافة للمعرض غير حرج — الملف يعود ظاهراً في مجلد التطبيق على أي حال.
+          }
+        }
+        patchItem(id, { inVault: false, fileUri: restoredUri });
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        return;
+      } catch {
+        // فشل الإرجاع الفعلي — نكمل بالإخفاء المنطقي.
+      }
+    }
     patchItem(id, { inVault: false });
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [patchItem]);
@@ -1105,8 +1189,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     return true;
   }, [commit]);
 
-  const setQueueOptions = useCallback((options: { maxTasks: MaxTasks; allowMobileData: boolean }) => {
+  const setQueueOptions = useCallback((options: { maxTasks: MaxTasks; maxTasksCellular: MaxTasks; allowMobileData: boolean }) => {
     maxTasksRef.current = options.maxTasks;
+    maxTasksCellularRef.current = options.maxTasksCellular;
     allowMobileDataRef.current = options.allowMobileData;
     pumpRef.current();
   }, []);

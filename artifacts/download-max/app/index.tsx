@@ -1,6 +1,7 @@
 import { Feather } from '@expo/vector-icons';
 import Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
+import { LinearGradient } from 'expo-linear-gradient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useIncomingShare } from 'expo-sharing';
 import { cleanupSlideshowTemp, fetchSlideshowBundle, generateSlideshowVideo } from '../context/slideshow';
@@ -702,13 +703,15 @@ function FeatureRow({ icon, text, colors }: { icon: keyof typeof Feather.glyphMa
   return <View style={styles.featureRow}><View style={[styles.featureIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name={icon} size={16} color={colors.primary} /></View><Text style={[styles.featureText, { color: colors.foreground }]}>{text}</Text></View>;
 }
 
-function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, downloadDir, onThemeChange, onAccentChange, onMaxTasks, onAllowMobileData, onChooseDownloadDir, onClearDownloadDir, onBack }: {
+function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, allowMobileData, downloadDir, onThemeChange, onAccentChange, onMaxTasks, onMaxTasksCellular, onAllowMobileData, onChooseDownloadDir, onClearDownloadDir, onBack }: {
   colors: Palette;
   themeMode: ThemeMode;
   accent: AccentKey;
   maxTasks: MaxTasks;
+  maxTasksCellular: MaxTasks;
   allowMobileData: boolean;
   downloadDir: string | null;
+  onMaxTasksCellular: (value: MaxTasks) => void;
   onThemeChange: (mode: ThemeMode) => void;
   onAccentChange: (value: AccentKey) => void;
   onMaxTasks: (value: MaxTasks) => void;
@@ -737,9 +740,18 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
     <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 27 }]}>التنزيلات المتزامنة</Text>
     <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>كم ملفاً يُنزّل في نفس الوقت</Text>
     <View style={styles.queueOptions}>
-      {([1, 2, 3] as const).map((value) => (
-        <Pressable key={value} testID={`max-tasks-${value}`} accessibilityLabel={`${value} مهام متزامنة`} onPress={() => onMaxTasks(value)} style={[styles.queueOption, { backgroundColor: colors.background, borderColor: maxTasks === value ? colors.primary : colors.border }]}>
+      {([1, 2, 3, 4] as const).map((value) => (
+        <Pressable key={value} testID={`max-tasks-${value}`} accessibilityLabel={`${value} مهام على Wi-Fi`} onPress={() => onMaxTasks(value)} style={[styles.queueOption, { backgroundColor: colors.background, borderColor: maxTasks === value ? colors.primary : colors.border }]}>
           <Text style={[styles.themeOptionText, { color: maxTasks === value ? colors.primary : colors.mutedForeground }]}>{value}</Text>
+        </Pressable>
+      ))}
+    </View>
+    <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 20 }]}>مهام بيانات الجوال</Text>
+    <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>حد أقل يوفر باقتك أثناء التنقل</Text>
+    <View style={styles.queueOptions}>
+      {([1, 2, 3, 4] as const).map((value) => (
+        <Pressable key={value} testID={`max-tasks-cellular-${value}`} accessibilityLabel={`${value} مهام على بيانات الجوال`} onPress={() => onMaxTasksCellular(value)} style={[styles.queueOption, { backgroundColor: colors.background, borderColor: maxTasksCellular === value ? colors.primary : colors.border }]}>
+          <Text style={[styles.themeOptionText, { color: maxTasksCellular === value ? colors.primary : colors.mutedForeground }]}>{value}</Text>
         </Pressable>
       ))}
     </View>
@@ -777,7 +789,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, allowMobileData, d
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.10.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.11.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -787,8 +799,8 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
-  const { themeMode, accent, hasSeenOnboarding, maxTasks, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
   const [activeTab, setActiveTab] = useState<'home' | 'downloads'>('home');
@@ -819,8 +831,8 @@ export default function HomeScreen() {
 
   // مزامنة إعدادات الطابور (المهام المتزامنة + بيانات الجوال) مع سياق التنزيل.
   useEffect(() => {
-    setQueueOptions({ maxTasks, allowMobileData });
-  }, [maxTasks, allowMobileData, setQueueOptions]);
+    setQueueOptions({ maxTasks, maxTasksCellular, allowMobileData });
+  }, [maxTasks, maxTasksCellular, allowMobileData, setQueueOptions]);
 
   // الإشعار السفلي يختفي تلقائياً بعد 7 ثوانٍ.
   useEffect(() => {
@@ -1185,9 +1197,15 @@ export default function HomeScreen() {
                     <Text style={[styles.eyebrow, { color: colors.primary }]}>روابطك في مكان واحد</Text>
                     <Text style={[styles.heroTitle, { color: colors.foreground }]}>حمّل ما تحتاجه{'\n'}بدون تعقيد.</Text>
                     <Text style={[styles.heroBody, { color: colors.mutedForeground }]}>شارك الرابط من متصفحك، اختر نوع الملف، واترك الباقي لـ Download Max.</Text>
+                    <View style={[styles.heroStat, { backgroundColor: `${colors.primary}14` }]}>
+                      <Feather name="check-circle" size={13} color={colors.primary} />
+                      <Text style={[styles.heroStatText, { color: colors.primary }]}>{stats.total} ملف جاهز في مكتبتك</Text>
+                    </View>
                   </View>
                   <View style={[styles.heroOrb, { borderColor: `${colors.primary}28` }]}>
-                    <Feather name="arrow-down" size={46} color={colors.primary} />
+                    <View style={[styles.heroOrbInner, { backgroundColor: `${colors.primary}14` }]}>
+                      <Feather name="arrow-down" size={44} color={colors.primary} />
+                    </View>
                   </View>
                 </View>
 
@@ -1219,7 +1237,6 @@ export default function HomeScreen() {
                     <Text style={[styles.sectionTitle, { color: colors.foreground }]}>نوع الملف</Text>
                     <Text style={[styles.sectionHint, { color: colors.mutedForeground }]}>اختر ما يناسبك</Text>
                   </View>
-                  <Feather name="sliders" size={19} color={colors.mutedForeground} />
                 </View>
                 <View style={styles.typeRow}>
                   {(Object.keys(typeLabels) as MediaType[]).map((type) => {
@@ -1268,7 +1285,6 @@ export default function HomeScreen() {
                     <Pressable testID="toggle-search" accessibilityLabel="بحث في التنزيلات" onPress={() => { setShowSearch((value) => !value); setSearchQuery(''); }} style={styles.headerActionButton}>
                       <Feather name={showSearch ? 'x' : 'search'} size={18} color={colors.primary} />
                     </Pressable>
-                    {downloadItems.some((item) => item.status === 'completed') ? <Pressable onPress={clearCompleted}><Text style={[styles.clearCompleted, { color: colors.primary }]}>مسح المكتمل</Text></Pressable> : null}
                   </View>
                 </View>
                 {showSearch ? (
@@ -1291,7 +1307,7 @@ export default function HomeScreen() {
                   </View>
                 ) : null}
                 <View style={styles.filterRow}>
-                  {([{ key: 'all', label: 'الكل', icon: 'grid' }, { key: 'video', label: 'فيديو', icon: 'video' }, { key: 'audio', label: 'صوت', icon: 'headphones' }, { key: 'image', label: 'صور', icon: 'image' }] as { key: MediaType | 'all'; label: string; icon: keyof typeof Feather.glyphMap }[]).map((filter) => <Pressable key={filter.key} onPress={() => setMediaFilter(filter.key)} style={[styles.filterChip, { backgroundColor: mediaFilter === filter.key ? colors.primary : colors.card, borderColor: mediaFilter === filter.key ? colors.primary : colors.border }]}><Feather name={filter.icon} size={14} color={mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground} /><Text style={[styles.filterText, { color: mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground }]}>{filter.label}</Text></Pressable>)}
+                  {([{ key: 'all', label: 'الكل', icon: 'grid' }, { key: 'video', label: 'فيديو', icon: 'video' }, { key: 'audio', label: 'صوت', icon: 'headphones' }, { key: 'image', label: 'صور', icon: 'image' }] as { key: MediaType | 'all'; label: string; icon: keyof typeof Feather.glyphMap }[]).map((filter) => { const count = filter.key === 'all' ? visibleItems.length : visibleItems.filter((entry) => entry.type === filter.key).length; return <Pressable key={filter.key} onPress={() => setMediaFilter(filter.key)} style={[styles.filterChip, { backgroundColor: mediaFilter === filter.key ? colors.primary : colors.card, borderColor: mediaFilter === filter.key ? colors.primary : colors.border }]}><Feather name={filter.icon} size={14} color={mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground} /><Text style={[styles.filterText, { color: mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground }]}>{filter.label}</Text><View style={[styles.filterCount, { backgroundColor: mediaFilter === filter.key ? `${colors.primaryForeground}26` : `${colors.mutedForeground}18` }]}><Text style={[styles.filterCountText, { color: mediaFilter === filter.key ? colors.primaryForeground : colors.mutedForeground }]}>{count}</Text></View></Pressable>; })}
                 </View>
               </>
             }
@@ -1307,6 +1323,10 @@ export default function HomeScreen() {
         <Pressable testID="tab-home" accessibilityLabel="الرئيسية" onPress={() => setActiveTab('home')} style={styles.navItem}>
           <Feather name="home" size={21} color={activeTab === 'home' ? colors.primary : colors.mutedForeground} />
           <Text style={[styles.navLabel, { color: activeTab === 'home' ? colors.primary : colors.mutedForeground }]}>الرئيسية</Text>
+        </Pressable>
+        <Pressable testID="tab-youtube" accessibilityLabel="يوتيوب" onPress={() => setPanel('youtube')} style={styles.navItem}>
+          <Feather name="youtube" size={21} color={colors.destructive} />
+          <Text style={[styles.navLabel, { color: colors.mutedForeground }]}>يوتيوب</Text>
         </Pressable>
         <Pressable testID="tab-downloads" accessibilityLabel="التنزيلات" onPress={() => setActiveTab('downloads')} style={styles.navItem}>
           <View><Feather name="download" size={21} color={activeTab === 'downloads' ? colors.primary : colors.mutedForeground} />{activeCount > 0 ? <View style={[styles.navDot, { backgroundColor: colors.primary }]} /> : null}</View>
@@ -1426,19 +1446,21 @@ export default function HomeScreen() {
         <Pressable style={styles.drawerBackdrop} onPress={() => setPanel(null)}>
           {panel === 'menu' ? (
             <Pressable style={[styles.drawer, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
-              <View style={styles.drawerHeader}><View style={[styles.drawerMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={18} color={colors.primaryForeground} /></View><View><Text style={[styles.drawerTitle, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.drawerSubtitle, { color: colors.mutedForeground }]}>مركز التحكم</Text></View><Pressable onPress={() => setPanel(null)} style={styles.closeButton}><Feather name="x" size={21} color={colors.mutedForeground} /></Pressable></View>
+              <View style={styles.drawerHeader}><LinearGradient style={styles.drawerMark} colors={[colors.primary, `${colors.primary}55`]}><Feather name="arrow-down" size={18} color={colors.primaryForeground} /></LinearGradient><View><Text style={[styles.drawerTitle, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.drawerSubtitle, { color: colors.mutedForeground }]}>مركز التحكم</Text></View><Pressable onPress={() => setPanel(null)} style={styles.closeButton}><Feather name="x" size={21} color={colors.mutedForeground} /></Pressable></View>
               <View style={[styles.drawerDivider, { backgroundColor: colors.border }]} />
-              <Pressable onPress={() => { setPanel(null); setActiveTab('home'); }} style={styles.menuItem}><Feather name="home" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الرئيسية</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <Pressable onPress={() => { setPanel(null); setActiveTab('downloads'); }} style={styles.menuItem}><Feather name="download" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>التنزيلات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><Feather name="lock" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <Pressable onPress={() => setPanel('youtube')} testID="menu-youtube" style={styles.menuItem}><Feather name="youtube" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>يوتيوب — ابحث وحمّل</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><Feather name="trash-2" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات{trashItems.length > 0 ? ` (${trashItems.length})` : ''}</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><Feather name="sliders" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><Feather name="info" size={20} color={colors.primary} /><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text><Feather name="chevron-left" size={17} color={colors.mutedForeground} /></Pressable>
-              <View style={styles.drawerFooter}><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>الإصدار 1.9.5</Text><Text style={[styles.drawerFooterText, { color: colors.mutedForeground }]}>صُنع بعناية</Text></View>
+              <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>تصفّح</Text>
+              <Pressable onPress={() => { setPanel(null); setActiveTab('home'); }} style={[styles.menuItem, { backgroundColor: activeTab === 'home' ? `${colors.primary}14` : 'transparent' }]}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="home" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: activeTab === 'home' ? colors.primary : colors.foreground }]}>الرئيسية</Text></Pressable>
+              <Pressable onPress={() => { setPanel(null); setActiveTab('downloads'); }} style={[styles.menuItem, { backgroundColor: activeTab === 'downloads' ? `${colors.primary}14` : 'transparent' }]}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="download" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: activeTab === 'downloads' ? colors.primary : colors.foreground }]}>التنزيلات</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.primary}16` }]}><Text style={[styles.menuBadgeText, { color: colors.primary }]}>{visibleItems.length}</Text></View></Pressable>
+              <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>مكتبتي</Text>
+              <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.accentForeground}14` }]}><Feather name="lock" size={16} color={colors.accentForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.accentForeground}16` }]}><Text style={[styles.menuBadgeText, { color: colors.accentForeground }]}>{vaultItems.length}</Text></View></Pressable>
+              <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="trash-2" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.destructive}16` }]}><Text style={[styles.menuBadgeText, { color: colors.destructive }]}>{trashItems.length}</Text></View></Pressable>
+              <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
+              <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
+              <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
+              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.11.0 · صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
-            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
+            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
           ) : panel === 'vault' ? (
             <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={showOpen} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : panel === 'trash' ? (
@@ -1484,9 +1506,20 @@ export default function HomeScreen() {
             <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
             {moreMenu ? (
               <View style={[styles.moreHeader, { borderBottomColor: colors.border }]}>
-                <View style={[styles.moreHeaderIcon, { backgroundColor: `${colors.primary}14` }]}>
-                  <Feather name={typeIcons[moreMenu.type]} size={22} color={colors.primary} />
-                </View>
+                {moreMenu.status === 'completed' && moreMenu.thumbnailUri ? (
+                  <View style={styles.moreHeaderThumbWrap}>
+                    <Image source={{ uri: moreMenu.thumbnailUri }} style={styles.moreHeaderThumb} resizeMode="cover" />
+                    {moreMenu.type === 'video' ? (
+                      <View style={styles.moreHeaderThumbBadge}>
+                        <Feather name="play" size={10} color="#fff" />
+                      </View>
+                    ) : null}
+                  </View>
+                ) : (
+                  <View style={[styles.moreHeaderIcon, { backgroundColor: `${colors.primary}14` }]}>
+                    <Feather name={typeIcons[moreMenu.type]} size={22} color={colors.primary} />
+                  </View>
+                )}
                 <View style={styles.moreHeaderText}>
                   <Text style={[styles.moreHeaderTitle, { color: colors.foreground }]} numberOfLines={2}>{moreMenu.title}</Text>
                   <Text style={[styles.moreHeaderMeta, { color: colors.mutedForeground }]}>{typeLabels[moreMenu.type]} · {moreMenu.format.toUpperCase()}{moreMenu.totalBytes ? ` · ${formatBytes(moreMenu.totalBytes)}` : ''}</Text>
@@ -1633,7 +1666,10 @@ const styles = StyleSheet.create({
   eyebrow: { fontSize: 12, fontWeight: '700', marginBottom: 9 },
   heroTitle: { fontSize: 28, lineHeight: 33, fontWeight: '800', letterSpacing: -0.7 },
   heroBody: { fontSize: 12, lineHeight: 18, marginTop: 11, maxWidth: 224 },
-  heroOrb: { width: 112, height: 112, borderRadius: 56, borderWidth: 18, justifyContent: 'center', alignItems: 'center', opacity: 0.9, marginRight: -35 },
+  heroOrb: { width: 112, height: 112, borderRadius: 56, borderWidth: 18, justifyContent: 'center', alignItems: 'center', opacity: 0.95, marginRight: -35 },
+  heroOrbInner: { width: 64, height: 64, borderRadius: 32, justifyContent: 'center', alignItems: 'center' },
+  heroStat: { flexDirection: 'row', alignItems: 'center', gap: 6, alignSelf: 'flex-start', marginTop: 12, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 11 },
+  heroStatText: { fontSize: 11, fontWeight: '700' },
   inputCard: { borderRadius: 20, borderWidth: 1, padding: 16, marginTop: 18 },
   sectionLabel: { fontSize: 14, fontWeight: '800', marginBottom: 11 },
   urlInputWrap: { minHeight: 52, borderRadius: 14, borderWidth: 1, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 9 },
@@ -1664,11 +1700,12 @@ const styles = StyleSheet.create({
   downloadsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 16 },
   pageTitle: { fontSize: 27, fontWeight: '800', letterSpacing: -0.5 },
   pageSubtitle: { fontSize: 12, marginTop: 5 },
-  clearCompleted: { fontSize: 12, fontWeight: '700', paddingBottom: 3 },
   filterRow: { flexDirection: 'row', gap: 7, marginBottom: 8 },
   filterChip: { minHeight: 34, borderRadius: 12, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 5 },
   filterText: { fontSize: 11, fontWeight: '700' },
-  downloadRow: { borderRadius: 17, borderWidth: 1, padding: 13, flexDirection: 'row', alignItems: 'center' },
+  filterCount: { minWidth: 19, height: 17, borderRadius: 9, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 5 },
+  filterCountText: { fontSize: 10, fontWeight: '800' },
+  downloadRow: { borderRadius: 17, borderWidth: 1, padding: 13, flexDirection: 'row', alignItems: 'center', shadowColor: '#0e1a2b', shadowOpacity: 0.05, shadowRadius: 9, shadowOffset: { width: 0, height: 4 }, elevation: 2 },
   fileIcon: { width: 42, height: 42, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
   fileThumbWrap: { width: 56, height: 56, borderRadius: 12, overflow: 'hidden', justifyContent: 'center', alignItems: 'center' },
   fileThumbImage: { width: '100%', height: '100%' },
@@ -1680,8 +1717,8 @@ const styles = StyleSheet.create({
   rowTitle: { fontSize: 13, fontWeight: '800' },
   rowMeta: { fontSize: 10, marginTop: 4 },
   progressLine: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 9 },
-  progressTrack: { flex: 1, height: 5, borderRadius: 3, overflow: 'hidden' },
-  progressFill: { height: '100%', borderRadius: 3 },
+  progressTrack: { flex: 1, height: 7, borderRadius: 4, overflow: 'hidden' },
+  progressFill: { height: '100%', borderRadius: 4 },
   progressPercent: { fontSize: 11, fontWeight: '800', minWidth: 32, textAlign: 'right' },
   openButton: { width: 30, height: 30, borderRadius: 15, justifyContent: 'center', alignItems: 'center' },
   dirRow: { flexDirection: 'row', alignItems: 'center', gap: 9, borderWidth: 1, borderRadius: 15, padding: 13, marginTop: 10 },
@@ -1721,10 +1758,14 @@ const styles = StyleSheet.create({
   drawerSubtitle: { fontSize: 11, marginTop: 3 },
   closeButton: { marginLeft: 'auto', padding: 6 },
   drawerDivider: { height: 1, marginVertical: 22 },
-  menuItem: { minHeight: 57, borderRadius: 14, flexDirection: 'row', alignItems: 'center', gap: 13, paddingHorizontal: 12 },
+  drawerSection: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginTop: 8, marginBottom: 4, paddingHorizontal: 12 },
+  menuItem: { minHeight: 50, borderRadius: 14, flexDirection: 'row', alignItems: 'center', gap: 13, paddingHorizontal: 12 },
+  menuItemIcon: { width: 32, height: 32, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  menuBadge: { minWidth: 22, height: 20, borderRadius: 10, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 7 },
+  menuBadgeText: { fontSize: 10, fontWeight: '800' },
   menuItemText: { flex: 1, fontSize: 14, fontWeight: '700' },
-  drawerFooter: { marginTop: 'auto', paddingBottom: 35, flexDirection: 'row', justifyContent: 'space-between' },
-  drawerFooterText: { fontSize: 10 },
+  drawerFooterPill: { marginTop: 'auto', alignSelf: 'center', marginBottom: 35, paddingHorizontal: 16, paddingVertical: 9, borderRadius: 999, borderWidth: 1 },
+  drawerFooterPillText: { fontSize: 10, fontWeight: '700' },
   settingsPanel: { width: '84%', minHeight: '100%', paddingTop: 58, paddingHorizontal: 21, borderTopRightRadius: 25, borderBottomRightRadius: 25 },
   panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 32 },
   backButton: { width: 34, height: 34, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
@@ -1783,6 +1824,9 @@ const styles = StyleSheet.create({
   moreSheet: { borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingTop: 10, paddingHorizontal: 18 },
   moreHeader: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, paddingVertical: 14, borderBottomWidth: 1 },
   moreHeaderIcon: { width: 44, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  moreHeaderThumbWrap: { width: 62, height: 44, borderRadius: 9, overflow: 'hidden' },
+  moreHeaderThumb: { width: '100%', height: '100%' },
+  moreHeaderThumbBadge: { position: 'absolute', bottom: 3, left: 3, width: 16, height: 16, borderRadius: 8, backgroundColor: 'rgba(0,0,0,0.62)', alignItems: 'center', justifyContent: 'center' },
   moreHeaderText: { flex: 1 },
   moreHeaderTitle: { fontSize: 15, fontWeight: '800', textAlign: 'right' },
   moreHeaderMeta: { fontSize: 12, marginTop: 2, textAlign: 'right' },
