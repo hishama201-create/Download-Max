@@ -26,11 +26,19 @@ import {
   useColorScheme,
   View,
 } from 'react-native';
+import Constants from 'expo-constants';
 import { WebView } from 'react-native-webview';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { DownloadItem, MediaType, useDownloads, previewCarouselImages } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
+
+/** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
+const APP_VERSION: string = String((Constants.expoConfig?.version as string | undefined) ?? '1.16.0');
+
+/** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
+const YT_MOBILE_UA =
+  'Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 
 const formats: Record<MediaType, { format: string; label: string; detail: string }[]> = {
   video: [
@@ -343,10 +351,12 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   const [nextPageToken, setNextPageToken] = useState<string | undefined>(undefined);
   const [exhausted, setExhausted] = useState(false);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
+  const [playerError, setPlayerError] = useState<string | null>(null);
 
   // جلب المقترحات: نفس عنوان الفيديو (نتائج مشابهة) — وكل سحب لأسفل يجلب صفحة جديدة
   useEffect(() => {
     let cancelled = false;
+    setPlayerError(null);
     setRelated([]);
     setNextPageToken(undefined);
     setExhausted(false);
@@ -395,7 +405,8 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
     }, 2500);
   }
 
-  const embedUrl = `https://www.youtube.com/embed/${video.id}?autoplay=1&rel=0&playsinline=1`;
+  const embedUrl = `https://www.youtube.com/embed/${video.id}?autoplay=1&rel=0&playsinline=1&modestbranding=1`;
+  const watchUrl = `https://www.youtube.com/watch?v=${video.id}`;
 
   return (
     <View style={styles.ytScreen}>
@@ -405,12 +416,37 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
           key={video.id}
           source={{ uri: embedUrl }}
           style={styles.ytPlayer}
+          userAgent={YT_MOBILE_UA}
+          originWhitelist={['https://*', 'http://*']}
           allowsFullscreenVideo
+          allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           javaScriptEnabled
           domStorageEnabled
-          allowsInlineMediaPlayback
+          thirdPartyCookiesEnabled
+          setSupportMultipleWindows={false}
+          mixedContentMode="always"
+          onError={() => setPlayerError('تعذّر تحميل مشغّل يوتيوب داخل التطبيق.')}
+          onHttpError={(event) => {
+            const status = event?.nativeEvent?.statusCode;
+            if (typeof status === 'number' && status >= 400) setPlayerError('مشغّل يوتيوب لم يستجب (خطأ ' + status + ').');
+          }}
+          onRenderProcessGone={() => setPlayerError('توقّف مشغّل يوتيوب على هذا الجهاز.')}
         />
+        {playerError ? (
+          <View style={styles.ytPlayerError}>
+            <Feather name="alert-triangle" size={22} color="#fff" />
+            <Text style={styles.ytPlayerErrorText}>{playerError}</Text>
+            <Pressable
+              accessibilityLabel="فتح الفيديو في المتصفح"
+              onPress={() => { void Linking.openURL(watchUrl); }}
+              style={styles.ytPlayerFallbackBtn}
+            >
+              <Feather name="external-link" size={15} color="#0b0f17" />
+              <Text style={styles.ytPlayerFallbackBtnText}>فتح في المتصفح</Text>
+            </Pressable>
+          </View>
+        ) : null}
       </View>
       {/* شريط عنوان المشاهدة مع زر رجوع */}
       <View style={[styles.ytWatchBar, { backgroundColor: colors.card, borderBottomColor: colors.border }]}>
@@ -1072,7 +1108,7 @@ function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void })
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <ScrollView style={styles.panelScroll} contentContainerStyle={styles.panelScrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.15.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار {APP_VERSION}</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>    </ScrollView>
 
@@ -1458,6 +1494,9 @@ export default function HomeScreen() {
               <Feather name="arrow-down" size={17} color={colors.primaryForeground} />
             </View>
             <Text style={[styles.brandName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text>
+            <View testID="version-badge" accessibilityLabel={`الإصدار ${APP_VERSION}`} style={[styles.versionBadge, { backgroundColor: `${colors.primary}1A`, borderColor: `${colors.primary}38` }]}>
+              <Text style={[styles.versionBadgeText, { color: colors.primary }]}>v{APP_VERSION}</Text>
+            </View>
           </View>
           <Text style={[styles.brandSubline, { color: colors.mutedForeground }]}>تحميلك، بطريقة أبسط</Text>
         </View>
@@ -1743,7 +1782,7 @@ export default function HomeScreen() {
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
-              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.15.0 · صُنع بعناية</Text></View>
+              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار {APP_VERSION} · صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -2136,6 +2175,8 @@ const styles = StyleSheet.create({
   ytEmptyIcon: { width: 64, height: 64, borderRadius: 32, justifyContent: 'center', alignItems: 'center', marginBottom: 4 },
   ytEmptyTitle: { fontSize: 16, fontWeight: '800' },
   ytEmptyHint: { fontSize: 13, textAlign: 'center', paddingHorizontal: 20, lineHeight: 20 },
+  versionBadge: { marginRight: 8, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 999, borderWidth: 1 },
+  versionBadgeText: { fontSize: 10, fontWeight: '800' },
   ytDuration: { position: 'absolute', bottom: 6, right: 6, backgroundColor: 'rgba(0,0,0,0.82)', borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 },
   ytDurationText: { color: '#fff', fontSize: 10, fontWeight: '700' },
   // — شرائح الفلترة (Filter Chips — Material 3) —
@@ -2159,6 +2200,10 @@ const styles = StyleSheet.create({
   // — صفحة المشاهدة (Watch Page) —
   ytPlayerWrap: { width: '100%', aspectRatio: 16 / 9 },
   ytPlayer: { flex: 1 },
+  ytPlayerError: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 18, backgroundColor: 'rgba(4,7,12,0.88)' },
+  ytPlayerErrorText: { color: '#e7ecf5', fontSize: 12, textAlign: 'center', lineHeight: 18 },
+  ytPlayerFallbackBtn: { marginTop: 4, flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
+  ytPlayerFallbackBtnText: { color: '#0b0f17', fontSize: 12, fontWeight: '700' },
   ytWatchBar: { flexDirection: 'row', alignItems: 'center', gap: 9, paddingHorizontal: 14, paddingVertical: 9, borderBottomWidth: 1 },
   ytWatchBack: { width: 34, height: 34, borderRadius: 17, justifyContent: 'center', alignItems: 'center' },
   ytWatchBarCopy: { flex: 1, gap: 2 },
