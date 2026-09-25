@@ -5,9 +5,10 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useIncomingShare } from 'expo-sharing';
 import { cleanupSlideshowTemp, fetchSlideshowBundle, generateSlideshowVideo } from '../context/slideshow';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Animated,
   FlatList,
   Image,
   Keyboard,
@@ -16,6 +17,7 @@ import {
   Platform,
   Pressable,
   RefreshControl,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -504,6 +506,10 @@ function YoutubeScreen({ colors, onDownload }: {
   const [ytFilter, setYtFilter] = useState<'all' | 'video' | 'channel'>('all');
   // صفحة المشاهدة: الفيديو المفتوح (Sticky Player + مقترحات)
   const [watching, setWatching] = useState<YoutubeVideo | null>(null);
+  // شريط البحث القابل للطي: يطوي رأس الصفحة تلقائياً عند السحب لأعلى
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const headerCollapse = scrollY.interpolate({ inputRange: [0, 64], outputRange: [64, 0], extrapolate: 'clamp' });
+  const headerFade = scrollY.interpolate({ inputRange: [0, 36], outputRange: [1, 0], extrapolate: 'clamp' });
 
   async function runSearch(text: string) {
     const trimmed = text.trim();
@@ -552,10 +558,12 @@ function YoutubeScreen({ colors, onDownload }: {
 
   return (
     <View style={styles.ytScreen}>
-      <View style={styles.ytPageHeader}>
-        <Text style={[styles.pageTitle, { color: colors.foreground }]}>يوتيوب</Text>
-        <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>ابحث عن فيديو أو أغنية وحمّلها مباشرة</Text>
-      </View>
+      <Animated.View style={{ height: headerCollapse, opacity: headerFade, overflow: 'hidden' }}>
+        <View style={styles.ytPageHeader}>
+          <Text style={[styles.pageTitle, { color: colors.foreground }]}>يوتيوب</Text>
+          <Text style={[styles.pageSubtitle, { color: colors.mutedForeground }]}>ابحث عن فيديو أو أغنية وحمّلها مباشرة</Text>
+        </View>
+      </Animated.View>
       <View style={[styles.ytSearchWrap, { backgroundColor: colors.card, borderColor: colors.input }]}>
         <Feather name="search" size={17} color={colors.mutedForeground} />
         <TextInput
@@ -585,6 +593,8 @@ function YoutubeScreen({ colors, onDownload }: {
           keyExtractor={(item) => item.id}
           style={styles.ytList}
           contentContainerStyle={styles.ytListContent}
+          onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: false })}
+          scrollEventThrottle={16}
           ListHeaderComponent={
             <View>
               {ytFilter === 'all' && topResult ? (
@@ -838,6 +848,7 @@ function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut
 
   return (
     <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+    <ScrollView style={styles.panelScroll} contentContainerStyle={styles.panelScrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
       <View style={styles.panelHeader}>
         <Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable>
         <Text style={[styles.panelTitle, { color: colors.foreground }]}>Vault · الخزنة</Text>
@@ -910,6 +921,8 @@ function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut
           )}
         </>
       )}
+    </ScrollView>
+
     </Pressable>
   );
 }
@@ -930,6 +943,7 @@ function TrashPanel({ colors, trashItems, onBack, onRestore, onDelete, onEmpty }
   onEmpty: () => void;
 }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+    <ScrollView style={styles.panelScroll} contentContainerStyle={styles.panelScrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>سلة المحذوفات</Text>{trashItems.length > 0 ? <Pressable onPress={onEmpty} accessibilityLabel="تفريغ السلة"><Feather name="trash-2" size={19} color={colors.destructive} /></Pressable> : <View style={{ width: 34 }} />}</View>
     <Text style={[styles.settingsHint, { color: colors.mutedForeground, marginBottom: 8 }]}>تبقى الملفات 30 يوماً ثم تُحذف تلقائياً</Text>
     {trashItems.length === 0 ? (
@@ -960,7 +974,8 @@ function TrashPanel({ colors, trashItems, onBack, onRestore, onDelete, onEmpty }
           </View>
         </View>
       ))
-    )}
+    )}    </ScrollView>
+
   </Pressable>;
 }
 
@@ -991,6 +1006,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
     { value: 'dark', label: 'داكن', icon: 'moon' },
   ];
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+    <ScrollView style={styles.panelScroll} contentContainerStyle={styles.panelScrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>الإعدادات</Text><View style={{ width: 34 }} /></View>
     <Text style={[styles.settingsLabel, { color: colors.foreground }]}>المظهر</Text>
     <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>اختر طريقة عرض التطبيق</Text>
@@ -1047,16 +1063,19 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
       </View>
       <Switch testID="mobile-data-switch" value={allowMobileData} onValueChange={onAllowMobileData} trackColor={{ true: colors.primary, false: colors.input }} thumbColor="#ffffff" />
     </View>
-    <View style={[styles.settingsNote, { backgroundColor: colors.background, borderColor: colors.border }]}><Feather name="info" size={17} color={colors.primary} /><Text style={[styles.settingsNoteText, { color: colors.mutedForeground }]}>يتم حفظ اختياراتك تلقائياً على هذا الجهاز.</Text></View>
+    <View style={[styles.settingsNote, { backgroundColor: colors.background, borderColor: colors.border }]}><Feather name="info" size={17} color={colors.primary} /><Text style={[styles.settingsNoteText, { color: colors.mutedForeground }]}>يتم حفظ اختياراتك تلقائياً على هذا الجهاز.</Text></View>    </ScrollView>
+
   </Pressable>;
 }
 
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+    <ScrollView style={styles.panelScroll} contentContainerStyle={styles.panelScrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.14.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.15.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
-    <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
+    <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>    </ScrollView>
+
   </Pressable>;
 }
 
@@ -1724,7 +1743,7 @@ export default function HomeScreen() {
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
-              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.14.0 · صُنع بعناية</Text></View>
+              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.15.0 · صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -2031,7 +2050,9 @@ const styles = StyleSheet.create({
   menuItemText: { flex: 1, fontSize: 14, fontWeight: '700' },
   drawerFooterPill: { marginTop: 'auto', alignSelf: 'center', marginBottom: 35, paddingHorizontal: 16, paddingVertical: 9, borderRadius: 999, borderWidth: 1 },
   drawerFooterPillText: { fontSize: 10, fontWeight: '700' },
-  settingsPanel: { width: '84%', minHeight: '100%', paddingTop: 58, paddingHorizontal: 21, borderTopRightRadius: 25, borderBottomRightRadius: 25 },
+  settingsPanel: { width: '84%', height: '100%', paddingTop: 58, paddingHorizontal: 21, borderTopRightRadius: 25, borderBottomRightRadius: 25 },
+  panelScroll: { flex: 1 },
+  panelScrollContent: { paddingBottom: 48 },
   panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 32 },
   backButton: { width: 34, height: 34, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
   panelTitle: { fontSize: 19, fontWeight: '800' },
