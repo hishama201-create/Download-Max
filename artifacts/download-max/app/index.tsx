@@ -24,6 +24,7 @@ import {
   useColorScheme,
   View,
 } from 'react-native';
+import { WebView } from 'react-native-webview';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { DownloadItem, MediaType, useDownloads, previewCarouselImages } from '@/context/DownloadContext';
@@ -238,14 +239,18 @@ function formatIsoDuration(iso: string) {
   return `${hours}${minutes}${seconds}`;
 }
 
-async function searchYoutube(query: string, apiKey: string, signal?: AbortSignal): Promise<YoutubeVideo[]> {
-  const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${apiKey}`;
+/** نتيجة بحث مع رمز الصفحة التالية (للسحب اللانهائي). */
+type YoutubeSearchResult = { videos: YoutubeVideo[]; nextPageToken?: string };
+
+async function searchYoutube(query: string, apiKey: string, pageToken?: string, signal?: AbortSignal): Promise<YoutubeSearchResult> {
+  const pageParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+  const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${apiKey}${pageParam}`;
   const searchResponse = await fetch(searchUrl, { signal });
   if (!searchResponse.ok) throw new Error('تعذر الوصول إلى يوتيوب. تحقق من الاتصال.');
   const searchData = await searchResponse.json();
   const videos: { id: { videoId?: string }; snippet: { title: string; channelTitle: string; thumbnails?: { medium?: { url: string } } } }[] = searchData.items ?? [];
   const ids = videos.map((entry) => entry.id.videoId).filter(Boolean).join(',');
-  if (!ids) return [];
+  if (!ids) return { videos: [], nextPageToken: searchData.nextPageToken };
   let details: Record<string, { items?: { id: string; statistics?: { viewCount?: string }; contentDetails?: { duration?: string } }[] }> = {};
   try {
     const detailsResponse = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${ids}&key=${apiKey}`, { signal });
@@ -253,7 +258,7 @@ async function searchYoutube(query: string, apiKey: string, signal?: AbortSignal
   } catch {
     // التفاصيل اختيارية — البحث يكفي
   }
-  return videos
+  const mapped: YoutubeVideo[] = videos
     .filter((entry) => entry.id.videoId)
     .map((entry) => {
       const id = entry.id.videoId!;
@@ -268,9 +273,224 @@ async function searchYoutube(query: string, apiKey: string, signal?: AbortSignal
         duration: extra?.contentDetails?.duration ? formatIsoDuration(extra.contentDetails.duration) : '',
       };
     });
+  return { videos: mapped, nextPageToken: searchData.nextPageToken };
 }
 
-/** شاشة يوتيوب بملء الشاشة (تبويب مستقل مثل التنزيلات): بحث ثم قائمة نتائج مع زر تحميل لكل نتيجة. */
+/** شريحة فلترة نتائج البحث (Filter Chip) بتصميم Material 3. */
+function YoutubeChip({ label, active, onPress, colors }: { label: string; active: boolean; onPress: () => void; colors: Palette }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityLabel={`فلترة: ${label}`}
+      style={[styles.ytChip, { backgroundColor: active ? colors.primary : colors.card, borderColor: active ? colors.primary : colors.border }]}
+    >
+      {active ? <Feather name="check" size={13} color={colors.primaryForeground} /> : null}
+      <Text style={[styles.ytChipText, { color: active ? colors.primaryForeground : colors.foreground }]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+/** بطاقة نتيجة كبيرة بتصميم Material 3: مصغرة عريضة 16:9 فوق العنوان — مثل يوتيوب الرسمي. */
+function YoutubeResultCard({ video, wide, downloading, onDownload, onPress, colors }: {
+  video: YoutubeVideo;
+  wide?: boolean;
+  downloading: boolean;
+  onDownload: () => void;
+  onPress: () => void;
+  colors: Palette;
+}) {
+  return (
+    <View style={[styles.ytCard, wide && styles.ytCardWide, { backgroundColor: colors.card, borderColor: colors.border }]}>
+      <Pressable onPress={onPress} accessibilityLabel={`تشغيل ${video.title}`}>
+        <View style={[styles.ytCardThumbWrap, { backgroundColor: colors.muted }]}>
+          <Image source={{ uri: video.thumbnail }} style={styles.ytCardThumb} resizeMode="cover" />
+          {video.duration ? <View style={styles.ytDuration}><Text style={styles.ytDurationText}>{video.duration}</Text></View> : null}
+        </View>
+      </Pressable>
+      <View style={styles.ytCardBody}>
+        <View style={styles.ytCardCopy}>
+          <Text style={[styles.ytCardTitle, { color: colors.cardForeground }]} numberOfLines={2}>{video.title}</Text>
+          <Text style={[styles.ytCardMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{video.channel}{video.views ? ` · ${video.views}` : ''}</Text>
+        </View>
+        <Pressable
+          accessibilityLabel={`تحميل ${video.title}`}
+          onPress={onDownload}
+          disabled={downloading}
+          style={[styles.ytCardDownload, { backgroundColor: downloading ? colors.muted : colors.primary }]}
+        >
+          {downloading
+            ? <ActivityIndicator size="small" color={colors.primaryForeground} />
+            : <Feather name="download" size={16} color={colors.primaryForeground} />}
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+/** صفحة مشاهدة يوتيوب: مشغل مثبت أعلى + عنوان + مقترحات تشبه الفيديو + سحب لانهائي. */
+function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenVideo }: {
+  colors: Palette;
+  video: YoutubeVideo;
+  apiKey: string;
+  onDownload: (video: YoutubeVideo) => void;
+  onBack: () => void;
+  onOpenVideo: (video: YoutubeVideo) => void;
+}) {
+  const [related, setRelated] = useState<YoutubeVideo[]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [nextPageToken, setNextPageToken] = useState<string | undefined>(undefined);
+  const [exhausted, setExhausted] = useState(false);
+  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
+
+  // جلب المقترحات: نفس عنوان الفيديو (نتائج مشابهة) — وكل سحب لأسفل يجلب صفحة جديدة
+  useEffect(() => {
+    let cancelled = false;
+    setRelated([]);
+    setNextPageToken(undefined);
+    setExhausted(false);
+    const controller = new AbortController();
+    (async () => {
+      setLoadingMore(true);
+      try {
+        const result = await searchYoutube(video.title, apiKey, undefined, controller.signal);
+        if (cancelled) return;
+        setRelated(result.videos.filter((entry) => entry.id !== video.id));
+        setNextPageToken(result.nextPageToken);
+        setExhausted(!result.nextPageToken);
+      } catch {
+        if (!cancelled) setExhausted(true);
+      } finally {
+        if (!cancelled) setLoadingMore(false);
+      }
+    })();
+    return () => { cancelled = true; controller.abort(); };
+  }, [video.id, video.title, apiKey]);
+
+  async function loadMore() {
+    if (loadingMore || exhausted || !nextPageToken) return;
+    setLoadingMore(true);
+    try {
+      const result = await searchYoutube(video.title, apiKey, nextPageToken);
+      setRelated((current) => [...current, ...result.videos.filter((entry) => entry.id !== video.id)]);
+      setNextPageToken(result.nextPageToken);
+      if (!result.nextPageToken) setExhausted(true);
+    } catch {
+      setExhausted(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  function handleDownload(entry: YoutubeVideo) {
+    setDownloadingIds((current) => new Set(current).add(entry.id));
+    onDownload(entry);
+    setTimeout(() => {
+      setDownloadingIds((current) => {
+        const next = new Set(current);
+        next.delete(entry.id);
+        return next;
+      });
+    }, 2500);
+  }
+
+  const embedUrl = `https://www.youtube.com/embed/${video.id}?autoplay=1&rel=0&playsinline=1`;
+
+  return (
+    <View style={styles.ytScreen}>
+      {/* المشغل المثبت (Sticky Player) — يبقى أعلى الشاشة أثناء تمرير المقترحات */}
+      <View style={[styles.ytPlayerWrap, { backgroundColor: '#000' }]}>
+        <WebView
+          key={video.id}
+          source={{ uri: embedUrl }}
+          style={styles.ytPlayer}
+          allowsFullscreenVideo
+          mediaPlaybackRequiresUserAction={false}
+          javaScriptEnabled
+          domStorageEnabled
+          allowsInlineMediaPlayback
+        />
+      </View>
+      {/* شريط عنوان المشاهدة مع زر رجوع */}
+      <View style={[styles.ytWatchBar, { backgroundColor: colors.card, borderBottomColor: colors.border }]}>
+        <Pressable onPress={onBack} accessibilityLabel="رجوع" style={[styles.ytWatchBack, { backgroundColor: `${colors.mutedForeground}14` }]}>
+          <Feather name="arrow-right" size={18} color={colors.foreground} />
+        </Pressable>
+        <View style={styles.ytWatchBarCopy}>
+          <Text style={[styles.ytWatchBarTitle, { color: colors.foreground }]} numberOfLines={1}>{video.title}</Text>
+          <Text style={[styles.ytWatchBarMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{video.channel}{video.views ? ` · ${video.views}` : ''}</Text>
+        </View>
+        <Pressable
+          accessibilityLabel="تحميل هذا الفيديو"
+          onPress={() => handleDownload(video)}
+          disabled={downloadingIds.has(video.id)}
+          style={[styles.ytWatchDownload, { backgroundColor: downloadingIds.has(video.id) ? colors.muted : colors.primary }]}
+        >
+          {downloadingIds.has(video.id)
+            ? <ActivityIndicator size="small" color={colors.primaryForeground} />
+            : <Feather name="download" size={16} color={colors.primaryForeground} />}
+          <Text style={[styles.ytWatchDownloadText, { color: colors.primaryForeground }]}>تحميل</Text>
+        </Pressable>
+      </View>
+      {/* قائمة المقترحات (Related / Up Next) مع سحب لانهائي */}
+      <FlatList
+        data={related}
+        keyExtractor={(item) => item.id}
+        style={styles.ytRelatedList}
+        contentContainerStyle={related.length === 0 ? [styles.ytListContent, styles.ytListEmpty] : styles.ytListContent}
+        onEndReached={loadMore}
+        onEndReachedThreshold={0.6}
+        ListHeaderComponent={
+          <View style={styles.ytRelatedHeader}>
+            <Text style={[styles.ytRelatedTitle, { color: colors.foreground }]}>مقترحات لك</Text>
+            <Text style={[styles.ytRelatedHint, { color: colors.mutedForeground }]}>اسحب لأسفل لعرض المزيد</Text>
+          </View>
+        }
+        ListEmptyComponent={
+          loadingMore ? null : (
+            <View style={styles.ytEmpty}>
+              <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
+              <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>لا توجد مقترحات الآن</Text>
+              <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>حاول فتح الفيديو مرة أخرى أو البحث عن شيء آخر</Text>
+            </View>
+          )
+        }
+        ListFooterComponent={
+          loadingMore ? (
+            <View style={styles.ytMoreSpinner}><ActivityIndicator size="small" color={colors.primary} /></View>
+          ) : exhausted ? (
+            <Text style={[styles.ytListEnd, { color: colors.mutedForeground }]}>انتهت المقترحات</Text>
+          ) : null
+        }
+        renderItem={({ item }) => (
+          <View style={[styles.ytRelatedRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Pressable style={styles.ytRelatedThumbWrap} onPress={() => onOpenVideo(item)} accessibilityLabel={`تشغيل ${item.title}`}>
+              <Image source={{ uri: item.thumbnail }} style={styles.ytRelatedThumb} resizeMode="cover" />
+              {item.duration ? <View style={styles.ytDuration}><Text style={styles.ytDurationText}>{item.duration}</Text></View> : null}
+            </Pressable>
+            <View style={styles.ytRelatedBody}>
+              <Pressable onPress={() => onOpenVideo(item)}>
+                <Text style={[styles.ytRelatedTitle2, { color: colors.cardForeground }]} numberOfLines={2}>{item.title}</Text>
+                <Text style={[styles.ytRelatedMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{item.channel}{item.views ? ` · ${item.views}` : ''}</Text>
+              </Pressable>
+            </View>
+            <Pressable
+              accessibilityLabel={`تحميل ${item.title}`}
+              onPress={() => handleDownload(item)}
+              disabled={downloadingIds.has(item.id)}
+              style={[styles.ytCardDownload, { backgroundColor: downloadingIds.has(item.id) ? colors.muted : colors.primary }]}
+            >
+              {downloadingIds.has(item.id)
+                ? <ActivityIndicator size="small" color={colors.primaryForeground} />
+                : <Feather name="download" size={15} color={colors.primaryForeground} />}
+            </Pressable>
+          </View>
+        )}
+      />
+    </View>
+  );
+}
+
+/** شاشة يوتيوب بملء الشاشة: بحث ببطاقات Material 3 + Top Result + شرائح فلترة، وصفحة مشاهدة كاملة. */
 function YoutubeScreen({ colors, onDownload }: {
   colors: Palette;
   onDownload: (videoUrl: string) => void;
@@ -281,6 +501,9 @@ function YoutubeScreen({ colors, onDownload }: {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
+  const [ytFilter, setYtFilter] = useState<'all' | 'video' | 'channel'>('all');
+  // صفحة المشاهدة: الفيديو المفتوح (Sticky Player + مقترحات)
+  const [watching, setWatching] = useState<YoutubeVideo | null>(null);
 
   async function runSearch(text: string) {
     const trimmed = text.trim();
@@ -289,8 +512,8 @@ function YoutubeScreen({ colors, onDownload }: {
     setError(null);
     try {
       const found = await searchYoutube(trimmed, apiKey);
-      setResults(found);
-      if (found.length === 0) setError('لا توجد نتائج لهذا البحث');
+      setResults(found.videos);
+      if (found.videos.length === 0) setError('لا توجد نتائج لهذا البحث');
     } catch {
       setError('تعذر البحث. تحقق من الاتصال وحاول مرة أخرى.');
     } finally {
@@ -309,6 +532,23 @@ function YoutubeScreen({ colors, onDownload }: {
       });
     }, 2500);
   }
+
+  if (watching) {
+    return (
+      <YoutubeWatchScreen
+        colors={colors}
+        video={watching}
+        apiKey={apiKey}
+        onDownload={(video) => handleDownload(video)}
+        onBack={() => setWatching(null)}
+        onOpenVideo={(video) => setWatching(video)}
+      />
+    );
+  }
+
+  // شارة Top Result: أول نتيجة نجاح (فيديو) تميز ببطاقة عريضة فوق الجميع
+  const [topResult, ...restResults] = results;
+  const channelOnly = ytFilter === 'channel';
 
   return (
     <View style={styles.ytScreen}>
@@ -332,43 +572,68 @@ function YoutubeScreen({ colors, onDownload }: {
         </Pressable>
       </View>
       {error ? <Text style={[styles.ytError, { color: colors.destructive }]}>{error}</Text> : null}
-      <FlatList
-        data={results}
-        keyExtractor={(item) => item.id}
-        style={styles.ytList}
-        contentContainerStyle={results.length === 0 ? [styles.ytListContent, styles.ytListEmpty] : styles.ytListContent}
-        ListEmptyComponent={
-          loading ? null : (
-            <View style={styles.ytEmpty}>
-              <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
-              <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من يوتيوب</Text>
-              <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>اكتب اسم أغنية أو فيديو واضغط البحث، ثم حمّل ما يعجبك مباشرة</Text>
+      {results.length > 0 ? (
+        <View style={styles.ytChipsRow}>
+          <YoutubeChip label="الكل" active={ytFilter === 'all'} onPress={() => setYtFilter('all')} colors={colors} />
+          <YoutubeChip label="فيديو" active={ytFilter === 'video'} onPress={() => setYtFilter('video')} colors={colors} />
+          <YoutubeChip label="قنوات" active={ytFilter === 'channel'} onPress={() => setYtFilter('channel')} colors={colors} />
+        </View>
+      ) : null}
+      {results.length > 0 ? (
+        <FlatList
+          data={channelOnly ? [] : restResults}
+          keyExtractor={(item) => item.id}
+          style={styles.ytList}
+          contentContainerStyle={styles.ytListContent}
+          ListHeaderComponent={
+            <View>
+              {ytFilter === 'all' && topResult ? (
+                <View>
+                  <View style={styles.ytTopBadgeRow}>
+                    <View style={[styles.ytTopBadge, { backgroundColor: `${colors.primary}16` }]}>
+                      <Feather name="award" size={12} color={colors.primary} />
+                      <Text style={[styles.ytTopBadgeText, { color: colors.primary }]}>الأفضل — من تنظيم YouTube</Text>
+                    </View>
+                  </View>
+                  <YoutubeResultCard video={topResult} wide downloading={downloadingIds.has(topResult.id)} onDownload={() => handleDownload(topResult)} onPress={() => setWatching(topResult)} colors={colors} />
+                </View>
+              ) : null}
             </View>
-          )
-        }
-        renderItem={({ item }) => (
-          <View style={[styles.ytRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <View style={styles.ytThumbWrap}>
-              <Image source={{ uri: item.thumbnail }} style={styles.ytThumb} resizeMode="cover" />
-              {item.duration ? <View style={styles.ytDuration}><Text style={styles.ytDurationText}>{item.duration}</Text></View> : null}
-            </View>
-            <View style={styles.ytBody}>
-              <Text style={[styles.ytTitle, { color: colors.cardForeground }]} numberOfLines={2}>{item.title}</Text>
-              <Text style={[styles.ytMeta, { color: colors.mutedForeground }]} numberOfLines={1}>{item.channel}{item.views ? ` · ${item.views}` : ''}</Text>
-            </View>
-            <Pressable
-              accessibilityLabel={`تحميل ${item.title}`}
-              onPress={() => handleDownload(item)}
-              disabled={downloadingIds.has(item.id)}
-              style={[styles.ytDownloadButton, { backgroundColor: downloadingIds.has(item.id) ? colors.muted : colors.primary }]}
-            >
-              {downloadingIds.has(item.id)
-                ? <ActivityIndicator size="small" color={colors.primaryForeground} />
-                : <Feather name="download" size={17} color={colors.primaryForeground} />}
-            </Pressable>
-          </View>
-        )}
-      />
+          }
+          ListEmptyComponent={
+            channelOnly ? (
+              <View style={styles.ytEmpty}>
+                <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="youtube" size={30} color={colors.mutedForeground} /></View>
+                <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>عرض القنوات قريباً</Text>
+                <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>هذه الفلترة تعرض القنوات المشابهة — التحميل يبقى من الفيديوهات</Text>
+              </View>
+            ) : null
+          }
+          renderItem={({ item }) => (
+            <YoutubeResultCard video={item} downloading={downloadingIds.has(item.id)} onDownload={() => handleDownload(item)} onPress={() => setWatching(item)} colors={colors} />
+          )}
+          ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
+        />
+      ) : (
+        <FlatList
+          data={[]}
+          keyExtractor={() => 'empty'}
+          renderItem={() => null}
+          style={styles.ytList}
+          contentContainerStyle={[styles.ytListContent, styles.ytListEmpty]}
+          ListEmptyComponent={
+            loading ? (
+              <View style={styles.ytEmpty}><ActivityIndicator size="large" color={colors.primary} /></View>
+            ) : (
+              <View style={styles.ytEmpty}>
+                <View style={[styles.ytEmptyIcon, { backgroundColor: `${colors.destructive}12` }]}><Feather name="youtube" size={30} color={colors.destructive} /></View>
+                <Text style={[styles.ytEmptyTitle, { color: colors.foreground }]}>ابحث وحمّل من يوتيوب</Text>
+                <Text style={[styles.ytEmptyHint, { color: colors.mutedForeground }]}>اكتب اسم أغنية أو فيديو واضغط البحث، ثم حمّل ما يعجبك مباشرة</Text>
+              </View>
+            )
+          }
+        />
+      )}
     </View>
   );
 }
@@ -789,7 +1054,7 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
 function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void }) {
   return <Pressable style={[styles.settingsPanel, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.12.0</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار 1.13.0</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>هشام الصبري</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>
   </Pressable>;
@@ -1459,7 +1724,7 @@ export default function HomeScreen() {
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
-              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.12.0 · صُنع بعناية</Text></View>
+              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار 1.13.0 · صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -1850,15 +2115,48 @@ const styles = StyleSheet.create({
   ytEmptyIcon: { width: 64, height: 64, borderRadius: 32, justifyContent: 'center', alignItems: 'center', marginBottom: 4 },
   ytEmptyTitle: { fontSize: 16, fontWeight: '800' },
   ytEmptyHint: { fontSize: 13, textAlign: 'center', paddingHorizontal: 20, lineHeight: 20 },
-  ytRow: { flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 1, borderRadius: 14, padding: 9, marginBottom: 9 },
-  ytThumbWrap: { position: 'relative' },
-  ytThumb: { width: 118, height: 68, borderRadius: 9, backgroundColor: 'rgba(0,0,0,0.08)' },
-  ytDuration: { position: 'absolute', bottom: 4, right: 4, backgroundColor: 'rgba(0,0,0,0.82)', borderRadius: 5, paddingHorizontal: 5, paddingVertical: 2 },
+  ytDuration: { position: 'absolute', bottom: 6, right: 6, backgroundColor: 'rgba(0,0,0,0.82)', borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 },
   ytDurationText: { color: '#fff', fontSize: 10, fontWeight: '700' },
-  ytBody: { flex: 1, gap: 3 },
-  ytTitle: { fontSize: 13, fontWeight: '700', lineHeight: 18 },
-  ytMeta: { fontSize: 11 },
-  ytDownloadButton: { width: 40, height: 40, borderRadius: 13, justifyContent: 'center', alignItems: 'center' },
+  // — شرائح الفلترة (Filter Chips — Material 3) —
+  ytChipsRow: { flexDirection: 'row', gap: 8, paddingHorizontal: 20, marginBottom: 12 },
+  ytChip: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 18, borderWidth: 1, paddingVertical: 7, paddingHorizontal: 13 },
+  ytChipText: { fontSize: 12.5, fontWeight: '700' },
+  // — بطاقات النتائج (Material 3 cards) —
+  ytCard: { borderRadius: 16, borderWidth: 1, overflow: 'hidden' },
+  ytCardWide: { borderWidth: 1.5 },
+  ytCardThumbWrap: { width: '100%', aspectRatio: 16 / 9 },
+  ytCardThumb: { width: '100%', height: '100%' },
+  ytCardBody: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 12 },
+  ytCardCopy: { flex: 1, gap: 3 },
+  ytCardTitle: { fontSize: 14, fontWeight: '800', lineHeight: 19 },
+  ytCardMeta: { fontSize: 11.5 },
+  ytCardDownload: { width: 38, height: 38, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
+  // — شارة Top Result —
+  ytTopBadgeRow: { marginBottom: 8 },
+  ytTopBadge: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 5, borderRadius: 12, paddingVertical: 5, paddingHorizontal: 10 },
+  ytTopBadgeText: { fontSize: 11, fontWeight: '800' },
+  // — صفحة المشاهدة (Watch Page) —
+  ytPlayerWrap: { width: '100%', aspectRatio: 16 / 9 },
+  ytPlayer: { flex: 1 },
+  ytWatchBar: { flexDirection: 'row', alignItems: 'center', gap: 9, paddingHorizontal: 14, paddingVertical: 9, borderBottomWidth: 1 },
+  ytWatchBack: { width: 34, height: 34, borderRadius: 17, justifyContent: 'center', alignItems: 'center' },
+  ytWatchBarCopy: { flex: 1, gap: 2 },
+  ytWatchBarTitle: { fontSize: 13.5, fontWeight: '800' },
+  ytWatchBarMeta: { fontSize: 11 },
+  ytWatchDownload: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 12, paddingVertical: 8, paddingHorizontal: 12 },
+  ytWatchDownloadText: { fontSize: 12.5, fontWeight: '800' },
+  ytRelatedList: { flex: 1 },
+  ytRelatedHeader: { paddingTop: 12, paddingBottom: 4 },
+  ytRelatedTitle: { fontSize: 16.5, fontWeight: '800' },
+  ytRelatedHint: { fontSize: 11.5, marginTop: 2 },
+  ytRelatedRow: { flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 15, borderWidth: 1, padding: 9 },
+  ytRelatedThumbWrap: { width: 128, aspectRatio: 16 / 9, borderRadius: 10, overflow: 'hidden', position: 'relative' },
+  ytRelatedThumb: { width: '100%', height: '100%' },
+  ytRelatedBody: { flex: 1, gap: 3 },
+  ytRelatedTitle2: { fontSize: 13, fontWeight: '700', lineHeight: 18 },
+  ytRelatedMeta: { fontSize: 11 },
+  ytMoreSpinner: { paddingVertical: 18 },
+  ytListEnd: { textAlign: 'center', fontSize: 12, paddingVertical: 16 },
   galleryHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
   galleryClose: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(127,127,127,0.12)' },
   gallerySelectAll: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 6, marginBottom: 12, paddingHorizontal: 11, paddingVertical: 7, borderRadius: 11, backgroundColor: 'rgba(127,127,127,0.10)' },
