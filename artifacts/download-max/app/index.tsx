@@ -33,7 +33,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, ensureDownloadFolders, currentDownloadFolder } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, ensureDownloadFolders } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 /** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
@@ -42,7 +42,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.4';
+const APP_VERSION = '2.0.5';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1121,7 +1121,7 @@ function FeatureRow({ icon, text, colors }: { icon: keyof typeof Feather.glyphMa
   return <View style={styles.featureRow}><View style={[styles.featureIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name={icon} size={16} color={colors.primary} /></View><Text style={[styles.featureText, { color: colors.foreground }]}>{text}</Text></View>;
 }
 
-function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, allowMobileData, downloadDir, downloadFolder, onThemeChange, onAccentChange, onMaxTasks, onMaxTasksCellular, onAllowMobileData, onChooseDownloadDir, onClearDownloadDir, onBack }: {
+function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, allowMobileData, downloadDir, deviceSavePath, onThemeChange, onAccentChange, onMaxTasks, onMaxTasksCellular, onAllowMobileData, onEnableAutoSave, onClearDownloadDir, onBack }: {
   colors: Palette;
   themeMode: ThemeMode;
   accent: AccentKey;
@@ -1129,13 +1129,13 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
   maxTasksCellular: MaxTasks;
   allowMobileData: boolean;
   downloadDir: string | null;
-  downloadFolder: string;
+  deviceSavePath: string | null;
   onMaxTasksCellular: (value: MaxTasks) => void;
   onThemeChange: (mode: ThemeMode) => void;
   onAccentChange: (value: AccentKey) => void;
   onMaxTasks: (value: MaxTasks) => void;
   onAllowMobileData: (value: boolean) => void;
-  onChooseDownloadDir: () => void;
+  onEnableAutoSave: () => void;
   onClearDownloadDir: () => void;
   onBack: () => void;
 }) {
@@ -1183,26 +1183,18 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
         </Pressable>
       ))}
     </View>
-    <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 27 }]}>مجلد التطبيق</Text>
-    <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>هنا تُحفظ ملفاتك تلقائياً</Text>
+    <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 27 }]}>أين تُحفظ ملفاتك</Text>
+    <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>كل فيديو أو صوت أو صورة يُحفظ هنا تلقائياً — بلا نسخ يدوي</Text>
     <View style={[styles.dirRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
       <Feather name="folder" size={19} color={colors.primary} style={{ marginTop: 1 }} />
       <Text style={[styles.dirText, { color: colors.foreground }]} numberOfLines={2}>
-        {downloadFolder || '—'}
-      </Text>
-    </View>
-    <Text style={[styles.settingsLabel, { color: colors.foreground, marginTop: 27 }]}>مكان التنزيل</Text>
-    <Text style={[styles.settingsHint, { color: colors.mutedForeground }]}>اختر مجلداً في الجهاز لحفظ الملفات فيه، أو اتركه في مجلد التطبيق</Text>
-    <View style={[styles.dirRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
-      <Feather name="folder" size={19} color={colors.primary} style={{ marginTop: 1 }} />
-      <Text style={[styles.dirText, { color: colors.foreground }]} numberOfLines={1}>
-        {downloadDir ? `${dirLabel(downloadDir)} · محفوظ ✓` : 'مجلد التطبيق (افتراضي)'}
+        {deviceSavePath ?? 'داخل التطبيق فقط — فعّل الحفظ في مجلد التنزيلات بجهازك'}
       </Text>
     </View>
     <View style={styles.dirActions}>
-      <Pressable testID="choose-download-dir" accessibilityLabel="اختيار مجلد التنزيل" onPress={onChooseDownloadDir} style={[styles.dirButton, { backgroundColor: colors.primary }]}>
-        <Feather name="edit" size={14} color={colors.primaryForeground} />
-        <Text style={[styles.dirButtonText, { color: colors.primaryForeground }]}>{downloadDir ? 'تغيير' : 'اختيار مجلد'}</Text>
+      <Pressable testID="enable-auto-save" accessibilityLabel="تفعيل الحفظ في مجلد التنزيلات" onPress={onEnableAutoSave} style={[styles.dirButton, { backgroundColor: colors.primary }]}>
+        <Feather name="download" size={14} color={colors.primaryForeground} />
+        <Text style={[styles.dirButtonText, { color: colors.primaryForeground }]}>{deviceSavePath ? 'تغيير المجلد' : 'تفعيل الحفظ التلقائي'}</Text>
       </Pressable>
       {downloadDir ? (
         <Pressable testID="clear-download-dir" accessibilityLabel="إزالة مجلد التنزيل" onPress={onClearDownloadDir} style={[styles.dirButton, { backgroundColor: colors.background, borderWidth: 1, borderColor: colors.border }]}>
@@ -1245,7 +1237,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1267,7 +1259,7 @@ export default function HomeScreen() {
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   const [playingInBackground, setPlayingInBackground] = useState(false);
-  const [downloadFolder, setDownloadFolder] = useState('');
+  const [publicSaveOk, setPublicSaveOk] = useState(false);
   const googleRef = useRef<WebView | null>(null);
   const [googleCanGoBack, setGoogleCanGoBack] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -1539,17 +1531,28 @@ export default function HomeScreen() {
 
 
 
-  /** يفتح منتقي مجلدات أندرويد لاختيار مكان حفظ التنزيلات. */
-  async function chooseDownloadDir() {
+  /**
+   * تفعيل الحفظ التلقائي في مجلد التنزيلات بجهاز المستخدم — مرة واحدة فقط.
+   * يحاول أولاً المسار العام «Download/Download Max» (إن كان إذن الوصول سارياً)،
+   * وإلا يطلب اختيار مجلد مرة واحدة عبر منتقي أندرويد الرسمي، وبعدها كل تنزيل
+   * جديد ينزل فيه تلقائياً بلا زر «نسخ».
+   */
+  async function enableAutoSave() {
     if (Platform.OS === 'web') {
-      setNotice('خيار المجلد متاح في تطبيق أندرويد');
+      setNotice('الحفظ في مجلد الجهاز متاح في تطبيق أندرويد');
       return;
     }
-    const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
-    if (!permissions.granted) return;
-    await setDownloadDir(permissions.directoryUri);
-    setNotice(`سيُحفظ في: ${dirLabel(permissions.directoryUri)} ✓`);
+    const result = await enableDeviceAutoSave();
+    setNotice(result.message);
+    if (result.ok) setPublicSaveOk(Platform.OS === 'android' && (await hasStorageAccess()));
   }
+
+  // الوجهة الحقيقية لملفات المستخدم: المسار العام إن سارِ الإذن، وإلا المجلد المختار مرة واحدة.
+  const deviceSavePath = publicSaveOk
+    ? '/storage/emulated/0/Download/Download Max'
+    : downloadDir
+      ? `${dirLabel(downloadDir)} · محفوظ ✓`
+      : null;
 
   function vaultAction(item: DownloadItem) {
     void moveToVault(item.id);
@@ -1582,8 +1585,9 @@ export default function HomeScreen() {
     const check = async () => {
       await ensureDownloadFolders();
       if (cancelled) return;
-      setDownloadFolder(await currentDownloadFolder());
-      if (Platform.OS === 'android' && (await hasStorageAccess())) {
+      const publicOk = Platform.OS === 'android' && (await hasStorageAccess());
+      setPublicSaveOk(publicOk);
+      if (publicOk) {
         const added = await refreshFromDevice();
         if (!cancelled && added > 0) setNotice(`استرجعنا ${added} ملف من تخزين الجهاز 📁`);
       }
@@ -2009,7 +2013,7 @@ export default function HomeScreen() {
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
             </Pressable>
           ) : panel === 'settings' ? (
-            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} downloadFolder={downloadFolder} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
+            <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} deviceSavePath={deviceSavePath} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onEnableAutoSave={enableAutoSave} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('أُوقف الحفظ في مجلد الجهاز'); }} onBack={() => setPanel('menu')} />
           ) : panel === 'vault' ? (
             <VaultPanel colors={colors} pin={vaultPin} setPin={setVaultPin} vaultItems={vaultItems} onBack={() => setPanel('menu')} onOpen={showOpen} onMoveOut={(id) => void removeFromVault(id)} onRemove={(id) => void removeDownload(id)} />
           ) : panel === 'trash' ? (

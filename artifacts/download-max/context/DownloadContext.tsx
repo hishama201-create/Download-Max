@@ -176,6 +176,7 @@ type DownloadContextValue = {
   shareFile: (item: DownloadItem) => Promise<void>;
   /** (2) ينسخ الملف من مساحة التطبيق إلى مجلد التنزيلات الحقيقي في جهاز المستخدم. */
   copyToDeviceDownloads: (item: DownloadItem) => Promise<{ ok: boolean; message: string }>;
+  enableDeviceAutoSave: () => Promise<{ ok: boolean; where: string | null; message: string }>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
@@ -368,8 +369,25 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
       // المسار العام غير متاح — نكمل بالمجلد الذي اختاره المستخدم.
     }
   }
-  if (safDir) return saveFileToSafDirectory(localUri, filename, mimeFor(filename), safDir);
+  if (safDir) {
+    const dir = await safSubfolder(safDir, subfolderFor(type));
+    return saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir);
+  }
   return false;
+}
+
+/**
+ * مجلد النوع الفرعي داخل المجلد الذي اختاره المستخدم (SAF).
+ * ننشئه إن أمكن، ولو رفض النظام إنشاؤه نكتب في المجلد الجذر مباشرة.
+ */
+async function safSubfolder(directoryUri: string, sub: string): Promise<string> {
+  const target = `${directoryUri}${sub}/`;
+  try {
+    await FileSystem.makeDirectoryAsync(target, { intermediates: true });
+    return target;
+  } catch {
+    return directoryUri;
+  }
 }
 
 /** يفتح شاشة «All files access» الخاصة بتطبيقنا مباشرة في إعدادات النظام. */
@@ -1574,6 +1592,33 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     return { ok: false, message: (await storageAccessError()) ?? 'تعذّر نسخ الملف' };
   }, [setDownloadDir]);
 
+  /**
+   * تفعيل الحفظ التلقائي في مجلد التنزيلات الحقيقي بجهاز المستخدم — مرة واحدة فقط:
+   * 1) إن سارت صلاحية «الوصول لجميع الملفات» نستخدم «Download/Download Max» بلا أي خطوة.
+   * 2) وإلا نفتح منتقي المجلدات الرسمي مرة واحدة ونحفظ اختياره، وبعدها كل تنزيل
+   *    جديد ينزل تلقائياً فيه. المستخدم لا يضغط «نسخ» أبداً بعد ذلك.
+   */
+  const enableDeviceAutoSave = useCallback(async (): Promise<{ ok: boolean; where: string | null; message: string }> => {
+    if (await hasStorageAccess()) {
+      const root = await publicDownloadRoot();
+      if (root) {
+        for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+          const dir = `${root}${subfolderFor(type)}/`;
+          const info = await FileSystem.getInfoAsync(dir).catch(() => null);
+          if (!info?.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
+        }
+        return { ok: true, where: root, message: 'كل تنزيل جديد يُحفظ تلقائياً في مجلد التنزيلات ✓' };
+      }
+    }
+    const picked = await pickDeviceDirectory();
+    if (!picked) return { ok: false, where: null, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
+    if (picked !== downloadDirRef.current) await setDownloadDir(picked);
+    for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+      await safSubfolder(picked, subfolderFor(type));
+    }
+    return { ok: true, where: picked, message: 'تم — كل تنزيل جديد سيُحفظ في هذا المجلد تلقائياً ✓' };
+  }, [setDownloadDir]);
+
   const value = useMemo(() => ({
     items,
     activeCount: items.filter((item) => item.status === 'queued' || item.status === 'downloading').length,
@@ -1598,6 +1643,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     setDownloadDir,
     refreshFromDevice,
     copyToDeviceDownloads,
+    enableDeviceAutoSave,
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
@@ -1607,7 +1653,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pauseDownload,
     resumeDownload,
     removeDownload,
-    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, copyToDeviceDownloads]);
+    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, copyToDeviceDownloads, enableDeviceAutoSave]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }
