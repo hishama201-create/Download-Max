@@ -1,5 +1,6 @@
 import { Feather } from '@expo/vector-icons';
 import Sharing from 'expo-sharing';
+import Constants from 'expo-constants';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -42,7 +43,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.5';
+const APP_VERSION = '2.0.6';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -208,7 +209,20 @@ function formatBytes(value?: number) {
 
 function percentLabel(item: DownloadItem) {
   const percent = Math.min(Math.floor(item.progress * 100), 99);
-  return `${percent}%`;
+  if (percent > 0) return `${percent}%`;
+  // النسبة مجهولة (الخادم لم يعطِ الحجم الكلي) — نعرض الحجم المنزّل بدل 0% الميتة.
+  const bytes = item.bytesWritten ?? 0;
+  if (bytes > 0) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return '0%';
+}
+
+/** يحوّل مسار ملف داخلي إلى content:// يفهمه FileProvider لمشاركة سليمة على أندرويد. */
+async function toShareableUri(fileUri: string): Promise<string> {
+  const filesDir = FileSystem.documentDirectory;
+  const applicationId = Constants.expoConfig?.android?.package;
+  if (!filesDir || !applicationId || !fileUri.startsWith(filesDir)) return fileUri;
+  const relative = fileUri.slice(filesDir.length).split('/').map(encodeURIComponent).join('/');
+  return `content://${applicationId}.SharingFileProvider/expo_files/${relative}`;
 }
 
 /** يعرض اسم مجلد التنزيل المختار بصيغة مقروءة من SAF URI. */
@@ -843,6 +857,9 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
               <View style={[styles.progressFill, { backgroundColor: isPaused ? colors.mutedForeground : colors.primary, width: `${Math.max(item.progress * 100, 4)}%` }]} />
             </View>
             <Text style={[styles.progressPercent, { color: isPaused ? colors.mutedForeground : colors.primary }]}>{percentLabel(item)}</Text>
+            {item.status === 'downloading' && item.progress * 100 < 1 && (item.bytesWritten ?? 0) > 0 ? (
+              <Text style={[styles.progressPercent, { color: colors.mutedForeground, fontSize: 11 }]}> · {((item.bytesWritten ?? 0) / (1024 * 1024)).toFixed(1)} MB</Text>
+            ) : null}
           </View>
         ) : item.error ? (
           <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
@@ -1516,7 +1533,9 @@ export default function HomeScreen() {
   }
 
   function showShare(item: DownloadItem) {
-    void shareFile(item);
+    shareFile(item).catch((error: unknown) => {
+      setNotice(error instanceof Error ? error.message : 'تعذّرت المشاركة');
+    });
   }
 
   function showOpen(item: DownloadItem) {
@@ -1666,12 +1685,17 @@ export default function HomeScreen() {
       setNotice('المشاركة غير مدعومة على هذا الجهاز');
       return;
     }
-    if (targets.length === 1) {
-      await Sharing.shareAsync(targets[0].fileUri!, { mimeType: mimeFromFile(targets[0].fileUri!), dialogTitle: 'مشاركة الملف' });
-    } else {
-      await Sharing.shareAsync(targets[0].fileUri!, { mimeType: mimeFromFile(targets[0].fileUri!), dialogTitle: `مشاركة ${targets.length} ملفات (شارك الباقي من المشغل)` });
+    try {
+      const first = targets[0].fileUri!;
+      const shareUri = await toShareableUri(first);
+      await Sharing.shareAsync(shareUri, {
+        mimeType: mimeFromFile(first),
+        dialogTitle: targets.length === 1 ? 'مشاركة الملف' : `مشاركة ${targets.length} ملفات (شارك الباقي من المشغل)`,
+      });
+      setSelectedIds(new Set());
+    } catch {
+      setNotice('تعذّرت المشاركة — تأكد أن الملف موجود وحاول مجدداً');
     }
-    setSelectedIds(new Set());
   }
 
   /** حذف المحدد: مع تحذير بين السلة أو الحذف النهائي. */

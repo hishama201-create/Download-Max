@@ -233,11 +233,22 @@ function prettyNameFromUrl(url: string): string | null {
 /** يجلب اسم الملف الحقيقي ونوعه من ترويسات الخادم قبل التنزيل. */
 async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string | null; mime: string | null; length: number | null }> {
   try {
-    const response = await fetch(mediaUrl, { method: 'HEAD' });
+    let response = await fetch(mediaUrl, { method: 'HEAD' });
     const disposition = response.headers.get('content-disposition');
     const mime = response.headers.get('content-type')?.split(';')[0]?.trim() ?? null;
     const lengthHeader = response.headers.get('content-length');
-    const length = lengthHeader ? Number(lengthHeader) : null;
+    let length = lengthHeader ? Number(lengthHeader) : null;
+    // خوادم البث (مثل يوتيوب عبر الخدمة الاحتياطية) كثيراً ما تحذف content-length من HEAD،
+    // لكنها ترجعه في ترويسة Content-Range لأول نطاق بايتات — فنستخرج الحجم الكلي منها.
+    if (!length || length <= 0) {
+      try {
+        const range = await fetch(mediaUrl, { method: 'GET', headers: { Range: 'bytes=0-1' } });
+        const contentRange = range.headers.get('content-range');
+        const total = contentRange?.match(/\/(\d+)\s*$/);
+        if (total) length = Number(total[1]);
+        try { await range.body?.cancel(); } catch { /* لا شيء */ }
+      } catch { /* نبقي length كما هو */ }
+    }
     let filename: string | null = null;
     if (disposition) {
       const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
@@ -377,15 +388,36 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
 }
 
 /**
+ * يطلب من المستخدم اختيار مجلد التنزيل مرة واحدة (SAF) ويحفظ اختياره.
+ * يُستدعى تلقائياً عند أول تنزيل إذا لم يكن هناك مجلد محفوظ ولا إذن عام —
+ * حتى لا تحتاج زر «نسخ» ولا زيارة الإعدادات.
+ */
+async function requestAndStoreDeviceDir(
+  setDownloadDir: (uri: string) => Promise<void>,
+  current: string | null,
+): Promise<string | null> {
+  const picked = await pickDeviceDirectory();
+  if (!picked) return null;
+  if (picked !== current) await setDownloadDir(picked);
+  return picked;
+}
+
+/**
  * مجلد النوع الفرعي داخل المجلد الذي اختاره المستخدم (SAF).
  * ننشئه إن أمكن، ولو رفض النظام إنشاؤه نكتب في المجلد الجذر مباشرة.
  */
 async function safSubfolder(directoryUri: string, sub: string): Promise<string> {
-  const target = `${directoryUri}${sub}/`;
+  // واجهة SAF الرسمية: makeDirectoryAsync(المجلد الأب، الاسم) — التلاصق النصي
+  // لا يعمل مع روابط content:// ويجعل إنشاء المجلدات الفرعية يفشل بصمت.
   try {
-    await FileSystem.makeDirectoryAsync(target, { intermediates: true });
-    return target;
+    return await FileSystem.StorageAccessFramework.makeDirectoryAsync(directoryUri, sub);
   } catch {
+    // المجلد موجود مسبقاً — نتحقق ونعيد روابطه إن وجدناها.
+    try {
+      const entries = await FileSystem.StorageAccessFramework.readDirectoryAsync(directoryUri);
+      const found = entries.find((entry) => entry.endsWith(`/${sub}`) || decodeURIComponent(entry).endsWith(`/${sub}`));
+      if (found) return found;
+    } catch { /* لا شيء */ }
     return directoryUri;
   }
 }
@@ -567,14 +599,35 @@ function mimeFor(filename: string) {
  * يفتح الملف الذي تم تنزيله عبر لوحة مشاركة أندرويد (ACTION_SEND)،
  * للتطبيقات والخصائص التي تقبل مشاركة الملفات.
  */
-async function shareDownloadedFile(item: DownloadItem) {
-  if (Platform.OS === 'web' || !item.fileUri) return;
-  const available = await Sharing.isAvailableAsync();
-  if (!available) throw new Error('المشاركة غير مدعومة على هذا الجهاز.');
-  await Sharing.shareAsync(item.fileUri, {
-    mimeType: mimeFor(item.fileUri),
-    dialogTitle: 'مشاركة الملف',
-  });
+/**
+ * مسار الملف الذي يفهمه FileProvider (content://…SharingFileProvider/…).
+ * على أندرويد، expo-sharing يفشل صامتاً مع مسارات file:// الخام — نحوّلها أولاً
+ * (نفس التحويل المستخدم في «فتح»)، وإذا تعذر التحويل نمرر المسار كما هو.
+ */
+async function shareableUri(fileUri: string): Promise<string> {
+  const applicationId = Constants.expoConfig?.android?.package;
+  const filesDir = FileSystem.documentDirectory;
+  if (!applicationId || !filesDir || !fileUri.startsWith(filesDir)) return fileUri;
+  const relative = fileUri.slice(filesDir.length).split('/').map(encodeURIComponent).join('/');
+  return `content://${applicationId}.SharingFileProvider/expo_files/${relative}`;
+}
+
+async function shareDownloadedFile(item: DownloadItem): Promise<{ ok: boolean; message?: string }> {
+  if (Platform.OS === 'web' || !item.fileUri) return { ok: false, message: 'الملف غير متاح للمشاركة' };
+  try {
+    const available = await Sharing.isAvailableAsync();
+    if (!available) return { ok: false, message: 'المشاركة غير مدعومة على هذا الجهاز' };
+    const uri = await shareableUri(item.fileUri);
+    await Sharing.shareAsync(uri, {
+      mimeType: mimeFor(item.fileUri),
+      dialogTitle: 'مشاركة الملف',
+    });
+    return { ok: true };
+  } catch (error) {
+    // إلغاء المستخدم للوحة المشاركة ليس خطأً.
+    if (String((error as Error)?.message ?? '').includes('cancel')) return { ok: true };
+    return { ok: false, message: 'تعذّرت المشاركة — تأكد أن الملف موجود وحاول مجدداً' };
+  }
 }
 
 /**
@@ -826,14 +879,18 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             const stat = await FileSystem.getInfoAsync(target);
             if (!('size' in stat) || typeof stat.size !== 'number' || stat.size <= 0) return;
             const expected = remoteLengthRef.current ?? item.totalBytes ?? 0;
-            if (expected <= 0) return;
-            const ratio = stat.size / expected;
-            if (ratio <= 0 || ratio >= 1) return;
             const now = Date.now();
             if (now - lastAt < 300) return;
             lastAt = now;
+            bytesRef.current.set(id, { bytesWritten: stat.size, totalBytes: expected > 0 ? expected : undefined });
+            if (expected <= 0) {
+              // ما نعرف الحجم الكلي — نحدّث البايتات على الأقل ليشوف المستخدم الملف يكبر.
+              patchItem(id, { progress: 0.001, bytesWritten: stat.size });
+              return;
+            }
+            const ratio = stat.size / expected;
+            if (ratio <= 0 || ratio >= 1) return;
             progressRef.current.set(id, { progress: ratio, at: now });
-            bytesRef.current.set(id, { bytesWritten: stat.size, totalBytes: expected });
             patchItem(id, { progress: ratio, bytesWritten: stat.size, totalBytes: expected });
           } catch { /* الملف لم يُنشأ بعد — ننتظر الدورة القادمة */ }
         })();
@@ -939,7 +996,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           }
         }
         target = `${baseDirectory}${finalFilename}`;
-        await mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current);
+        let safNow = downloadDirRef.current;
+        if (!safNow && Platform.OS === 'android' && !(await hasStorageAccess())) {
+          // أول تنزيل بلا إعداد سابق: نطلب اختيار مجلد التنزيل مرة واحدة تلقائياً.
+          safNow = await requestAndStoreDeviceDir(async (uri) => { downloadDirRef.current = uri; }, null);
+        }
+        await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1398,7 +1460,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const shareFile = useCallback(async (item: DownloadItem) => {
     if (item.status !== 'completed' || !item.fileUri) return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    await shareDownloadedFile(item);
+    const result = await shareDownloadedFile(item);
+    if (!result.ok && result.message) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => undefined);
+      throw new Error(result.message);
+    }
   }, []);
 
   const moveToVault = useCallback(async (id: string) => {
@@ -1617,6 +1683,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       await safSubfolder(picked, subfolderFor(type));
     }
     return { ok: true, where: picked, message: 'تم — كل تنزيل جديد سيُحفظ في هذا المجلد تلقائياً ✓' };
+  }, [setDownloadDir]);
+
+  /**
+   * يضمن وجود مجلد التنزيل المحفوظ ومجلداته الفرعية قبل الحفظ (SAF الرسمي).
+   * يعيد مجلد النوع الصحيح أو null إذا لم يكن الإعداد جاهزاً.
+   */
+  const ensureDeviceTargetDir = useCallback(async (type: MediaType): Promise<string | null> => {
+    const safDir = downloadDirRef.current;
+    if (!safDir) return null;
+    try {
+      const entries = await FileSystem.StorageAccessFramework.readDirectoryAsync(safDir);
+      const want = subfolderFor(type);
+      const found = entries.find((entry) => entry.endsWith(`/${want}`) || decodeURIComponent(entry).endsWith(`/${want}`));
+      return found ?? await FileSystem.StorageAccessFramework.makeDirectoryAsync(safDir, want);
+    } catch {
+      return null;
+    }
   }, [setDownloadDir]);
 
   const value = useMemo(() => ({
