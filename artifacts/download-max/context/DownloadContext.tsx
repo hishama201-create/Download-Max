@@ -288,11 +288,18 @@ const PUBLIC_ROOT = '/storage/emulated/0/';
 /** مجلد التنزيلات العام في الجهاز. */
 const PUBLIC_DOWNLOAD_DIR = `${PUBLIC_ROOT}Download/`;
 
-/** هل لدينا صلاحية الوصول لجميع الملفات؟ نتحقق عملياً بقراءة المجلد العام. */
+/** اسم الملف التجريبي الذي يثبت أن الصلاحية生效 فعلاً (نكتب ثم نحذف). */
+const PROBE_FILE = `${PUBLIC_DOWNLOAD_DIR}.download-max-probe`;
+
+/**
+ * هل لدينا صلاحية الوصول لجميع الملفات؟ القراءة وحدها غير موثوقة على أندرويد 11+،
+ * فنتحقق بالكتابة: ننشئ ملفاً صغيراً في المجلد العام ثم نحذفه فوراً.
+ */
 export async function hasStorageAccess(): Promise<boolean> {
   if (Platform.OS !== 'android') return false;
   try {
-    await FileSystem.readDirectoryAsync(PUBLIC_DOWNLOAD_DIR);
+    await FileSystem.writeAsStringAsync(PROBE_FILE, '');
+    await FileSystem.deleteAsync(PROBE_FILE, { idempotent: true });
     return true;
   } catch {
     return false;
@@ -310,6 +317,25 @@ export async function openAllFilesAccessSettings(): Promise<void> {
   } catch {
     await Linking.openSettings();
   }
+}
+
+/**
+ * ينشئ «Download Max» ومجلداته الثلاثة فوراً (عند منح الإذن أو أول تشغيل)،
+ * حتى لا ينتظر المستخدم أول تنزيل ليظهر له المجلد في ملفات جهازه.
+ */
+export async function ensureDownloadFolders(): Promise<string | null> {
+  const base = await baseDownloadDir();
+  if (!base) return null;
+  for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+    await ensureTypeDir(base, type);
+  }
+  return base;
+}
+
+/** المسار الفعلي لمجلد التنزيلات المعروض في الإعدادات. */
+export async function currentDownloadFolder(): Promise<string> {
+  const base = await baseDownloadDir();
+  return base ?? FileSystem.documentDirectory ?? '';
 }
 
 /** مجلد «Download Max» المرئي في جهاز المستخدم، أو المجلد الخاص إن لم تصل الصلاحية. */
