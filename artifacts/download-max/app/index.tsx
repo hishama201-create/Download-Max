@@ -42,7 +42,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.0.1';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -346,13 +346,14 @@ function YoutubeResultCard({ video, wide, downloading, onDownload, onPress, colo
 }
 
 /** صفحة مشاهدة يوتيوب: مشغل مثبت أعلى + عنوان + مقترحات تشبه الفيديو + سحب لانهائي. */
-function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenVideo }: {
+function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenVideo, onPlayingChange }: {
   colors: Palette;
   video: YoutubeVideo;
   apiKey: string;
   onDownload: (video: YoutubeVideo) => void;
   onBack: () => void;
   onOpenVideo: (video: YoutubeVideo) => void;
+  onPlayingChange?: (playing: boolean) => void;
 }) {
   const [related, setRelated] = useState<YoutubeVideo[]>([]);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -390,6 +391,18 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
       });
     return () => { cancelled = true; };
   }, [video.id]);
+
+  // (4) نُبلّغ النافذة الخارجية إن كان الفيديو يعمل فعلاً، عشان تعرض شريط «فيديو يعمل» فوق شريط التبويبات.
+  useEffect(() => {
+    if (!onPlayingChange) return;
+    const subscription = player.addListener('statusChange', ({ status }: { status: string }) => {
+      onPlayingChange(status === 'playing');
+    });
+    return () => {
+      subscription.remove();
+      onPlayingChange(false);
+    };
+  }, [player, onPlayingChange]);
 
   // جلب المقترحات: نفس عنوان الفيديو (نتائج مشابهة) — وكل سحب لأسفل يجلب صفحة جديدة
   useEffect(() => {
@@ -591,9 +604,10 @@ function GoogleScreen({ colors, googleRef, onHistoryChange }: {
 }
 
 /** شاشة يوتيوب بملء الشاشة: بحث ببطاقات Material 3 + Top Result + شرائح فلترة، وصفحة مشاهدة كاملة. */
-function YoutubeScreen({ colors, onDownload }: {
+function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
   colors: Palette;
   onDownload: (videoUrl: string) => void;
+  onPlayingChange?: (playing: boolean) => void;
 }) {
   const apiKey = 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
   const [query, setQuery] = useState('');
@@ -656,6 +670,7 @@ function YoutubeScreen({ colors, onDownload }: {
         onDownload={(video) => handleDownload(video)}
         onBack={() => setWatching(null)}
         onOpenVideo={(video) => setWatching(video)}
+        onPlayingChange={onPlayingChange}
       />
     );
   }
@@ -1256,6 +1271,7 @@ export default function HomeScreen() {
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   // (7) صلاحية الوصول لجميع الملفات: بدونها تبقى التنزيلات داخل التطبيق فقط.
   const [storageGranted, setStorageGranted] = useState<boolean | null>(null);
+  const [playingInBackground, setPlayingInBackground] = useState(false);
   const [downloadFolder, setDownloadFolder] = useState('');
   const googleRef = useRef<WebView | null>(null);
   const [googleCanGoBack, setGoogleCanGoBack] = useState(false);
@@ -1777,8 +1793,6 @@ export default function HomeScreen() {
               </>
             )}
           />
-        ) : activeTab === 'youtube' ? (
-          <YoutubeScreen colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
         ) : activeTab === 'google' ? (
           <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
@@ -1848,7 +1862,26 @@ export default function HomeScreen() {
           />
           )
         ) : null}
+
+        {/* (4) يوتيوب يظل مركّباً حتى لو انتقل المستخدم لتبويب آخر: المشغّل يضل شغّال
+            والشاشة ما تفكّك، فيرجع المستخدم للفيديو من حيث توقّف. الإخفاء بـ display يحافظ
+            على حالة المكوّن ويمنع لمس الطبقات المخفية. */}
+        <View style={activeTab === 'youtube' ? styles.tabLayer : styles.tabLayerHidden} pointerEvents={activeTab === 'youtube' ? 'auto' : 'none'}>
+          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then(() => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
+        </View>
       </View>
+
+      {activeTab !== 'youtube' && playingInBackground ? (
+        <Pressable
+          testID="resume-playing"
+          accessibilityLabel="العودة إلى الفيديو الذي يعمل"
+          onPress={() => setActiveTab('youtube')}
+          style={[styles.playingHint, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 8 : 6 }]}
+        >
+          <Feather name="play-circle" size={16} color={colors.destructive} />
+          <Text style={[styles.playingHintText, { color: colors.foreground }]}>فيديو يعمل — اضغط للعودة</Text>
+        </Pressable>
+      ) : null}
 
       <View style={[styles.bottomNav, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 34 : Math.max(insets.bottom, 10) }]}>
         <Pressable testID="tab-home" accessibilityLabel="الرئيسية" onPress={() => setActiveTab('home')} style={styles.navItem}>
@@ -2395,6 +2428,10 @@ const styles = StyleSheet.create({
   ytSearchButton: { width: 36, height: 36, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
   ytError: { fontSize: 13, fontWeight: '700', textAlign: 'center', marginBottom: 9, marginHorizontal: 20 },
   ytList: { flex: 1 },
+  tabLayer: { flex: 1 },
+  tabLayerHidden: { display: 'none' },
+  playingHint: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, paddingTop: 8, borderTopWidth: 1 },
+  playingHintText: { fontSize: 12, fontWeight: '700' },
   ytScreen: { flex: 1 },
   ytPageHeader: { paddingHorizontal: 20, paddingTop: 8, marginBottom: 12 },
   ytListContent: { paddingHorizontal: 20, paddingBottom: 30 },
