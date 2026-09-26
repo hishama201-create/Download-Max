@@ -330,30 +330,14 @@ async function publicDownloadRoot(): Promise<string> {
 }
 
 /**
- * (2) «نسخ إلى مجلد التنزيلات»: ينسخ ملفاً من مساحة التطبيق إلى مجلد التنزيلات
- * الحقيقي في جهاز المستخدم، فيراه في مدير الملفات وينقله وينما شاء.
+ * يفتح منتقي مجلدات أندرويد الرسمي (SAF) مرة واحدة — بلا صلاحية «الوصول لجميع الملفات».
+ * يُرجع null عند رفض المستخدم أو الإلغاء.
  */
-export async function copyToDeviceDownloads(item: DownloadItem): Promise<{ ok: boolean; message: string }> {
-  const reason = await storageAccessError();
-  if (reason) {
-    return { ok: false, message: 'يحتاج التطبيق إذن الوصول لجميع الملفات أولاً' };
-  }
-  const source = item.fileUri;
-  if (!source || !source.startsWith('file://')) {
-    return { ok: false, message: 'هذا الملف ما زال قيد التحميل' };
-  }
-  const filename = source.split('/').pop() ?? 'file';
-  const target = `${await publicDownloadRoot()}${subfolderFor(item.type)}${filename}`;
-  try {
-    const targetDir = target.slice(0, target.lastIndexOf('/') + 1);
-    const dirInfo = await FileSystem.getInfoAsync(targetDir);
-    if (!dirInfo.exists) await FileSystem.makeDirectoryAsync(targetDir, { intermediates: true });
-    await FileSystem.copyAsync({ from: source, to: target });
-    return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return { ok: false, message: detail || 'تعذّر نسخ الملف' };
-  }
+async function pickDeviceDirectory(): Promise<string | null> {
+  const picked = await FileSystem.StorageAccessFramework
+    .requestDirectoryPermissionsAsync()
+    .catch(() => null);
+  return picked?.granted ? picked.directoryUri : null;
 }
 
 /** يفتح شاشة «All files access» الخاصة بتطبيقنا مباشرة في إعدادات النظام. */
@@ -1526,6 +1510,42 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  /**
+   * «نسخ إلى مجلد التنزيلات»: ينسخ الملف إلى مجلد جهازك عبر منتقي المجلدات
+   * الرسمي (SAF) — يختاره المستخدم مرة واحدة ثم تكفي ضغطة واحدة لكل ملف.
+   */
+  const copyToDeviceDownloads = useCallback(async (item: DownloadItem) => {
+    const source = item.fileUri;
+    if (!source || !source.startsWith('file://')) {
+      return { ok: false, message: 'هذا الملف ما زال قيد التحميل' };
+    }
+    const filename = source.split('/').pop() ?? 'file';
+    const mime = mimeFor(filename);
+    // 1) المجلد المحفوظ سابقاً، 2) وإلا نفتح المنتقي لاختياره مرة واحدة.
+    let dir = downloadDirRef.current;
+    if (!dir || !(await saveFileToSafDirectory(source, filename, mime, dir))) {
+      const picked = await pickDeviceDirectory();
+      if (!picked) return { ok: false, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
+      if (picked !== downloadDirRef.current) await setDownloadDir(picked);
+      dir = picked;
+      if (await saveFileToSafDirectory(source, filename, mime, dir)) {
+        return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
+      }
+    } else {
+      return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
+    }
+    // بديل أخير: المسار العام إن كانت صلاحية الوصول متاحة فعلاً على هذا الجهاز.
+    const reason = await storageAccessError();
+    if (reason) return { ok: false, message: `تعذّر النسخ: ${reason}` };
+    const target = `${await publicDownloadRoot()}${subfolderFor(item.type)}${filename}`;
+    try {
+      await FileSystem.copyAsync({ from: source, to: target });
+      return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : 'تعذّر نسخ الملف' };
+    }
+  }, [setDownloadDir]);
+
   const value = useMemo(() => ({
     items,
     activeCount: items.filter((item) => item.status === 'queued' || item.status === 'downloading').length,
@@ -1559,7 +1579,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pauseDownload,
     resumeDownload,
     removeDownload,
-    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio]);
+    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, copyToDeviceDownloads]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

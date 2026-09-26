@@ -33,7 +33,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, storageAccessError, copyToDeviceDownloads as copyItemToDevice, openAllFilesAccessSettings, ensureDownloadFolders, currentDownloadFolder } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, ensureDownloadFolders, currentDownloadFolder } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 /** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
@@ -42,7 +42,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.2';
+const APP_VERSION = '2.0.3';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1266,10 +1266,6 @@ export default function HomeScreen() {
   const [rememberFormat, setRememberFormat] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
-  // (7) صلاحية الوصول لجميع الملفات: بدونها تبقى التنزيلات داخل التطبيق فقط.
-  const [storageGranted, setStorageGranted] = useState<boolean | null>(null);
-  /** (2) سبب فشل الوصول الحقيقي بدل رسالة عامة. */
-  const [storageError, setStorageError] = useState<string | null>(null);
   const [playingInBackground, setPlayingInBackground] = useState(false);
   const [downloadFolder, setDownloadFolder] = useState('');
   const googleRef = useRef<WebView | null>(null);
@@ -1535,11 +1531,10 @@ export default function HomeScreen() {
     void openFile(item);
   }
 
-  /** (2) نسخ الملف من مساحة التطبيق إلى مجلد التنزيلات الحقيقي في جهاز المستخدم. */
+  /** نسخ الملف إلى مجلد تنزيلات في جهاز المستخدم عبر منتقي المجلدات الرسمي. */
   async function runCopyToDevice(item: DownloadItem) {
     const result = await copyToDeviceDownloads(item);
     setNotice(result.message);
-    if (!result.ok) setStorageError(await storageAccessError());
   }
 
 
@@ -1580,22 +1575,15 @@ export default function HomeScreen() {
     }
   }
 
-  // فحص صلاحية الوصول للملفات عند فتح التطبيق، وعند كل رجوع من إعدادات النظام.
+  // تجهيز مجلد التنزيلات داخل التطبيق، واسترجاع ما هو موجود في جهاز المستخدم.
+  // لا نطلب أي صلاحية هنا أبداً — القائمة تعمل دائماً.
   useEffect(() => {
-    if (Platform.OS !== 'android') {
-      setStorageGranted(true);
-      return;
-    }
     let cancelled = false;
     const check = async () => {
-      const granted = await hasStorageAccess();
-      if (cancelled) return;
-      setStorageGranted(granted);
-      // ننشئ المجلدات فوراً بدل انتظار أول تنزيل، حتى يراها المستخدم في ملفات جهازه.
       await ensureDownloadFolders();
-      setStorageError(await storageAccessError());
+      if (cancelled) return;
       setDownloadFolder(await currentDownloadFolder());
-      if (granted) {
+      if (Platform.OS === 'android' && (await hasStorageAccess())) {
         const added = await refreshFromDevice();
         if (!cancelled && added > 0) setNotice(`استرجعنا ${added} ملف من تخزين الجهاز 📁`);
       }
@@ -1803,27 +1791,6 @@ export default function HomeScreen() {
         ) : activeTab === 'google' ? (
           <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
-          storageGranted === false && Platform.OS === 'android' ? (
-            <View style={styles.storageGate}>
-              <View style={[styles.storageGateIcon, { backgroundColor: `${colors.primary}14` }]}>
-                <Feather name="clock" size={40} color={colors.primary} />
-              </View>
-              <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>السماح بالوصول إلى الملفات التي تم تنزيلها</Text>
-              <Text style={[styles.storageGateHint, { color: colors.mutedForeground }]}>تنزيلاتك محفوظة بأمان داخل التطبيق. هذا الإذن اختياري ويوجد لنسخ أي ملف إلى مجلد التنزيلات في جهازك.</Text>
-              <Pressable
-                testID="storage-permission"
-                accessibilityLabel="السماح بالوصول للملفات"
-                onPress={() => { void openAllFilesAccessSettings(); }}
-                style={[styles.storageGateButton, { backgroundColor: colors.card, borderColor: colors.border }]}
-              >
-                <Feather name="folder" size={18} color={colors.foreground} />
-                <Text style={[styles.storageGateButtonText, { color: colors.foreground }]}>السماح</Text>
-              </Pressable>
-              {storageError ? (
-                <Text style={[styles.storageGateError, { color: colors.destructive }]}>سبب التعذّر: {storageError}</Text>
-              ) : null}
-            </View>
-          ) : (
           <FlatList
             data={filteredItems}
             keyExtractor={(item) => item.id}
@@ -1871,7 +1838,6 @@ export default function HomeScreen() {
             renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
-          )
         ) : null}
 
         {/* (4) يوتيوب يظل مركّباً حتى لو انتقل المستخدم لتبويب آخر: المشغّل يضل شغّال
