@@ -290,8 +290,8 @@ const PUBLIC_ROOT = '/storage/emulated/0/';
 /** مجلد التنزيلات العام في الجهاز. */
 const PUBLIC_DOWNLOAD_DIR = `${PUBLIC_ROOT}Download/`;
 
-/** اسم الملف التجريبي الذي يثبت أن الصلاحية生效 فعلاً (نكتب ثم نحذف). */
-const PROBE_FILE = `${PUBLIC_DOWNLOAD_DIR}.download-max-probe`;
+/** ملف الاختبار: اسم عادي (أندرويد 11+ يمنع الملفات التي تبدأ بنقطة) وصيغة URI. */
+const PROBE_FILE = `file://${PUBLIC_DOWNLOAD_DIR}download-max-probe.tmp`;
 
 /**
  * هل لدينا صلاحية الوصول لجميع الملفات؟ القراءة وحدها غير موثوقة على أندرويد 11+،
@@ -305,8 +305,18 @@ export async function hasStorageAccess(): Promise<boolean> {
  * (2) بدل ابتلاع الخطأ، نرجّع سببه الحقيقي حتى تعرضه الواجهة بدل رسالة عامة.
  * يرجع `null` إذا كانت الصلاحية متاحة.
  */
+/** نتيجة الفحص مؤقتة حتى لا نكتب ملف اختبار مع كل تنزيل. */
+let accessCache: { at: number; reason: string | null } | null = null;
+
 export async function storageAccessError(): Promise<string | null> {
   if (Platform.OS !== 'android') return null;
+  if (accessCache && Date.now() - accessCache.at < 10000) return accessCache.reason;
+  const reason = await probeStorageAccess();
+  accessCache = { at: Date.now(), reason };
+  return reason;
+}
+
+async function probeStorageAccess(): Promise<string | null> {
   try {
     await FileSystem.writeAsStringAsync(PROBE_FILE, '');
     await FileSystem.deleteAsync(PROBE_FILE, { idempotent: true });
@@ -340,6 +350,28 @@ async function pickDeviceDirectory(): Promise<string | null> {
   return picked?.granted ? picked.directoryUri : null;
 }
 
+/**
+ * الحفظ التلقائي في مجلد التنزيلات الحقيقي بجهاز المستخدم، دون أي اختيار يدوي:
+ * 1) المسار العام «Download Max» إن كانت صلاحية الوصول سارية،
+ * 2) وإلا المجلد الذي اختاره المستخدم مرة واحدة (SAF).
+ * يرجع true إذا حُفظ الملف فعلاً.
+ */
+async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
+  if (await hasStorageAccess()) {
+    try {
+      const dir = `${await publicDownloadRoot()}${subfolderFor(type)}/`;
+      const info = await FileSystem.getInfoAsync(dir);
+      if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+      await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
+      return true;
+    } catch {
+      // المسار العام غير متاح — نكمل بالمجلد الذي اختاره المستخدم.
+    }
+  }
+  if (safDir) return saveFileToSafDirectory(localUri, filename, mimeFor(filename), safDir);
+  return false;
+}
+
 /** يفتح شاشة «All files access» الخاصة بتطبيقنا مباشرة في إعدادات النظام. */
 export async function openAllFilesAccessSettings(): Promise<void> {
   const applicationId = Constants.expoConfig?.android?.package;
@@ -363,11 +395,24 @@ export async function ensureDownloadFolders(): Promise<string | null> {
   for (const type of ['video', 'image', 'voice'] as MediaType[]) {
     await ensureTypeDir(base, type);
   }
+  // نفس المجلدات في تخزين الجهاز الحقيقي حتى يراها المستخدم في مدير الملفات.
+  if (await hasStorageAccess()) {
+    const root = await publicDownloadRoot();
+    for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+      const dir = `${root}${type}/`;
+      const info = await FileSystem.getInfoAsync(dir).catch(() => null);
+      if (!info?.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
+    }
+  }
   return base;
 }
 
 /** المسار الفعلي لمجلد التنزيلات المعروض في الإعدادات. */
 export async function currentDownloadFolder(): Promise<string> {
+  if (await hasStorageAccess()) {
+    const publicDir = await publicDownloadRoot();
+    if (publicDir) return publicDir;
+  }
   const base = await baseDownloadDir();
   return base ?? FileSystem.documentDirectory ?? '';
 }
@@ -681,9 +726,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
-        if (downloadDirRef.current) {
-          await saveFileToSafDirectory(target, filename, mimeFor(filename), downloadDirRef.current);
-        }
+        await mirrorToDeviceDownloads(target, filename, item.type, downloadDirRef.current);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -878,9 +921,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           }
         }
         target = `${baseDirectory}${finalFilename}`;
-        if (downloadDirRef.current) {
-          await saveFileToSafDirectory(target, finalFilename, mimeFor(finalFormat), downloadDirRef.current);
-        }
+        await mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1520,30 +1561,17 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       return { ok: false, message: 'هذا الملف ما زال قيد التحميل' };
     }
     const filename = source.split('/').pop() ?? 'file';
-    const mime = mimeFor(filename);
-    // 1) المجلد المحفوظ سابقاً، 2) وإلا نفتح المنتقي لاختياره مرة واحدة.
-    let dir = downloadDirRef.current;
-    if (!dir || !(await saveFileToSafDirectory(source, filename, mime, dir))) {
-      const picked = await pickDeviceDirectory();
-      if (!picked) return { ok: false, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
-      if (picked !== downloadDirRef.current) await setDownloadDir(picked);
-      dir = picked;
-      if (await saveFileToSafDirectory(source, filename, mime, dir)) {
-        return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
-      }
-    } else {
+    if (await mirrorToDeviceDownloads(source, filename, item.type, downloadDirRef.current)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
     }
-    // بديل أخير: المسار العام إن كانت صلاحية الوصول متاحة فعلاً على هذا الجهاز.
-    const reason = await storageAccessError();
-    if (reason) return { ok: false, message: `تعذّر النسخ: ${reason}` };
-    const target = `${await publicDownloadRoot()}${subfolderFor(item.type)}${filename}`;
-    try {
-      await FileSystem.copyAsync({ from: source, to: target });
+    // الحفظ التلقائي غير متاح: نطلب منه اختيار مجله مرة واحدة ثم ننسخ فيه دائماً.
+    const picked = await pickDeviceDirectory();
+    if (!picked) return { ok: false, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
+    if (picked !== downloadDirRef.current) await setDownloadDir(picked);
+    if (await saveFileToSafDirectory(source, filename, mimeFor(filename), picked)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : 'تعذّر نسخ الملف' };
     }
+    return { ok: false, message: (await storageAccessError()) ?? 'تعذّر نسخ الملف' };
   }, [setDownloadDir]);
 
   const value = useMemo(() => ({
