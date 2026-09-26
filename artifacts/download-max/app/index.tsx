@@ -33,7 +33,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, openAllFilesAccessSettings, ensureDownloadFolders, currentDownloadFolder } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, storageAccessError, copyToDeviceDownloads as copyItemToDevice, openAllFilesAccessSettings, ensureDownloadFolders, currentDownloadFolder } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 /** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
@@ -42,7 +42,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.1';
+const APP_VERSION = '2.0.2';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -979,7 +979,6 @@ function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut
       nestedScrollEnabled
       bounces={false}
       overScrollMode="never"
-      removeClippedSubviews
     >
       <View style={styles.panelHeader}>
         <Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable>
@@ -1083,7 +1082,6 @@ function TrashPanel({ colors, trashItems, onBack, onRestore, onDelete, onEmpty }
       nestedScrollEnabled
       bounces={false}
       overScrollMode="never"
-      removeClippedSubviews
     >
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>سلة المحذوفات</Text>{trashItems.length > 0 ? <Pressable onPress={onEmpty} accessibilityLabel="تفريغ السلة"><Feather name="trash-2" size={19} color={colors.destructive} /></Pressable> : <View style={{ width: 34 }} />}</View>
     <Text style={[styles.settingsHint, { color: colors.mutedForeground, marginBottom: 8 }]}>تبقى الملفات 30 يوماً ثم تُحذف تلقائياً</Text>
@@ -1155,7 +1153,6 @@ function SettingsPanel({ colors, themeMode, accent, maxTasks, maxTasksCellular, 
       nestedScrollEnabled
       bounces={false}
       overScrollMode="never"
-      removeClippedSubviews
     >
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>الإعدادات</Text><View style={{ width: 34 }} /></View>
     <Text style={[styles.settingsLabel, { color: colors.foreground }]}>المظهر</Text>
@@ -1235,10 +1232,10 @@ function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void })
       nestedScrollEnabled
       bounces={false}
       overScrollMode="never"
-      removeClippedSubviews
     >
     <View style={styles.panelHeader}><Pressable onPress={onBack} style={styles.backButton}><Feather name="arrow-right" size={21} color={colors.foreground} /></Pressable><Text style={[styles.panelTitle, { color: colors.foreground }]}>حول التطبيق</Text><View style={{ width: 34 }} /></View>
-    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.aboutVersion, { color: colors.mutedForeground }]}>الإصدار {APP_VERSION}</Text></View>
+    <View style={styles.aboutHero}><View style={[styles.aboutMark, { backgroundColor: colors.primary }]}><Feather name="arrow-down" size={31} color={colors.primaryForeground} /></View><Text style={[styles.aboutName, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text></View>
+    <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>الإصدار</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>{APP_VERSION}</Text></View>
     <View style={[styles.aboutCard, { backgroundColor: colors.background, borderColor: colors.border }]}><Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>المطور</Text><Text style={[styles.aboutDeveloper, { color: colors.foreground }]}>Hisham Al-Sabri</Text></View>
     <Text style={[styles.aboutDescription, { color: colors.mutedForeground }]}>تطبيق يساعدك على تنظيم تنزيلاتك من الروابط المسموح باستخدامها، مع تجربة بسيطة وسريعة.</Text>    </ScrollView>
   </View>;
@@ -1248,7 +1245,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1271,6 +1268,8 @@ export default function HomeScreen() {
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   // (7) صلاحية الوصول لجميع الملفات: بدونها تبقى التنزيلات داخل التطبيق فقط.
   const [storageGranted, setStorageGranted] = useState<boolean | null>(null);
+  /** (2) سبب فشل الوصول الحقيقي بدل رسالة عامة. */
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [playingInBackground, setPlayingInBackground] = useState(false);
   const [downloadFolder, setDownloadFolder] = useState('');
   const googleRef = useRef<WebView | null>(null);
@@ -1536,6 +1535,13 @@ export default function HomeScreen() {
     void openFile(item);
   }
 
+  /** (2) نسخ الملف من مساحة التطبيق إلى مجلد التنزيلات الحقيقي في جهاز المستخدم. */
+  async function runCopyToDevice(item: DownloadItem) {
+    const result = await copyToDeviceDownloads(item);
+    setNotice(result.message);
+    if (!result.ok) setStorageError(await storageAccessError());
+  }
+
 
 
   /** يفتح منتقي مجلدات أندرويد لاختيار مكان حفظ التنزيلات. */
@@ -1587,6 +1593,7 @@ export default function HomeScreen() {
       setStorageGranted(granted);
       // ننشئ المجلدات فوراً بدل انتظار أول تنزيل، حتى يراها المستخدم في ملفات جهازه.
       await ensureDownloadFolders();
+      setStorageError(await storageAccessError());
       setDownloadFolder(await currentDownloadFolder());
       if (granted) {
         const added = await refreshFromDevice();
@@ -1802,6 +1809,7 @@ export default function HomeScreen() {
                 <Feather name="clock" size={40} color={colors.primary} />
               </View>
               <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>السماح بالوصول إلى الملفات التي تم تنزيلها</Text>
+              <Text style={[styles.storageGateHint, { color: colors.mutedForeground }]}>تنزيلاتك محفوظة بأمان داخل التطبيق. هذا الإذن اختياري ويوجد لنسخ أي ملف إلى مجلد التنزيلات في جهازك.</Text>
               <Pressable
                 testID="storage-permission"
                 accessibilityLabel="السماح بالوصول للملفات"
@@ -1811,6 +1819,9 @@ export default function HomeScreen() {
                 <Feather name="folder" size={18} color={colors.foreground} />
                 <Text style={[styles.storageGateButtonText, { color: colors.foreground }]}>السماح</Text>
               </Pressable>
+              {storageError ? (
+                <Text style={[styles.storageGateError, { color: colors.destructive }]}>سبب التعذّر: {storageError}</Text>
+              ) : null}
             </View>
           ) : (
           <FlatList
@@ -2010,8 +2021,12 @@ export default function HomeScreen() {
         </Pressable>
       </Modal>
 
+      {/* (1) الخلفية طبقة مستقلة خلف اللوحات وليست أباً لها: أي لمسة داخل
+          الإعدادات/الخزنة/السلة/حول التطبيق ما تقدر تفتح «الإغلاق» أبداً،
+          فينتهي السبب اللي كان يسدّ اللوحة أثناء السحب. */}
       <Modal visible={panel !== null} transparent animationType="slide" onRequestClose={() => setPanel(null)}>
-        <Pressable style={styles.drawerBackdrop} onPress={() => setPanel(null)}>
+        <View style={styles.panelRoot}>
+          <Pressable style={styles.panelBackdropLayer} onPress={() => setPanel(null)} />
           {panel === 'menu' ? (
             <Pressable style={[styles.drawer, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
               <View style={styles.drawerHeader}><LinearGradient style={styles.drawerMark} colors={[colors.primary, `${colors.primary}55`]}><Feather name="arrow-down" size={18} color={colors.primaryForeground} /></LinearGradient><View><Text style={[styles.drawerTitle, { color: colors.foreground }]}>Download <Text style={{ color: colors.primary }}>Max</Text></Text><Text style={[styles.drawerSubtitle, { color: colors.mutedForeground }]}>مركز التحكم</Text></View><Pressable onPress={() => setPanel(null)} style={styles.closeButton}><Feather name="x" size={21} color={colors.mutedForeground} /></Pressable></View>
@@ -2026,7 +2041,6 @@ export default function HomeScreen() {
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
-              <View style={[styles.drawerFooterPill, { borderColor: colors.border }]}><Text style={[styles.drawerFooterPillText, { color: colors.mutedForeground }]}>الإصدار {APP_VERSION} · صُنع بعناية</Text></View>
             </Pressable>
           ) : panel === 'settings' ? (
             <SettingsPanel colors={colors} themeMode={themeMode} accent={accent} maxTasks={maxTasks} maxTasksCellular={maxTasksCellular} allowMobileData={allowMobileData} downloadDir={downloadDir} downloadFolder={downloadFolder} onThemeChange={setThemeMode} onAccentChange={setAccent} onMaxTasks={setMaxTasks} onMaxTasksCellular={setMaxTasksCellular} onAllowMobileData={setAllowMobileData} onChooseDownloadDir={chooseDownloadDir} onClearDownloadDir={() => { void setDownloadDir(null); setNotice('عاد التنزيل إلى مجلد التطبيق'); }} onBack={() => setPanel('menu')} />
@@ -2037,7 +2051,7 @@ export default function HomeScreen() {
           ) : (
             <AboutPanel colors={colors} onBack={() => setPanel('menu')} />
           )}
-        </Pressable>
+        </View>
       </Modal>
 
       {/* نافذة تأكيد الحذف: سلة المحذوفات أو حذف نهائي */}
@@ -2121,6 +2135,16 @@ export default function HomeScreen() {
                 <Text style={[styles.moreRowText, { color: colors.foreground }]}>{converting ? 'جارٍ التحويل...' : `تحويل إلى صوت (${convertFormat.toUpperCase()})`}</Text>
               </Pressable>
             ) : null}
+            <Pressable
+              testID="copy-to-device"
+              onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) void runCopyToDevice(target); }}
+              style={styles.moreRow}
+            >
+              <View style={[styles.moreRowIcon, { backgroundColor: `${colors.primary}12` }]}>
+                <Feather name="folder" size={18} color={colors.primary} />
+              </View>
+              <Text style={[styles.moreRowText, { color: colors.foreground }]}>نسخ إلى مجلد التنزيلات</Text>
+            </Pressable>
             <Pressable testID="menu-vault" onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) vaultAction(target); }} style={styles.moreRow}>
               <View style={[styles.moreRowIcon, { backgroundColor: `${colors.accentForeground}14` }]}>
                 <Feather name="lock" size={18} color={colors.accentForeground} />
@@ -2271,6 +2295,8 @@ const styles = StyleSheet.create({
   bottomNav: { minHeight: 68, borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
   storageGate: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32, gap: 16 },
   storageGateIcon: { width: 92, height: 92, borderRadius: 46, alignItems: 'center', justifyContent: 'center' },
+  storageGateHint: { fontSize: 13, textAlign: 'center', lineHeight: 20, paddingHorizontal: 20 },
+  storageGateError: { fontSize: 11, textAlign: 'center', paddingHorizontal: 20, fontWeight: '700' },
   storageGateTitle: { fontSize: 16, fontWeight: '700', textAlign: 'center', lineHeight: 26 },
   storageGateButton: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 26, paddingVertical: 13, borderRadius: 999, borderWidth: 1 },
   storageGateButtonText: { fontSize: 15, fontWeight: '700' },
@@ -2334,7 +2360,8 @@ const styles = StyleSheet.create({
   optionCopy: { flex: 1 },
   optionTitle: { fontSize: 14, fontWeight: '700' },
   optionDetail: { fontSize: 11, marginTop: 3 },
-  drawerBackdrop: { flex: 1, backgroundColor: 'rgba(5, 15, 28, 0.52)', justifyContent: 'flex-start' },
+  panelRoot: { flex: 1, flexDirection: 'row' },
+  panelBackdropLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(5, 15, 28, 0.52)' },
   drawer: { width: '84%', minHeight: '100%', paddingTop: 58, paddingHorizontal: 21, borderTopRightRadius: 25, borderBottomRightRadius: 25 },
   drawerHeader: { flexDirection: 'row', alignItems: 'center', gap: 11 },
   drawerMark: { width: 40, height: 40, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },

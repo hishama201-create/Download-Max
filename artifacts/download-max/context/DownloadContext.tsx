@@ -174,6 +174,8 @@ type DownloadContextValue = {
   openFile: (item: DownloadItem) => Promise<void>;
   /** يشارك الملف عبر لوحة مشاركة أندرويد (التطبيقات التي تقبل مشاركة الملفات). */
   shareFile: (item: DownloadItem) => Promise<void>;
+  /** (2) ينسخ الملف من مساحة التطبيق إلى مجلد التنزيلات الحقيقي في جهاز المستخدم. */
+  copyToDeviceDownloads: (item: DownloadItem) => Promise<{ ok: boolean; message: string }>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
   retryDownload: (id: string) => Promise<void>;
@@ -296,13 +298,61 @@ const PROBE_FILE = `${PUBLIC_DOWNLOAD_DIR}.download-max-probe`;
  * فنتحقق بالكتابة: ننشئ ملفاً صغيراً في المجلد العام ثم نحذفه فوراً.
  */
 export async function hasStorageAccess(): Promise<boolean> {
-  if (Platform.OS !== 'android') return false;
+  return (await storageAccessError()) === null;
+}
+
+/**
+ * (2) بدل ابتلاع الخطأ، نرجّع سببه الحقيقي حتى تعرضه الواجهة بدل رسالة عامة.
+ * يرجع `null` إذا كانت الصلاحية متاحة.
+ */
+export async function storageAccessError(): Promise<string | null> {
+  if (Platform.OS !== 'android') return null;
   try {
     await FileSystem.writeAsStringAsync(PROBE_FILE, '');
     await FileSystem.deleteAsync(PROBE_FILE, { idempotent: true });
-    return true;
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return message || 'تعذّر الوصول إلى مجلد التنزيلات على الجهاز';
+  }
+}
+
+/** نسخة آمنة من مجلد التنزيلات في تخزين الجهاز: «/storage/emulated/0/Download/Download Max/». */
+async function publicDownloadRoot(): Promise<string> {
+  const dir = `${PUBLIC_DOWNLOAD_DIR}${APP_DIR_NAME}/`;
+  try {
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
   } catch {
-    return false;
+    return PUBLIC_DOWNLOAD_DIR;
+  }
+  return dir;
+}
+
+/**
+ * (2) «نسخ إلى مجلد التنزيلات»: ينسخ ملفاً من مساحة التطبيق إلى مجلد التنزيلات
+ * الحقيقي في جهاز المستخدم، فيراه في مدير الملفات وينقله وينما شاء.
+ */
+export async function copyToDeviceDownloads(item: DownloadItem): Promise<{ ok: boolean; message: string }> {
+  const reason = await storageAccessError();
+  if (reason) {
+    return { ok: false, message: 'يحتاج التطبيق إذن الوصول لجميع الملفات أولاً' };
+  }
+  const source = item.fileUri;
+  if (!source || !source.startsWith('file://')) {
+    return { ok: false, message: 'هذا الملف ما زال قيد التحميل' };
+  }
+  const filename = source.split('/').pop() ?? 'file';
+  const target = `${await publicDownloadRoot()}${subfolderFor(item.type)}${filename}`;
+  try {
+    const targetDir = target.slice(0, target.lastIndexOf('/') + 1);
+    const dirInfo = await FileSystem.getInfoAsync(targetDir);
+    if (!dirInfo.exists) await FileSystem.makeDirectoryAsync(targetDir, { intermediates: true });
+    await FileSystem.copyAsync({ from: source, to: target });
+    return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { ok: false, message: detail || 'تعذّر نسخ الملف' };
   }
 }
 
@@ -338,9 +388,13 @@ export async function currentDownloadFolder(): Promise<string> {
   return base ?? FileSystem.documentDirectory ?? '';
 }
 
-/** مجلد «Download Max» المرئي في جهاز المستخدم، أو المجلد الخاص إن لم تصل الصلاحية. */
+/**
+ * (2) التخزين الآمن: التنزيلات تُحفظ داماً داخل مساحة التطبيق.
+ * هذي نفس طريقة سنابتوب: مضمونة 100% وما تعتمد على إذن نظام أبداً.
+ * لو حبّ المستخدم يشوف ملفاته في مدير الملفات، يستخدم «نسخ إلى مجلد التنزيلات».
+ */
 async function baseDownloadDir(): Promise<string | null> {
-  const root = (await hasStorageAccess()) ? PUBLIC_DOWNLOAD_DIR : FileSystem.documentDirectory;
+  const root = FileSystem.documentDirectory;
   if (!root) return null;
   const dir = `${root}${APP_DIR_NAME}/`;
   try {
@@ -1423,9 +1477,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
    * قراءة فقط: لا يُحذف ولا يُعدَّل أي ملف. يُستدعى بعد منح صلاحية الوصول لجميع الملفات.
    */
   const refreshFromDevice = useCallback(async () => {
-    if (!(await hasStorageAccess())) return 0;
     const known = new Set(itemsRef.current.map((item) => item.fileUri));
-    const uris = await mediaFilesIn(PUBLIC_DOWNLOAD_DIR);
+    // نفحص مجلد التنزيلات في الجهاز إن كانت الصلاحية متاحة، ومجلد التطبيق دائماً.
+    const roots: string[] = [await baseDownloadDir()].filter(Boolean) as string[];
+    if (await hasStorageAccess()) roots.unshift(await publicDownloadRoot());
+    const uris: string[] = [];
+    for (const root of roots) uris.push(...(await mediaFilesIn(root)));
     const adopted: DownloadItem[] = [];
     for (const uri of uris) {
       if (known.has(uri)) continue;
@@ -1492,6 +1549,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     downloadDir,
     setDownloadDir,
     refreshFromDevice,
+    copyToDeviceDownloads,
     restoreFromTrash,
     deletePermanently,
     emptyTrash,
