@@ -226,12 +226,34 @@ function prettyNameFromUrl(url: string): string | null {
     const last = new URL(url).pathname.split('/').filter(Boolean).pop();
     if (!last) return null;
     const decoded = decodeURIComponent(last).replace(/\.[^.]+$/, '').replace(/[-_+]+/g, ' ').trim();
-    // أسماء مثل 3a5f2c8d مجرد بصمات بلا فائدة — نتجاهلها إن لم تحوِ حروفًا كافية.
-    if (decoded.length < 3 || !/[\p{L}]{3,}/u.test(decoded)) return null;
+    if (!looksLikeHumanName(decoded)) return null;
     return decoded.slice(0, 60);
   } catch {
     return null;
   }
+}
+
+/**
+ * (إصلاح v2.0.11) هل هذا اسماً بشرياً حقيقياً أم بصمة/هاش من الخادم؟
+ * خوادم فيسبوك وإنستغرام تسمّي ملفات الكاروسيل ببصمات مثل «987333cd4fc5481b980» —
+ * معايير الكشف: طويل نسبياً + خالٍ من المسافات + نسبة الأرقام والرموز عالية،
+ * أو سلسلة سداسية عشرية طويلة. الفلتر القديم (3 حروف متتالية) كان يسلّلها
+ * لأن الهاشات تحوي مقاطع حرفية مثل «fced».
+ */
+function looksLikeHumanName(name: string): boolean {
+  const trimmed = name.trim();
+  if (trimmed.length < 3 || trimmed.length > 80) return false;
+  // سلسلة سداسية عشرية طويلة (بصمة الخوادم الأشهر) — ترفض مباشرة.
+  if (/^[0-9a-f]{12,}$/i.test(trimmed.replace(/[\s._-]/g, ''))) return false;
+  const spaces = (trimmed.match(/\s/g) ?? []).length;
+  if (spaces === 0 && trimmed.length >= 16) {
+    // كلمة واحدة طويلة: نسبة الحروف الرقمية/الرمزية تحسم الهوية.
+    const letters = (trimmed.match(/[\p{L}]/gu) ?? []).length;
+    const digits = (trimmed.match(/[0-9]/g) ?? []).length;
+    if (digits >= 4 && digits / letters >= 0.25) return false; // مزيج رقمي كثيف = بصمة
+    if (letters / trimmed.length < 0.5) return false;
+  }
+  return true;
 }
 
 /** يجلب اسم الملف الحقيقي ونوعه من ترويسات الخادم قبل التنزيل. */
@@ -417,6 +439,16 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
  * يرجع true إذا حُفظ الملف فعلاً.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
+  // (إصلاح v2.0.11) المجلد الذي اختاره المستخدم له الأولوية القصوى ودائماً:
+  // سابقاً كان المسار العام Download/Download Max يسبقه صامتاً عندما تكون صلاحية
+  // «الوصول لكل الملفات» مفعّلة — فيبقى المجلد المختار فارغاً بغض النظر عن التحميلات.
+  if (safDir) {
+    // (v2.0.8) المجلد الأساسي «Download Max» ثم مجلد النوع داخله — بلا تكرار.
+    const appRoot = await safAppRoot(safDir);
+    const dir = await safSubfolder(appRoot, subfolderFor(type));
+    if (await saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir)) return true;
+    // فشل SAF؟ نكمل للمسار العام بدل إفشال الحفظ كلياً.
+  }
   if (await hasStorageAccess()) {
     try {
       const dir = `${await publicDownloadRoot()}${subfolderFor(type)}/`;
@@ -425,14 +457,8 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
       await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
       return true;
     } catch {
-      // المسار العام غير متاح — نكمل بالمجلد الذي اختاره المستخدم.
+      // المسار العام غير متاح أيضاً.
     }
-  }
-  if (safDir) {
-    // (v2.0.8) المجلد الأساسي «Download Max» ثم مجلد النوع داخله — بلا تكرار.
-    const appRoot = await safAppRoot(safDir);
-    const dir = await safSubfolder(appRoot, subfolderFor(type));
-    return saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir);
   }
   return false;
 }
@@ -981,13 +1007,15 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
-        await mirrorToDeviceDownloads(target, filename, item.type, downloadDirRef.current);
+        const mirrored = await mirrorToDeviceDownloads(target, filename, item.type, downloadDirRef.current);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
           bytesWritten: size,
           totalBytes: size,
           fileUri: target,
+          // (v2.0.11) فشل النسخ إلى مجلد الجهاز لا يمرّ بصمت — الملف محفوظ في مساحة التطبيق وننبه المستخدم.
+          error: mirrored ? undefined : 'الملف محفوظ في مساحة التطبيق — لم نستطع نسخه إلى مجلد الجهاز',
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         if (item.type === 'video') {
@@ -1039,7 +1067,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
       // يوتيوب غالباً يبث بدون ترويسة طول أثناء التنزيل نفسه — نستخدم طول HEAD كمرجع للنسبة.
       remoteLengthRef.current = remoteInfo.length ?? null;
-      const remoteName = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
+      const remoteCandidate = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
+      // (إصلاح v2.0.11) اسم الخادم يُعتمد فقط إذا كان بشرياً — لا بصمات هاش مكان العناوين.
+      const remoteName = remoteCandidate && looksLikeHumanName(remoteCandidate.replace(/\.[^.]+$/, '')) ? remoteCandidate : null;
       if (remoteName) {
         const remoteExt = remoteName.includes('.') ? remoteName.split('.').pop()?.toLowerCase() : null;
         resolvedTitle = remoteName.replace(/\.[^.]+$/, '');
@@ -1185,7 +1215,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           // أول تنزيل بلا إعداد سابق: نطلب اختيار مجلد التنزيل مرة واحدة تلقائياً.
           safNow = await requestAndStoreDeviceDir(setDownloadDirRef.current, null);
         }
-        await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
+        const mirrored = await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1194,6 +1224,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           fileUri: target,
           title: resolvedTitle,
           format: finalFormat,
+          // (v2.0.11) تنبيه شفاف: فشل النسخ المطابق لا يبقى صامتاً.
+          error: mirrored ? undefined : 'الملف محفوظ في مساحة التطبيق — لم نستطع نسخه إلى مجلد الجهاز',
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         // توليد صورة مصغّرة للفيديو في الخلفية — فشلها لا يؤثر على اكتمال الملف.
@@ -1779,10 +1811,22 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         downloadDirRef.current = stored;
         // تجهيز المسار الأساسي مسبقاً (ذاكرة + مجلدات الأنواع) بلا أي طلب جديد.
         // (v2.0.10) روابط المجلدات محفوظة دائماً وتُعاد استخدامها مباشرة — لا بحث ولا إنشاء متكرر.
+        // (v2.0.11) تحقق فعلي بعد التجهيز: أي مجلد نوع مفقود/ميت يُعاد بناؤه فوراً
+        // حتى لا يجد المستخدم مجلدات ناقصة أو فارغة عند أول فحص من مدير الملفات.
         try {
           const appRoot = await safAppRoot(stored);
           for (const type of ['video', 'image', 'voice'] as MediaType[]) {
-            await safSubfolder(appRoot, subfolderFor(type));
+            const dir = await safSubfolder(appRoot, subfolderFor(type));
+            if (dir === appRoot || !(await isSafDirAlive(dir))) {
+              // الرابط المحفوظ ميت أو فشل — نمسح كاش النوع ليعاد إنشاؤه في المحاولة القادمة.
+              safTypeFoldersCache?.delete(subfolderFor(type));
+              await FileSystem.StorageAccessFramework.makeDirectoryAsync(appRoot, subfolderFor(type))
+                .then(async (fresh) => {
+                  safTypeFoldersCache?.set(subfolderFor(type), fresh);
+                  await persistSafTypeFolders(appRoot, safTypeFoldersCache!);
+                })
+                .catch(() => undefined);
+            }
           }
         } catch { /* أول تنزيل سيعيد المحاولة بنفسه */ }
       } else {
