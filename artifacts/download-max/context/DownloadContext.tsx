@@ -1,5 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
+// واجهة الملفات الحديثة: النسخ عبر تدفق أصلي (Native Stream) يدعم وجهات SAF content://.
+import { File as NativeFile } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
@@ -589,19 +591,54 @@ function extensionFor(mimeType: string | null, originalName: string | null, type
   return type === 'image' ? 'jpg' : type === 'audio' ? 'mp3' : 'mp4';
 }
 
+/** حد أقصى لخطة Base64 الاحتياطية — فوقه تنهار ذاكرة JS مع الملفات الكبيرة. */
+const SAF_BASE64_FALLBACK_LIMIT = 24 * 1024 * 1024;
+
+/**
+ * (إصلاح v2.0.9) نسخ الملف إلى مستند SAF بالتدفق الأصلي عبر واجهة الملفات الحديثة.
+ * سبب ملفات «الحجم 0» السابقة: copyAsync القديمة تحوّل داخلياً وجهات content://
+ * إلى مسار محلي لا معنى له فتفشل، وخطة Base64 تنهار مع الفيديوهات الكبيرة —
+ * فيبقى الملف الفارغ من createFileAsync يتيمة في مجلدات المستخدم.
+ * هنا: نسخ Native Stream بلا مرور بالذاكرة + تحقق أن الحجم المكتوب يطابق الأصل.
+ */
+async function streamCopyToSafFile(localUri: string, safFileUri: string): Promise<boolean> {
+  try {
+    const source = new NativeFile(localUri);
+    const target = new NativeFile(safFileUri);
+    // overwrite: المستند موجود فارغاً (من createFileAsync) — يحذفه ويعيد ملأه بنفس المسار.
+    await source.copy(target, { overwrite: true });
+    const expected = source.size;
+    const actual = target.size;
+    // ملف أصلي فارغ أو تطابق تام = نجاح. أي حجم آخر = فشل جزئي يجب تنظيفه.
+    return expected === 0 || actual === expected;
+  } catch {
+    return false;
+  }
+}
+
 /** ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم (مكان التنزيل). */
 async function saveFileToSafDirectory(localUri: string, filename: string, mimeType: string, directoryUri: string): Promise<boolean> {
+  let safFileUri: string | null = null;
   try {
     const baseName = filename.replace(/\.[^.]+$/, '') || 'download';
-    const safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(directoryUri, baseName, mimeType);
-    try {
-      await FileSystem.copyAsync({ from: localUri, to: safFileUri });
-    } catch {
-      const data = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
-      await FileSystem.writeAsStringAsync(safFileUri, data, { encoding: FileSystem.EncodingType.Base64 });
+    safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(directoryUri, baseName, mimeType);
+    // (v2.0.9) النسخ بالتدفق الأصلي أولاً — يعمل مع أي حجم وبلا كارثة ذاكرة.
+    if (await streamCopyToSafFile(localUri, safFileUri)) return true;
+    // خطة Base64 أخيرة — للملفات الصغيرة فقط (سابقاً كانت تُجرب مع الكل فتنهار).
+    const info = await FileSystem.getInfoAsync(localUri).catch(() => null);
+    const size = info?.exists && 'size' in info && typeof info.size === 'number' ? info.size : 0;
+    if (size > 0 && size <= SAF_BASE64_FALLBACK_LIMIT) {
+      try {
+        const data = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
+        await FileSystem.writeAsStringAsync(safFileUri, data, { encoding: FileSystem.EncodingType.Base64 });
+        return true;
+      } catch { /* ننزل لتنظيف الملف الفارغ */ }
     }
-    return true;
+    // فشل النسخ: نحذف المستند الفارغ اليتيم حتى لا يجد المستخدم ملفات «بحجم 0».
+    await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
+    return false;
   } catch {
+    if (safFileUri) await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
     // فشل الحفظ في المجلد المختار — يبقى الملف في مجلد التطبيق.
     return false;
   }
