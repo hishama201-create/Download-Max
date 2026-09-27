@@ -363,9 +363,27 @@ async function pickDeviceDirectory(): Promise<string | null> {
 }
 
 /**
+ * (v2.0.8) مجلد «Download Max» داخل المجلد الذي اختاره المستخدم — المسار الأساسي للتطبيق:
+ * «المجلد المختار / Download Max / video · voice · image».
+ * يُنشأ مرة واحدة ويُحفظ رابطه، ولا يُعاد إنشاؤه مع كل تنزيل (منع التكرار).
+ */
+let safAppRootCache: string | null = null;
+
+function setSafAppRootCache(uri: string | null): void {
+  safAppRootCache = uri;
+}
+
+async function safAppRoot(pickedDirUri: string): Promise<string> {
+  if (safAppRootCache) return safAppRootCache;
+  const root = await safSubfolder(pickedDirUri, APP_DIR_NAME);
+  setSafAppRootCache(root === pickedDirUri ? null : root);
+  return safAppRootCache ?? pickedDirUri;
+}
+
+/**
  * الحفظ التلقائي في مجلد التنزيلات الحقيقي بجهاز المستخدم، دون أي اختيار يدوي:
- * 1) المسار العام «Download Max» إن كانت صلاحية الوصول سارية،
- * 2) وإلا المجلد الذي اختاره المستخدم مرة واحدة (SAF).
+ * 1) المسار العام «Download/Download Max» إن كانت صلاحية الوصول سارية،
+ * 2) وإلا «Download Max» داخل المجلد الذي اختاره المستخدم مرة واحدة (SAF).
  * يرجع true إذا حُفظ الملف فعلاً.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
@@ -381,19 +399,21 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
     }
   }
   if (safDir) {
-    const dir = await safSubfolder(safDir, subfolderFor(type));
+    // (v2.0.8) المجلد الأساسي «Download Max» ثم مجلد النوع داخله — بلا تكرار.
+    const appRoot = await safAppRoot(safDir);
+    const dir = await safSubfolder(appRoot, subfolderFor(type));
     return saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir);
   }
   return false;
 }
 
 /**
- * يطلب من المستخدم اختيار مجلد التنزيل مرة واحدة (SAF) ويحفظ اختياره.
- * يُستدعى تلقائياً عند أول تنزيل إذا لم يكن هناك مجلد محفوظ ولا إذن عام —
- * حتى لا تحتاج زر «نسخ» ولا زيارة الإعدادات.
+ * يطلب من المستخدم اختيار مجلد التنزيل مرة واحدة (SAF) ويحفظ اختياره بشكل دائم.
+ * (إصلاح v2.0.8): سابقاً كان الاختيار يُكتب في مرجع مؤقت فقط فكان يضيع بعد
+ * إعادة تشغيل التطبيق ويُطلب من المستخدم من جديد — الآن يمر عبر الحفظ الدائم.
  */
 async function requestAndStoreDeviceDir(
-  setDownloadDir: (uri: string) => Promise<void>,
+  setDownloadDir: (uri: string | null) => Promise<void>,
   current: string | null,
 ): Promise<string | null> {
   const picked = await pickDeviceDirectory();
@@ -403,22 +423,40 @@ async function requestAndStoreDeviceDir(
 }
 
 /**
- * مجلد النوع الفرعي داخل المجلد الذي اختاره المستخدم (SAF).
- * ننشئه إن أمكن، ولو رفض النظام إنشاؤه نكتب في المجلد الجذر مباشرة.
+ * يبحث عن مجلد فرعي بالاسم المطلوب داخل مجلد SAF ويُنشئه فقط إن لم يوجد نهائياً.
+ *
+ * (إصلاح v2.0.8): في الإصدارات السابقة كنا نستدعي makeDirectoryAsync أولاً ونعتمد
+ * على فشلها لاكتشاف المجلد الموجود، لكن أندرويد لا يفشل — بل ينشئ تلقائياً
+ * «video (1)» ثم «video (2)»... فيتكرر المجلد مع كل تنزيل. الآن نقرأ المحتويات
+ * أولاً ونعيد استخدام المجلد الموجود (مطابقة مرنة: فك الترميز + تجاهل حالة الأحرف)،
+ * ولا ننشئ إلا إذا لم يوجد.
  */
+async function findSafChildByName(parentUri: string, name: string): Promise<string | null> {
+  try {
+    const entries = await FileSystem.StorageAccessFramework.readDirectoryAsync(parentUri);
+    const wanted = name.toLowerCase();
+    for (const entry of entries) {
+      const tail = entry.split('/').filter(Boolean).pop() ?? '';
+      let decoded = tail;
+      try { decoded = decodeURIComponent(tail); } catch { /* الاسم غير مُرمّز */ }
+      if (decoded.toLowerCase() === wanted) return entry;
+    }
+  } catch { /* تعذّرت القراءة — نحاول الإنشاء مباشرة */ }
+  return null;
+}
+
 async function safSubfolder(directoryUri: string, sub: string): Promise<string> {
+  // (v2.0.8) نبحث أولاً عن المجلد الموجود ونعيد استخدامه — الإنشاء آخر حل.
+  const existing = await findSafChildByName(directoryUri, sub);
+  if (existing) return existing;
   // واجهة SAF الرسمية: makeDirectoryAsync(المجلد الأب، الاسم) — التلاصق النصي
   // لا يعمل مع روابط content:// ويجعل إنشاء المجلدات الفرعية يفشل بصمت.
   try {
     return await FileSystem.StorageAccessFramework.makeDirectoryAsync(directoryUri, sub);
   } catch {
-    // المجلد موجود مسبقاً — نتحقق ونعيد روابطه إن وجدناها.
-    try {
-      const entries = await FileSystem.StorageAccessFramework.readDirectoryAsync(directoryUri);
-      const found = entries.find((entry) => entry.endsWith(`/${sub}`) || decodeURIComponent(entry).endsWith(`/${sub}`));
-      if (found) return found;
-    } catch { /* لا شيء */ }
-    return directoryUri;
+    // قد يكون أُنشئ للتو بسباق مع مهمة أخرى — فحص أخير ثم نكتب في الجذر.
+    const raced = await findSafChildByName(directoryUri, sub);
+    return raced ?? directoryUri;
   }
 }
 
@@ -999,7 +1037,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         let safNow = downloadDirRef.current;
         if (!safNow && Platform.OS === 'android' && !(await hasStorageAccess())) {
           // أول تنزيل بلا إعداد سابق: نطلب اختيار مجلد التنزيل مرة واحدة تلقائياً.
-          safNow = await requestAndStoreDeviceDir(async (uri) => { downloadDirRef.current = uri; }, null);
+          safNow = await requestAndStoreDeviceDir(setDownloadDirRef.current, null);
         }
         await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
         await patchItem(id, {
@@ -1569,16 +1607,43 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pumpRef.current();
   }, []);
 
-  // استرجاع مجلد التنزيل المحفوظ عند الإقلاع.
+  // مرجع دالة الحفظ الدائم — يسمح باستدعائها من runJob المعرّف قبلها بأمان.
+  const setDownloadDirRef = useRef<(uri: string | null) => Promise<void>>(async () => undefined);
+
+  /**
+   * (v2.0.8) تهيئة التخزين عند فتح التطبيق — تُستدعى مرة واحدة:
+   * 1) جذر محفوظ؟ نتحقق من صحته بقراءة تجريبية (بديل موثوق عن getUriInfoAsync
+   *    غير المتوفرة في نسخة expo-file-system لدينا) ثم نجهّز النظام فوراً.
+   * 2) لا جذر محفوظ أو الصلاحية انسحبت؟ لا نطلب شيئاً هنا — الطلب يحدث تلقائياً
+   *    عند أول تنزيل/تفعيل فقط، مرة واحدة، ثم يُحفظ بشكل دائم.
+   * 3) نجهّز «Download Max» ومجلدات الأنواع الثلاثة داخله بلا إنشاء مكرر.
+   */
   useEffect(() => {
-    AsyncStorage.getItem(DOWNLOAD_DIR_KEY)
-      .then((stored) => {
-        if (stored) {
-          setDownloadDirState(stored);
-          downloadDirRef.current = stored;
-        }
-      })
-      .catch(() => undefined);
+    let cancelled = false;
+    (async () => {
+      const stored = await AsyncStorage.getItem(DOWNLOAD_DIR_KEY).catch(() => null);
+      if (cancelled || !stored) return;
+      // تحقق حي: القراءة التجريبية تكشف انسحاب الصلاحية أو حذف المجلد.
+      const alive = await FileSystem.StorageAccessFramework.readDirectoryAsync(stored)
+        .then(() => true)
+        .catch(() => false);
+      if (cancelled) return;
+      if (alive) {
+        setDownloadDirState(stored);
+        downloadDirRef.current = stored;
+        // تجهيز المسار الأساسي مسبقاً (ذاكرة + مجلدات الأنواع) بلا أي طلب جديد.
+        try {
+          const appRoot = await safAppRoot(stored);
+          for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+            await safSubfolder(appRoot, subfolderFor(type));
+          }
+        } catch { /* أول تنزيل سيعيد المحاولة بنفسه */ }
+      } else {
+        // الصلاحية انسحبت — نمسح الاختيار الميت حتى يُطلب الاختيار من جديد مرة واحدة.
+        await setDownloadDirRef.current(null);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   /**
@@ -1633,7 +1698,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     } else {
       await AsyncStorage.removeItem(DOWNLOAD_DIR_KEY).catch(() => undefined);
     }
+    // (v2.0.8) نصفّر ذاكرة مجلد «Download Max» عند تغيير الجذر حتى لا يشير لمسار قديم.
+    if (uri) {
+      safAppRootCache = null;
+    }
   }, []);
+  // نربط المرجع بعد تعريف الدالة حتى يعمل استدعاؤها من initStorage وrunJob.
+  setDownloadDirRef.current = setDownloadDir;
 
   /**
    * «نسخ إلى مجلد التنزيلات»: ينسخ الملف إلى مجلد جهازك عبر منتقي المجلدات
@@ -1648,11 +1719,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (await mirrorToDeviceDownloads(source, filename, item.type, downloadDirRef.current)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
     }
-    // الحفظ التلقائي غير متاح: نطلب منه اختيار مجله مرة واحدة ثم ننسخ فيه دائماً.
+    // الحفظ التلقائي غير متاح: نطلب منه اختيار مجلده مرة واحدة ثم ننسخ دائماً
+    // في «المختار / Download Max / نوع الوسيط» — نفس المسار الأساسي (v2.0.8).
     const picked = await pickDeviceDirectory();
     if (!picked) return { ok: false, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
     if (picked !== downloadDirRef.current) await setDownloadDir(picked);
-    if (await saveFileToSafDirectory(source, filename, mimeFor(filename), picked)) {
+    const appRoot = await safAppRoot(picked);
+    const typeDir = await safSubfolder(appRoot, subfolderFor(item.type));
+    if (await saveFileToSafDirectory(source, filename, mimeFor(filename), typeDir)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
     }
     return { ok: false, message: (await storageAccessError()) ?? 'تعذّر نسخ الملف' };
@@ -1679,24 +1753,25 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const picked = await pickDeviceDirectory();
     if (!picked) return { ok: false, where: null, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
     if (picked !== downloadDirRef.current) await setDownloadDir(picked);
+    // (v2.0.8) المسار الأساسي: «المختار / Download Max / video · image · voice».
+    const appRoot = await safAppRoot(picked);
     for (const type of ['video', 'image', 'voice'] as MediaType[]) {
-      await safSubfolder(picked, subfolderFor(type));
+      await safSubfolder(appRoot, subfolderFor(type));
     }
-    return { ok: true, where: picked, message: 'تم — كل تنزيل جديد سيُحفظ في هذا المجلد تلقائياً ✓' };
+    return { ok: true, where: `${picked}${APP_DIR_NAME}`, message: 'تم — كل تنزيل جديد سيُحفظ في مجلد Download Max تلقائياً ✓' };
   }, [setDownloadDir]);
 
   /**
    * يضمن وجود مجلد التنزيل المحفوظ ومجلداته الفرعية قبل الحفظ (SAF الرسمي).
+   * (v2.0.8) المسار: «المختار / Download Max / نوع الوسيط» — بحث قبل إنشاء (بلا تكرار).
    * يعيد مجلد النوع الصحيح أو null إذا لم يكن الإعداد جاهزاً.
    */
   const ensureDeviceTargetDir = useCallback(async (type: MediaType): Promise<string | null> => {
     const safDir = downloadDirRef.current;
     if (!safDir) return null;
     try {
-      const entries = await FileSystem.StorageAccessFramework.readDirectoryAsync(safDir);
-      const want = subfolderFor(type);
-      const found = entries.find((entry) => entry.endsWith(`/${want}`) || decodeURIComponent(entry).endsWith(`/${want}`));
-      return found ?? await FileSystem.StorageAccessFramework.makeDirectoryAsync(safDir, want);
+      const appRoot = await safAppRoot(safDir);
+      return await safSubfolder(appRoot, subfolderFor(type));
     } catch {
       return null;
     }
