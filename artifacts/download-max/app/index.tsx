@@ -30,6 +30,7 @@ import {
   View,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -43,7 +44,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.11';
+const APP_VERSION = '2.0.12';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -208,6 +209,12 @@ function formatBytes(value?: number) {
 }
 
 function percentLabel(item: DownloadItem) {
+  // (v2.0.12) النسبة تظهر دائماً — وبغياب الحجم الكلي نعرضها كمقياس تقدّم محلي:
+  // لا نعرف الإجمالي من الخادم، فيمثل المترجم (1MB→1%) حتى لا يبدو التقدم متجمداً.
+  if (!item.totalBytes && (item.bytesWritten ?? 0) > 0) {
+    const mb = Math.floor((item.bytesWritten ?? 0) / (1024 * 1024));
+    return `${Math.min(Math.max(mb, 1), 99)}%+`;
+  }
   const percent = Math.min(Math.floor(item.progress * 100), 99);
   if (percent > 0) return `${percent}%`;
   // النسبة مجهولة (الخادم لم يعطِ الحجم الكلي) — نعرض الحجم المنزّل بدل 0% الميتة.
@@ -857,8 +864,11 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
               <View style={[styles.progressFill, { backgroundColor: isPaused ? colors.mutedForeground : colors.primary, width: `${Math.max(item.progress * 100, 4)}%` }]} />
             </View>
             <Text style={[styles.progressPercent, { color: isPaused ? colors.mutedForeground : colors.primary }]}>{percentLabel(item)}</Text>
-            {item.status === 'downloading' && item.progress * 100 < 1 && (item.bytesWritten ?? 0) > 0 ? (
-              <Text style={[styles.progressPercent, { color: colors.mutedForeground, fontSize: 11 }]}> · {((item.bytesWritten ?? 0) / (1024 * 1024)).toFixed(1)} MB</Text>
+            {/* (v2.0.12) نص الحجم الكامل دائماً: «12.4 MB / 55.0 MB» بجانب النسبة. */}
+            {(item.bytesWritten ?? 0) > 0 ? (
+              <Text style={[styles.progressPercent, { color: colors.mutedForeground, fontSize: 11 }]}>
+                {' '}· {formatBytes(item.bytesWritten ?? 0)}{item.totalBytes ? ` / ${formatBytes(item.totalBytes)}` : ''}
+              </Text>
             ) : null}
           </View>
         ) : item.error ? (
@@ -1260,6 +1270,10 @@ export default function HomeScreen() {
   const [input, setInput] = useState('');
   const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // (v2.0.12) التحديد بالسحب: يدخل عند ضغطة مطوّلة على صف ثم سحب — يحدد كل الصفوف
+  // التي يمر بها الإصبع مع تمرير تلقائي عند أطراف القائمة (مثل «ملفاتي» في سامسونج).
+  const dragSelectRef = useRef<{ startY: number; active: boolean; lastId: string | null } | null>(null);
+  const listScrollRef = useRef<number>(0);
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
   const [moreMenu, setMoreMenu] = useState<DownloadItem | null>(null);
@@ -1285,6 +1299,26 @@ export default function HomeScreen() {
   const [showSearch, setShowSearch] = useState(false);
   // شبكة اختيار صور الكاروسيل: الصور مصغّرة مع صح/بدون صح ثم تنزيل المحدد فقط.
   const [carouselGallery, setCarouselGallery] = useState<{ urls: string[]; selected: boolean[]; title?: string } | null>(null);
+  // (v2.0.12) التحديد بالسحب داخل شبكة صور الكاروسيل: ضغطة مطوّلة ثم مرور على الصور.
+  const galleryDragGesture = useMemo(() => Gesture.Pan()
+    .activateAfterLongPress(300)
+    .onUpdate((event) => {
+      setCarouselGallery((state) => {
+        if (!state) return state;
+        // الشبكة 3 أعمدة؛ من إحداثيات اللمس نستنتج الخلية (خلية ~ (width-14)/3 × 118px).
+        const cellW = 118;
+        const cellH = 118;
+        const col = Math.floor(event.x / cellW);
+        const row = Math.floor((event.y + event.translationY + 400) / cellH);
+        const flatIndex = Math.max(0, row * 3 + col);
+        if (flatIndex < 0 || flatIndex >= state.selected.length) return state;
+        if (state.selected[flatIndex]) return state;
+        const next = [...state.selected];
+        next[flatIndex] = true;
+        void Haptics.selectionAsync();
+        return { ...state, selected: next };
+      });
+    }), []);
   // نافذة المحتوى المختلط: منشور يحتوي صوراً ونسخة فيديو قصير معاً — نسأل المستخدم أيهما يريد.
   const [mixedPrompt, setMixedPrompt] = useState<{ url: string; imageCount: number } | null>(null);
 
@@ -1646,6 +1680,56 @@ export default function HomeScreen() {
     return () => subscription.remove();
   }, [panel, activeTab, googleCanGoBack, selectedIds.size]);
 
+  // (v2.0.12) لمسة التحديد بالسحب: تتفعّل فقط بعد ضغطة مطوّلة (activateAfterLongPress)
+  // ثم يحدد كل صف يتقاطع معه الإصبع، مع تمرير تلقائي عند أعلى/أسفل القائمة.
+  const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
+  const dragSelectGesture = useMemo(() => {
+    const pan = Gesture.Pan()
+      .activateAfterLongPress(350)
+      .onBegin((event) => {
+        dragSelectRef.current = { startY: event.absoluteY, active: false, lastId: null };
+      })
+      .onStart(() => {
+        if (dragSelectRef.current) dragSelectRef.current.active = true;
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      })
+      .onUpdate((event) => {
+        const drag = dragSelectRef.current;
+        if (!drag || !drag.active) return;
+        const touchY = event.absoluteY;
+        // تحديد الصف أسفل الإصبع: نحسبه من ارتفاع الصف التقريبي (79px + فاصل 10px).
+        const rowHeight = 89;
+        const index = Math.floor(touchY / rowHeight);
+        const candidates = filteredItems;
+        if (index >= 0 && index < candidates.length) {
+          const id = candidates[index].id;
+          if (id !== drag.lastId) {
+            drag.lastId = id;
+            setSelectedIds((current) => {
+              const next = new Set(current);
+              next.add(id);
+              return next;
+            });
+          }
+        }
+        // التمرير التلقائي عند الأطراف (شريط 90px أعلى وأسفل).
+        const edge = 90;
+        if (touchY < edge) {
+          listFlatRef.current?.scrollToOffset({ offset: Math.max(0, listScrollRef.current - 14), animated: false });
+        } else if (touchY > edge && touchY > 0) {
+          // نعرف ارتفاع القائمة من الإحداثي فقط — التمرير للأسفل يزيد الدخول للقائمة.
+          listFlatRef.current?.scrollToOffset({ offset: listScrollRef.current + 14, animated: false });
+        }
+      })
+      .onEnd(() => {
+        if (dragSelectRef.current) dragSelectRef.current = null;
+      })
+      .onFinalize(() => {
+        if (dragSelectRef.current) dragSelectRef.current = null;
+      });
+    return pan;
+  }, [filteredItems]);
+
   /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
   function toggleSelection(id: string) {
     setSelectedIds((current) => {
@@ -1819,9 +1903,14 @@ export default function HomeScreen() {
         ) : activeTab === 'google' ? (
           <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
+          <GestureDetector gesture={dragSelectGesture}>
+          <View style={{ flex: 1 }}>
           <FlatList
+            ref={listFlatRef}
             data={filteredItems}
             keyExtractor={(item) => item.id}
+            onScroll={(event) => { listScrollRef.current = event.nativeEvent.contentOffset.y; }}
+            scrollEventThrottle={16}
             refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} tintColor={colors.primary} />}
             contentContainerStyle={[styles.downloadsContent, downloadItems.length === 0 && styles.emptyList]}
             ListHeaderComponent={
@@ -1866,6 +1955,8 @@ export default function HomeScreen() {
             renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
+          </View>
+          </GestureDetector>
         ) : null}
 
         {/* (4) يوتيوب يظل مركّباً حتى لو انتقل المستخدم لتبويب آخر: المشغّل يضل شغّال
@@ -1976,6 +2067,7 @@ export default function HomeScreen() {
               <Feather name="check-square" size={17} color={colors.primary} />
               <Text style={[styles.gallerySelectAllText, { color: colors.primary }]}>تحديد الكل</Text>
             </Pressable>
+            <GestureDetector gesture={galleryDragGesture}>
             <FlatList
               data={carouselGallery?.urls ?? []}
               keyExtractor={(item, index) => `${index}-${item.slice(-24)}`}
@@ -1993,6 +2085,7 @@ export default function HomeScreen() {
                 </TouchableOpacity>;
               }}
             />
+            </GestureDetector>
             <Pressable
               testID="gallery-download"
               accessibilityLabel="تنزيل الصور المحددة"

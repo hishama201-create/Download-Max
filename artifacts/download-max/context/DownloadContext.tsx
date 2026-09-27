@@ -11,6 +11,7 @@ import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Linking, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
+import { setPublicRootProvider, syncHistorySnapshot, upsertHistoryEntry, deleteHistoryEntry } from '@/context/historyDb';
 import { extractAudioFromVideo } from '@/context/audio';
 import { generateVideoThumbnail } from '@/context/thumbnails';
 
@@ -214,6 +215,24 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+/** (v2.0.12) تحويل عنصر تنزيل إلى صف سجل لقاعدة البيانات العامة. */
+function historyEntryOf(item: DownloadItem) {
+  return {
+    id: item.id,
+    title: item.title,
+    url: item.url,
+    type: item.type,
+    format: item.format,
+    quality: item.quality,
+    status: item.status,
+    progress: item.progress,
+    bytesWritten: item.bytesWritten ?? null,
+    totalBytes: item.totalBytes ?? null,
+    fileUri: item.fileUri ?? null,
+    createdAt: item.createdAt,
+  };
+}
+
 function safeFilename(title: string, format: string) {
   // \p{L} يحافظ على الحروف العربية وكل اللغات في اسم الملف.
   const cleaned = title.replace(/[^\p{L}\p{N}\s._-]/gu, '').trim().replace(/\s+/g, ' ').slice(0, 60) || 'download';
@@ -324,6 +343,21 @@ function subfolderFor(type: MediaType): string {
 /** اسم مجلد التنزيلات الافتراضي. */
 const APP_DIR_NAME = 'Download Max';
 /**
+ * (v2.0.12) هيكل Snaptube في جذر التخزين العام — ثابت واحد يغيّر كل شيء:
+ * DownloadMax/download/DownloadMax Video|Music|Image (+ DownloadMax/db للسجل).
+ */
+const SNAPTUBE_ROOT_NAME = 'DownloadMax';
+const SNAPTUBE_DOWNLOAD_DIR = 'download';
+const SNAPTUBE_VIDEO_DIR = 'DownloadMax Video';
+const SNAPTUBE_MUSIC_DIR = 'DownloadMax Music';
+const SNAPTUBE_IMAGE_DIR = 'DownloadMax Image';
+/** مجلد النوع في هيكل Snaptube حسب نوع الوسيط. */
+function snaptubeSubfolderFor(type: MediaType): string {
+  if (type === 'video') return SNAPTUBE_VIDEO_DIR;
+  if (type === 'audio') return SNAPTUBE_MUSIC_DIR;
+  return SNAPTUBE_IMAGE_DIR;
+}
+/**
  * (v2.0.10) هل هذا الرابط يشير لمجلد اسمه «Download Max» أصلاً؟
  * نقرأ معرّف المستند من الرابط (primary:Download Max مثلاً) بعد فك الترميز —
  * لأن الجزء الأخير من روابط SAF قد يكون معرّفاً رقمياً لا اسماً حقيقياً.
@@ -345,6 +379,19 @@ function isSafAppRootUri(uri: string): boolean {
 }
 /** الجذر العام للتخزين الداخلي في أندرويد — يحتاج صلاحية «الوصول لجميع الملفات». */
 const PUBLIC_ROOT = '/storage/emulated/0/';
+/**
+ * (v2.0.12) جذر هيكل Snaptube العام: «/storage/emulated/0/DownloadMax/».
+ * يعمل فقط مع صلاحية All Files Access — وهو المسار الأساسي للحفظ الآن.
+ */
+function publicStorageRoot(): string {
+  return `${PUBLIC_ROOT}${SNAPTUBE_ROOT_NAME}/`;
+}
+
+// (v2.0.12) تزويد موديول قاعدة السجل بمجلد الجذر العام (بلا استيراد دائري).
+setPublicRootProvider(() => {
+  if (Platform.OS !== 'android') return null;
+  return publicStorageRoot();
+});
 /** مجلد التنزيلات العام في الجهاز. */
 const PUBLIC_DOWNLOAD_DIR = `${PUBLIC_ROOT}Download/`;
 
@@ -382,6 +429,22 @@ async function probeStorageAccess(): Promise<string | null> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return message || 'تعذّر الوصول إلى مجلد التنزيلات على الجهاز';
+  }
+}
+
+/**
+ * (v2.0.12) مجلد النوع في هيكل Snaptube العام — يُنشأ تلقائياً إن لم يوجد:
+ * «/storage/emulated/0/DownloadMax/download/DownloadMax Video|Music|Image/».
+ * يعيد null إذا كانت صلاحية All Files Access غير متاحة.
+ */
+async function snaptubeTypeDir(type: MediaType): Promise<string | null> {
+  try {
+    const dir = `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/${snaptubeSubfolderFor(type)}/`;
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+    return dir;
+  } catch {
+    return null;
   }
 }
 
@@ -439,9 +502,28 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
  * يرجع true إذا حُفظ الملف فعلاً.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
-  // (إصلاح v2.0.11) المجلد الذي اختاره المستخدم له الأولوية القصوى ودائماً:
-  // سابقاً كان المسار العام Download/Download Max يسبقه صامتاً عندما تكون صلاحية
-  // «الوصول لكل الملفات» مفعّلة — فيبقى المجلد المختار فارغاً بغض النظر عن التحميلات.
+  // (v2.0.12) المسار الأساسي: هيكل Snaptube في جذر التخزين مع All Files Access —
+  // نقل مباشر بلا نسخ مزدوج وبلا مزوّد SAF: «DownloadMax/download/DownloadMax Video…».
+  if (Platform.OS === 'android' && (await hasStorageAccess())) {
+    const dir = await snaptubeTypeDir(type);
+    if (dir) {
+      try {
+        await FileSystem.moveAsync({ from: localUri, to: `${dir}${filename}` });
+        return true;
+      } catch (moveError) {
+        console.error('[v2.0.12] فشل النقل المباشر إلى هيكل Snaptube:', moveError);
+        // فشل النقل (قفل ملف مثلًا)؟ نجرّب نسخاً ثم نحذف الأصل.
+        try {
+          await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
+          await FileSystem.deleteAsync(localUri, { idempotent: true }).catch(() => undefined);
+          return true;
+        } catch (copyError) {
+          console.error('[v2.0.12] فشل النسخ أيضاً إلى هيكل Snaptube:', copyError);
+        }
+      }
+    }
+  }
+  // (إصلاح v2.0.11) المجلد الذي اختاره المستخدم (SAF يدوي) — بعده مباشرة.
   if (safDir) {
     // (v2.0.8) المجلد الأساسي «Download Max» ثم مجلد النوع داخله — بلا تكرار.
     const appRoot = await safAppRoot(safDir);
@@ -502,7 +584,29 @@ async function findSafChildByName(parentUri: string, name: string): Promise<stri
 }
 
 /**
- * (v2.0.10) ذاكرة كاش للمجلدات الفرعية ومفتاح الحفظ الدائم الحالي،
+ * (v2.0.12) استعادة أسماء العناصر القديمة المحفوظة كهاش (مثل bd604a8e…):
+ * عند فتح التطبيق، أي عنصر مكتمل عنوانه بصمة خادم ونملك رابطه الأصلي نستعلم
+ * الخادم مرة واحدة (HEAD) عن اسمه الحقيقي ونحدّث القائمة — القديم يُصحح تلقائياً.
+ */
+async function restoreLegacyHashTitles(
+  items: DownloadItem[],
+  patchItem: (id: string, patch: Partial<DownloadItem>) => void,
+): Promise<void> {
+  for (const item of items) {
+    if (item.status !== 'completed' || !item.resolvedUrl && !/^https?:\/\//i.test(item.url)) continue;
+    if (looksLikeHumanName(item.title)) continue;
+    try {
+      const candidate = await fetchRemoteFileInfo(item.url);
+      const name = candidate.filename ?? prettyNameFromUrl(item.url);
+      if (name && looksLikeHumanName(name.replace(/\.[^.]+$/, ''))) {
+        await patchItem(item.id, { title: name.replace(/\.[^.]+$/, '') });
+      }
+    } catch { /* الخادم لا يرد — نترك العنوان كما هو */ }
+  }
+}
+
+/**
+ * (v2.0.10) ذاكرة كاش للمجلدات الفرعية ومفتاح الحفظ الدائم الحالي,
  * حتى لا تُقرأ محتويات المجلد الأب ولا يُستدعى الإنشاء مع كل تنزيل —
  * هذا هو الحل الجذري لتكرار «video (1)» و«video (2)» على مزودات
  * يكون فيها الجزء الأخير من روابط العناصر معرّفاً داخلياً لا اسماً،
@@ -607,6 +711,12 @@ export async function ensureDownloadFolders(): Promise<string | null> {
   for (const type of ['video', 'image', 'voice'] as MediaType[]) {
     await ensureTypeDir(base, type);
   }
+  // (v2.0.12) مجلدات هيكل Snaptube العامة تُجهّز أولاً: DownloadMax/download/…
+  if (Platform.OS === 'android' && (await hasStorageAccess())) {
+    for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+      await snaptubeTypeDir(type);
+    }
+  }
   // نفس المجلدات في تخزين الجهاز الحقيقي حتى يراها المستخدم في مدير الملفات.
   if (await hasStorageAccess()) {
     const root = await publicDownloadRoot();
@@ -621,9 +731,8 @@ export async function ensureDownloadFolders(): Promise<string | null> {
 
 /** المسار الفعلي لمجلد التنزيلات المعروض في الإعدادات. */
 export async function currentDownloadFolder(): Promise<string> {
-  if (await hasStorageAccess()) {
-    const publicDir = await publicDownloadRoot();
-    if (publicDir) return publicDir;
+  if (Platform.OS === 'android' && (await hasStorageAccess())) {
+    return `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/`;
   }
   const base = await baseDownloadDir();
   return base ?? FileSystem.documentDirectory ?? '';
@@ -727,13 +836,25 @@ async function streamCopyToSafFile(localUri: string, safFileUri: string): Promis
   try {
     const source = new NativeFile(localUri);
     const target = new NativeFile(safFileUri);
-    // overwrite: المستند موجود فارغاً (من createFileAsync) — يحذفه ويعيد ملأه بنفس المسار.
-    await source.copy(target, { overwrite: true });
-    const expected = source.size;
-    const actual = target.size;
-    // ملف أصلي فارغ أو تطابق تام = نجاح. أي حجم آخر = فشل جزئي يجب تنظيفه.
-    return expected === 0 || actual === expected;
-  } catch {
+    // (v2.0.12) محاولتان: بعض مزوّدات SAF (سامسونج خصوصاً) تُرجع size قديماً/خاطئاً
+    // مباشرة بعد كتابة ملف كبير — إعادة المحاولة تعطي النظام فرصة لتحديث المقاس.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await source.copy(target, { overwrite: true });
+        const expected = source.size;
+        const actual = target.size;
+        if (expected === 0 || actual === expected) return true;
+        // الحجم غير مطابق؟ ننتظر قليلاً ونعيد قراءته قبل الحكم بالفشل.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const reread = new NativeFile(safFileUri).size;
+        if (expected === 0 || reread === expected) return true;
+      } catch (copyError) {
+        console.error('[v2.0.12] خطأ النسخ بالتدفق إلى SAF (محاولة ' + (attempt + 1) + '):', copyError);
+      }
+    }
+    return false;
+  } catch (error) {
+    console.error('[v2.0.12] خطأ غير متوقع في النسخ إلى SAF:', error);
     return false;
   }
 }
@@ -767,12 +888,17 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
         const data = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
         await FileSystem.writeAsStringAsync(safFileUri, data, { encoding: FileSystem.EncodingType.Base64 });
         return true;
-      } catch { /* ننزل لتنظيف الملف الفارغ */ }
+      } catch (base64Error) {
+        console.error('[v2.0.12] فشلت خطة Base64 الأخيرة:', base64Error);
+      }
     }
-    // فشل النسخ: نحذف المستند الفارغ اليتيم حتى لا يجد المستخدم ملفات «بحجم 0».
+    // (إصلاح v2.0.12) الحكم بالحذف بعد فحص فعلي: مستند فيه بيانات لا يُحذف أبداً —
+    // حذف نسخة ناجحة بسبب قراءة حجم خاطئ كان سبب «فشل النسخ» الزائف على سامسونج.
+    if (await isSafFileHasContent(safFileUri)) return true;
     await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
     return false;
-  } catch {
+  } catch (error) {
+    console.error('[v2.0.12] فشل الحفظ في مجلد SAF:', error);
     if (safFileUri) await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
     // فشل الحفظ في المجلد المختار — يبقى الملف في مجلد التطبيق.
     return false;
@@ -958,19 +1084,48 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
   const progressRef = useRef(new Map<string, { progress: number; at: number }>());
   const bytesRef = useRef(new Map<string, { bytesWritten: number; totalBytes?: number }>());
+  // (v2.0.12) الرابط المباشر الحالي لكل مهمة — مطلوب للاستئناف الحقيقي بلا إعادة استخراج
+  // (يوتيوب يغير رابطه في كل استخراج فكان الاستئناف يفشل ويعيد التنزيل من الصفر).
+  const directUrlRef = useRef(new Map<string, string>());
   /** مهام طلب المستخدم إيقافها — تمييز الإيقاف المقصود عن الإلغاء داخل runJob. */
   const pauseRequestedRef = useRef(new Set<string>());
   const pumpRef = useRef<() => void>(() => undefined);
   const runJobRef = useRef<(id: string) => void>(() => undefined);
 
+  // (v2.0.12) حفظ القائمة الدائم يُخفَّف: تحديثات التقدم تحدث كل 250ms وتعيد تسلسل
+  // JSON لكل العناصر في كل مرة — عبء واضح على الإيقاف/الاستئناف والواجهة.
+  // الآن: الكتابة الفورية عند تغيّر الحالة (queued/downloading/paused/completed/failed)،
+  // وتهدئة (throttle) 1.2 ثانية لتحديثات التقدم فقط.
+  let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  let persistPending: DownloadItem[] | null = null;
+  const persistNow = useCallback((next: DownloadItem[]) => {
+    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
+  }, []);
   const commit = useCallback((updater: (current: DownloadItem[]) => DownloadItem[]) => {
     setItems((current) => {
       const next = updater(current);
       itemsRef.current = next;
-      void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
+      const stateChanged = next.some((entry, index) => {
+        const previous = current[index];
+        return !previous || previous.id !== entry.id || previous.status !== entry.status;
+      });
+      if (stateChanged) {
+        if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+        persistPending = null;
+        persistNow(next);
+      } else if (persistTimer) {
+        persistPending = next;
+      } else {
+        persistPending = next;
+        persistTimer = setTimeout(() => {
+          persistTimer = null;
+          if (persistPending) persistNow(persistPending);
+          persistPending = null;
+        }, 1200);
+      }
       return next;
     });
-  }, []);
+  }, [persistNow]);
 
   const patchItem = useCallback((id: string, patch: Partial<DownloadItem>) => {
     commit((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
@@ -1017,6 +1172,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           // (v2.0.11) فشل النسخ إلى مجلد الجهاز لا يمرّ بصمت — الملف محفوظ في مساحة التطبيق وننبه المستخدم.
           error: mirrored ? undefined : 'الملف محفوظ في مساحة التطبيق — لم نستطع نسخه إلى مجلد الجهاز',
         });
+        void upsertHistoryEntry(historyEntryOf({ ...item, status: 'completed', progress: 1, bytesWritten: size, totalBytes: size, fileUri: target }));
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         if (item.type === 'video') {
           void generateVideoThumbnail(target)
@@ -1064,6 +1220,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         const oembedTitle = await fetchYoutubeTitle(item.url);
         if (oembedTitle) resolvedTitle = oembedTitle;
       }
+      // (v2.0.12) نحفظ الرابط المباشر فور استخراجه — إيقاف مؤقت لاحق سيستأنف منه بلا استخراج جديد.
+      directUrlRef.current.set(id, mediaUrl);
       const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
       // يوتيوب غالباً يبث بدون ترويسة طول أثناء التنزيل نفسه — نستخدم طول HEAD كمرجع للنسبة.
       remoteLengthRef.current = remoteInfo.length ?? null;
@@ -1130,8 +1288,18 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       try {
         const savedRaw = await AsyncStorage.getItem(RESUME_KEY_PREFIX + id);
         if (savedRaw) {
-          const saved = JSON.parse(savedRaw) as { url?: string; fileUri?: string; resumeData?: string };
-          if (saved?.url === mediaUrl && saved.fileUri) {
+          const saved = JSON.parse(savedRaw) as { url?: string; fileUri?: string; resumeData?: string; __directUrl?: string };
+          // (v2.0.12) الاستئناف الحقيقي: الرابط المباشر المحفوظ يُعتمد مباشرة حتى لو
+          // تغيّر mediaUrl المستخرج حديثاً (يوتيوب يغيّر روابطه في كل استخراج).
+          if (saved?.__directUrl && saved.fileUri) {
+            const partial = await FileSystem.getInfoAsync(saved.fileUri);
+            if (partial.exists) {
+              mediaUrl = saved.__directUrl;
+              target = saved.fileUri;
+              resumable = FileSystem.createDownloadResumable(saved.__directUrl, saved.fileUri, {}, onProgress, saved.resumeData);
+              resumedFromPause = true;
+            }
+          } else if (saved?.url === mediaUrl && saved.fileUri) {
             const partial = await FileSystem.getInfoAsync(saved.fileUri);
             if (partial.exists) {
               target = saved.fileUri;
@@ -1164,6 +1332,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         if (!resumedFromPause) throw resumeError;
         // الخادم لا يدعم الاستئناف من نقطة التوقف — نمسح الجزء المحمّل ونعيد من الصفر.
         await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
+        directUrlRef.current.delete(id);
         try {
           const partial = await FileSystem.getInfoAsync(target);
           if (partial.exists) await FileSystem.deleteAsync(target, { idempotent: true });
@@ -1187,6 +1356,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         bytesRef.current.delete(id);
       }
       const finalBytes = bytesRef.current.get(id);
+      // (v2.0.12) الرابط المباشر يُمسح فقط بعد انتهاء حقيقي (نجاح/فشل) — الإيقاف يحتاجه.
+      if (result) directUrlRef.current.delete(id);
 
       if (!result) {
         // المهمة توقفت مؤقتاً بطلب المستخدم أو أُلغيت (حذف من القائمة) — لا تعتبر فشلاً.
@@ -1228,6 +1399,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           error: mirrored ? undefined : 'الملف محفوظ في مساحة التطبيق — لم نستطع نسخه إلى مجلد الجهاز',
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalBytes?.bytesWritten, totalBytes: finalBytes?.totalBytes, fileUri: target }));
         // توليد صورة مصغّرة للفيديو في الخلفية — فشلها لا يؤثر على اكتمال الملف.
         if (item.type === 'video') {
           void generateVideoThumbnail(target)
@@ -1236,16 +1408,19 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
       } else {
         await patchItem(id, { status: 'failed', error: `تعذر تنزيل الملف (رمز ${result?.status ?? 'مجهول'}).` });
+        void upsertHistoryEntry(historyEntryOf({ ...item, status: 'failed' }));
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       }
     } catch (err) {
       resumablesRef.current.delete(id);
       progressRef.current.delete(id);
       bytesRef.current.delete(id);
+      directUrlRef.current.delete(id);
       await patchItem(id, {
         status: 'failed',
         error: err instanceof Error ? err.message : 'فشل التنزيل. تحقق من الرابط والاتصال ثم حاول مرة أخرى.',
       });
+      void upsertHistoryEntry(historyEntryOf({ ...item, status: 'failed' }));
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     } finally {
       activeIdsRef.current.delete(id);
@@ -1341,6 +1516,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           .sort((a, b) => b.createdAt - a.createdAt);
         itemsRef.current = merged;
         setItems(merged);
+        // (v2.0.12) مزامنة أولية لقاعدة السجل في DownloadMax/db/downloads.db
+        void syncHistorySnapshot(merged.filter((entry) => !entry.deletedAt).map(historyEntryOf));
+        // (v2.0.12) تصحيح عناوين الهاش القديمة من الخادم في الخلفية
+        void restoreLegacyHashTitles(merged.filter((entry) => !entry.deletedAt && entry.status === 'completed'), patchItem);
 
         for (const item of merged) {
           if (item.status === 'downloading' || item.status === 'queued') {
@@ -1570,6 +1749,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item) return;
     if (item.status === 'downloading' || item.status === 'queued') return;
+    directUrlRef.current.delete(id);
     patchItem(id, { status: 'queued', progress: 0, error: undefined });
     enqueue(id);
   }, [patchItem, enqueue]);
@@ -1590,8 +1770,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pauseRequestedRef.current.add(id);
     try {
       const state = await resumable.pauseAsync();
-      await AsyncStorage.setItem(RESUME_KEY_PREFIX + id, JSON.stringify(state));
+      // (v2.0.12) نحفظ الرابط المباشر مع الحالة — الاستئناف سيستخدمه مباشرة بلا استخراج جديد.
+      const directUrl = directUrlRef.current.get(id);
+      await AsyncStorage.setItem(
+        RESUME_KEY_PREFIX + id,
+        JSON.stringify(directUrl ? { ...state, __directUrl: directUrl } : state),
+      );
       patchItem(id, { status: 'paused', error: undefined });
+      void upsertHistoryEntry(historyEntryOf({ ...item, status: 'paused' }));
     } catch {
       pauseRequestedRef.current.delete(id);
       // تعذر الإيقاف — يكمل التنزيل تلقائياً.
@@ -1621,6 +1807,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
     progressRef.current.delete(id);
     bytesRef.current.delete(id);
+    directUrlRef.current.delete(id);
     patchItem(id, { deletedAt: Date.now(), status: 'completed', error: undefined, inVault: false });
   }, [patchItem]);
 
@@ -1642,6 +1829,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
     }
     commit((current) => current.filter((entry) => entry.id !== id));
+    void deleteHistoryEntry(id);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   }, [commit]);
 
@@ -1659,6 +1847,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }
     }
     commit((current) => current.filter((item) => !item.deletedAt));
+    for (const item of trashed) void deleteHistoryEntry(item.id);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   }, [commit]);
 
