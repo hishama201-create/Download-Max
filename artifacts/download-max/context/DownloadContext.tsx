@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 // واجهة الملفات الحديثة: النسخ عبر تدفق أصلي (Native Stream) يدعم وجهات SAF content://.
-import { File as NativeFile } from 'expo-file-system';
+import { Directory as NativeDirectory, File as NativeFile } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
@@ -16,6 +16,8 @@ import { generateVideoThumbnail } from '@/context/thumbnails';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
+/** مفتاح حفظ روابط مجلدات الأنواع الثلاثة (SAF) المربوطة بجذر مختار معيّن (إصلاح v2.0.10). */
+const SAF_FOLDERS_KEY_PREFIX = '@download-max/saf-folders/';
 /** مفتاح حفظ نقطة استئناف كل مهمة متوقفة مؤقتاً (جزء الملف المحمّل). */
 const RESUME_KEY_PREFIX = '@download-max/resume/';
 /** مدة بقاء الملفات في سلة المحذوفات قبل حذفها تلقائياً (30 يوماً). */
@@ -299,6 +301,26 @@ function subfolderFor(type: MediaType): string {
 
 /** اسم مجلد التنزيلات الافتراضي. */
 const APP_DIR_NAME = 'Download Max';
+/**
+ * (v2.0.10) هل هذا الرابط يشير لمجلد اسمه «Download Max» أصلاً؟
+ * نقرأ معرّف المستند من الرابط (primary:Download Max مثلاً) بعد فك الترميز —
+ * لأن الجزء الأخير من روابط SAF قد يكون معرّفاً رقمياً لا اسماً حقيقياً.
+ */
+function safUriDisplayName(uri: string): string | null {
+  try {
+    if (!uri.startsWith('content://')) return null;
+    const last = uri.split('/').filter(Boolean).pop() ?? '';
+    let decoded = last;
+    try { decoded = decodeURIComponent(last); } catch { /* الاسم غير مُرمّز */ }
+    // معرف مستند «primary:Download Max» → الاسم بعد النقطتين. معرف شجري «primary:» → جذر التخزين.
+    const tail = decoded.includes(':') ? decoded.split(':').pop() ?? '' : decoded;
+    return tail.trim() || null;
+  } catch { return null; }
+}
+
+function isSafAppRootUri(uri: string): boolean {
+  return safUriDisplayName(uri)?.toLowerCase() === APP_DIR_NAME.toLowerCase();
+}
 /** الجذر العام للتخزين الداخلي في أندرويد — يحتاج صلاحية «الوصول لجميع الملفات». */
 const PUBLIC_ROOT = '/storage/emulated/0/';
 /** مجلد التنزيلات العام في الجهاز. */
@@ -367,7 +389,8 @@ async function pickDeviceDirectory(): Promise<string | null> {
 /**
  * (v2.0.8) مجلد «Download Max» داخل المجلد الذي اختاره المستخدم — المسار الأساسي للتطبيق:
  * «المجلد المختار / Download Max / video · voice · image».
- * يُنشأ مرة واحدة ويُحفظ رابطه، ولا يُعاد إنشاؤه مع كل تنزيل (منع التكرار).
+ * (إصلاح v2.0.10): إذا كان المجلد المختار اسمه «Download Max» أصلاً نستخدمه كما هو
+ * بلا إنشاء مجلد متشابك ثانٍ بداخله.
  */
 let safAppRootCache: string | null = null;
 
@@ -377,6 +400,11 @@ function setSafAppRootCache(uri: string | null): void {
 
 async function safAppRoot(pickedDirUri: string): Promise<string> {
   if (safAppRootCache) return safAppRootCache;
+  // المجلد المختار اسمه «Download Max»؟ إذن هو جذر التطبيق نفسه — لا تعشيش.
+  if (isSafAppRootUri(pickedDirUri)) {
+    safAppRootCache = pickedDirUri;
+    return pickedDirUri;
+  }
   const root = await safSubfolder(pickedDirUri, APP_DIR_NAME);
   setSafAppRootCache(root === pickedDirUri ? null : root);
   return safAppRootCache ?? pickedDirUri;
@@ -447,18 +475,86 @@ async function findSafChildByName(parentUri: string, name: string): Promise<stri
   return null;
 }
 
-async function safSubfolder(directoryUri: string, sub: string): Promise<string> {
-  // (v2.0.8) نبحث أولاً عن المجلد الموجود ونعيد استخدامه — الإنشاء آخر حل.
-  const existing = await findSafChildByName(directoryUri, sub);
-  if (existing) return existing;
-  // واجهة SAF الرسمية: makeDirectoryAsync(المجلد الأب، الاسم) — التلاصق النصي
-  // لا يعمل مع روابط content:// ويجعل إنشاء المجلدات الفرعية يفشل بصمت.
+/**
+ * (v2.0.10) ذاكرة كاش للمجلدات الفرعية ومفتاح الحفظ الدائم الحالي،
+ * حتى لا تُقرأ محتويات المجلد الأب ولا يُستدعى الإنشاء مع كل تنزيل —
+ * هذا هو الحل الجذري لتكرار «video (1)» و«video (2)» على مزودات
+ * يكون فيها الجزء الأخير من روابط العناصر معرّفاً داخلياً لا اسماً،
+ * فيفشل البحث بالاسم ويُنشأ مجلد جديد مع كل ملف (وأندرويد يفصلها تلقائياً بأرقام).
+ */
+let safFoldersKeyCache: string | null = null;
+let safTypeFoldersCache: Map<string, string> | null = null;
+/** أقفال الإنشاء: تمنع سباق تهيئة متزامن من إنشاء نفس المجلد مرتين. */
+const safSubfolderInflight = new Map<string, Promise<string>>();
+
+function clearSafTypeFolderCaches(): void {
+  safFoldersKeyCache = null;
+  safTypeFoldersCache = null;
+  safSubfolderInflight.clear();
+}
+
+/** يحمّل روابط مجلدات الأنواع المحفوظة لهذا الجذر من التخزين الدائم. */
+async function loadSafTypeFolders(safDir: string): Promise<Map<string, string>> {
+  if (safFoldersKeyCache === safDir && safTypeFoldersCache) return safTypeFoldersCache;
+  let saved: Record<string, string> = {};
   try {
-    return await FileSystem.StorageAccessFramework.makeDirectoryAsync(directoryUri, sub);
-  } catch {
-    // قد يكون أُنشئ للتو بسباق مع مهمة أخرى — فحص أخير ثم نكتب في الجذر.
-    const raced = await findSafChildByName(directoryUri, sub);
-    return raced ?? directoryUri;
+    const raw = await AsyncStorage.getItem(SAF_FOLDERS_KEY_PREFIX + safDir);
+    if (raw) saved = JSON.parse(raw) as Record<string, string>;
+  } catch { /* لا حفظ سابق — سننشئه الآن */ }
+  safFoldersKeyCache = safDir;
+  safTypeFoldersCache = new Map(Object.entries(saved));
+  return safTypeFoldersCache;
+}
+
+/** يحفظ روابط مجلدات الأنواع مربوطة بالجذر المختار بشكل دائم. */
+async function persistSafTypeFolders(safDir: string, folders: Map<string, string>): Promise<void> {
+  try {
+    await AsyncStorage.setItem(SAF_FOLDERS_KEY_PREFIX + safDir, JSON.stringify(Object.fromEntries(folders)));
+  } catch { /* فشل الحفظ غير حرج — الكاش بالذاكرة يكفي للجلسة */ }
+}
+
+/** تحقق حي أن رابط المجلد المحفوظ ما زال مقروءاً (لم تنسحب الصلاحية). */
+async function isSafDirAlive(uri: string): Promise<boolean> {
+  try {
+    await FileSystem.StorageAccessFramework.readDirectoryAsync(uri);
+    return true;
+  } catch { return false; }
+}
+
+async function safSubfolder(directoryUri: string, sub: string): Promise<string> {
+  // (v2.0.10) كاش بالذاكرة: بعد أول إنشاء/اكتشاف لا نلمس نظام الملفات لهذا المجلد أبداً.
+  const cached = safTypeFoldersCache?.get(sub);
+  if (cached && safFoldersKeyCache === directoryUri) return cached;
+
+  // (v2.0.10) قفل: استدعاءات متزامنة لنفس المجلد تنتظر نفس العملية بدل سباق إنشاء.
+  const inflight = safSubfolderInflight.get(`${directoryUri}|${sub}`);
+  if (inflight) return inflight;
+
+  const job = (async (): Promise<string> => {
+    const folders = await loadSafTypeFolders(directoryUri);
+    const saved = folders.get(sub);
+    // (v2.0.10) الثقة المطلقة بالرابط المحفوظ إذا كان حياً — بدون أي بحث بالاسم
+    // (البحث يفشل على بعض المزودات لأن آخر جزء بالرابط معرّف داخلي لا اسم).
+    if (saved && safFoldersKeyCache === directoryUri && await isSafDirAlive(saved)) return saved;
+
+    // (v2.0.8) نبحث أولاً عن المجلد الموجود ونعيد استخدامه — الإنشاء آخر حل.
+    const existing = await findSafChildByName(directoryUri, sub);
+    const resolved = existing
+      ?? await FileSystem.StorageAccessFramework.makeDirectoryAsync(directoryUri, sub).catch(async () => {
+        // قد يكون أُنشئ للتو بسباق مع مهمة أخرى — فحص أخير ثم نكتب في الجذر.
+        return await findSafChildByName(directoryUri, sub) ?? directoryUri;
+      });
+    if (resolved !== directoryUri) {
+      folders.set(sub, resolved);
+      await persistSafTypeFolders(directoryUri, folders);
+    }
+    return resolved;
+  })();
+  safSubfolderInflight.set(`${directoryUri}|${sub}`, job);
+  try {
+    return await job;
+  } finally {
+    safSubfolderInflight.delete(`${directoryUri}|${sub}`);
   }
 }
 
@@ -617,13 +713,26 @@ async function streamCopyToSafFile(localUri: string, safFileUri: string): Promis
 }
 
 /** ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم (مكان التنزيل). */
+/** (v2.0.10) تحقق بديل أن مستند SAF الناتج فيه محتوى فعلًا — عبر واجهة الملفات الحديثة. */
+async function isSafFileHasContent(safFileUri: string): Promise<boolean> {
+  try {
+    const size = new NativeFile(safFileUri).size;
+    return typeof size === 'number' && size > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function saveFileToSafDirectory(localUri: string, filename: string, mimeType: string, directoryUri: string): Promise<boolean> {
   let safFileUri: string | null = null;
   try {
     const baseName = filename.replace(/\.[^.]+$/, '') || 'download';
     safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(directoryUri, baseName, mimeType);
     // (v2.0.9) النسخ بالتدفق الأصلي أولاً — يعمل مع أي حجم وبلا كارثة ذاكرة.
+    // (ملاحظة v2.0.10): NativeFile.size قد يقرأ 0 مع بعض مزودات SAF حتى لو نجح
+    // النسخ فعلاً — لذا فشل التتبع وحده لا يلغي النتيجة؛ نتحقق من الملف الناتج بنفسه.
     if (await streamCopyToSafFile(localUri, safFileUri)) return true;
+    if (await isSafFileHasContent(safFileUri)) return true;
     // خطة Base64 أخيرة — للملفات الصغيرة فقط (سابقاً كانت تُجرب مع الكل فتنهار).
     const info = await FileSystem.getInfoAsync(localUri).catch(() => null);
     const size = info?.exists && 'size' in info && typeof info.size === 'number' ? info.size : 0;
@@ -1669,6 +1778,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         setDownloadDirState(stored);
         downloadDirRef.current = stored;
         // تجهيز المسار الأساسي مسبقاً (ذاكرة + مجلدات الأنواع) بلا أي طلب جديد.
+        // (v2.0.10) روابط المجلدات محفوظة دائماً وتُعاد استخدامها مباشرة — لا بحث ولا إنشاء متكرر.
         try {
           const appRoot = await safAppRoot(stored);
           for (const type of ['video', 'image', 'voice'] as MediaType[]) {
@@ -1736,9 +1846,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       await AsyncStorage.removeItem(DOWNLOAD_DIR_KEY).catch(() => undefined);
     }
     // (v2.0.8) نصفّر ذاكرة مجلد «Download Max» عند تغيير الجذر حتى لا يشير لمسار قديم.
-    if (uri) {
-      safAppRootCache = null;
-    }
+    // (إصلاح v2.0.10) نصفّرها أيضاً عند مسح الاختيار (null) وليس فقط عند اختيار جديد،
+    // وإلا بقي الكاش يشير لمجلد جذر لم يعد مصرّحاً بالوصول إليه.
+    safAppRootCache = null;
+    clearSafTypeFolderCaches();
   }, []);
   // نربط المرجع بعد تعريف الدالة حتى يعمل استدعاؤها من initStorage وrunJob.
   setDownloadDirRef.current = setDownloadDir;
