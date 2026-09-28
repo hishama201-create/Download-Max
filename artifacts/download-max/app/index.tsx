@@ -44,7 +44,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.13';
+const APP_VERSION = '2.0.14';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -795,8 +795,97 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
 /** ارتفاع منطقة الإيماءة داخل الصف (الصف الفعلي ~79px + فاصل) — يستخدمه السحب للاتجاهات. */
 const ROW_GESTURE_HEIGHT = 79;
 
-function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected, onSelect, rowGesture }: {
+// (v2.0.14) لمسة التحديد بالسحب — الربط الآمن النهائي: الإيماءة تُبنى داخل مكوّن الصف
+// (مكان قانوني للـ Hooks) عبر custom hook على مستوى الملف، بلا أي استدعاء داخل renderItem.
+// refs الحالة مشتركة على مستوى الملف: مرجع القائمة للتمرير، والحالة قابلة للتعديل من أي صف.
+const listFlatRef = { current: null as FlatList<DownloadItem> | null };
+const listScrollRef = { current: 0 };
+const dragSelectRef = { current: null as { anchorIndex: number; lastId: string | null } | null };
+const autoScrollRef = { current: 0 as 0 | 1 | -1 };
+const scrollTickRef = { current: null as ReturnType<typeof setInterval> | null };
+/** يحدد الصفوف عبر دالة التحديد الخارجية (تُربط من الشاشة). */
+let setSelectionIds: ((fn: (current: Set<string>) => Set<string>) => void) | null = null;
+
+function stopAutoScrollTimer(): void {
+  autoScrollRef.current = 0;
+  if (scrollTickRef.current) {
+    clearInterval(scrollTickRef.current);
+    scrollTickRef.current = null;
+  }
+}
+
+/** إيماءة الصف: ضغطة مطوّلة تفعّل التحديد، والسحب يحدد الصفوف بترتيبها مع تمرير تلقائي. */
+function useRowDragGesture(itemId: string, index: number, items: DownloadItem[]): GestureType {
+  return useMemo(() => {
+    const pan = Gesture.Pan()
+      .activateAfterLongPress(350)
+      .onBegin(() => {
+        dragSelectRef.current = { anchorIndex: index, lastId: itemId };
+      })
+      .onStart(() => {
+        if (dragSelectRef.current) dragSelectRef.current.lastId = itemId;
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        setSelectionIds?.((current) => {
+          const next = new Set(current);
+          next.add(itemId);
+          return next;
+        });
+      })
+      .onUpdate((event) => {
+        const drag = dragSelectRef.current;
+        if (!drag) return;
+        // موضع الإصبع داخل الصف: فوق حدّه = الصفوف قبله، تحته = ما بعده.
+        const step = event.y < 0 ? -1 : event.y > ROW_GESTURE_HEIGHT ? 1 : 0;
+        if (step !== 0) {
+          const start = drag.anchorIndex;
+          const lastIdx = drag.lastId ? items.findIndex((c) => c.id === drag.lastId) : -1;
+          const from = lastIdx >= 0 ? lastIdx : start;
+          const to = Math.max(0, Math.min(items.length - 1, start + step));
+          const lo = Math.min(from, to);
+          const hi = Math.max(from, to);
+          for (let i = lo; i <= hi; i++) {
+            const id = items[i]?.id;
+            if (!id) continue;
+            setSelectionIds?.((current) => {
+              if (current.has(id)) return current;
+              const next = new Set(current);
+              next.add(id);
+              return next;
+            });
+          }
+          drag.lastId = items[to]?.id ?? drag.lastId;
+        }
+        // تمرير تلقائي عند ملامسة الأطراف — مؤقّت خفيف حتى يتوقف السحب.
+        const edge = 40;
+        const dir = event.y < -edge ? 1 : event.y > ROW_GESTURE_HEIGHT + edge ? -1 : 0;
+        autoScrollRef.current = dir;
+        if (dir !== 0 && scrollTickRef.current === null) {
+          scrollTickRef.current = setInterval(() => {
+            const d = autoScrollRef.current;
+            if (d === 0) return;
+            listFlatRef.current?.scrollToOffset({
+              offset: Math.max(0, listScrollRef.current + d * 22),
+              animated: false,
+            });
+          }, 40);
+        }
+      })
+      .onEnd(() => {
+        stopAutoScrollTimer();
+        dragSelectRef.current = null;
+      })
+      .onFinalize(() => {
+        stopAutoScrollTimer();
+        dragSelectRef.current = null;
+      });
+    return pan;
+  }, [itemId, index, items]);
+}
+
+function DownloadRow({ item, index, items, onSelect, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected }: {
   item: DownloadItem;
+  index: number;
+  items: DownloadItem[];
   onRetry: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -807,14 +896,13 @@ function DownloadRow({ item, onRetry, onPause, onResume, onRemove, onShare, onOp
   onMore: () => void;
   selected: boolean;
   onSelect: () => void;
-  rowGesture?: GestureType;
 }) {
-  return rowGesture ? (
+  // (v2.0.14) استدعاء الـ hook داخل جسم المكوّن — قانوني دائماً بلا شروط.
+  const rowGesture = useRowDragGesture(item.id, index, items);
+  return (
     <GestureDetector gesture={rowGesture}>
-    <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} selected={selected} onSelect={onSelect} />
+      <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} selected={selected} onSelect={onSelect} />
     </GestureDetector>
-  ) : (
-    <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} selected={selected} onSelect={onSelect} />
   );
 }
 
@@ -1296,6 +1384,14 @@ export default function HomeScreen() {
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
   const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
+  const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
+  const listScrollRef = useRef<number>(0);
+
+  // (v2.0.14) ربط دالة التحديد المشتركة لحالة الشاشة — الإيماءات في الصفوف تستخدمها.
+  useEffect(() => {
+    setSelectionIds = (fn) => setSelectedIds((current) => fn(current));
+    return () => { setSelectionIds = null; };
+  }, []);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
@@ -1703,95 +1799,6 @@ export default function HomeScreen() {
     return () => subscription.remove();
   }, [panel, activeTab, googleCanGoBack, selectedIds.size]);
 
-  // (v2.0.13) لمسة التحديد بالسحب — إعادة بناء آمنة: الإيماءة تُربط داخل كل صف
-  // على حدة بدل غلاف حول القائمة كاملة (الغلاف كان سبب انهيار دخول التبويب).
-  // الضغطة المطوّلة تفعّل الوضع، والسحب بعدها يحدد الصفوف بترتيبها في القائمة
-  // (للأسفل = ما بعده، للأعلى = ما قبله)، مع تمرير تلقائي عبر onScroll المؤجل.
-  const dragSelectRef = useRef<{ anchorIndex: number | null; lastId: string | null } | null>(null);
-  const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
-  const listScrollRef = useRef<number>(0);
-  const autoScrollRef = useRef<{ dir: 0 | -1 | 1 }>({ dir: 0 });
-  const scrollTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const stopAutoScroll = useCallback(() => {
-    autoScrollRef.current.dir = 0;
-    if (scrollTickRef.current) {
-      clearInterval(scrollTickRef.current);
-      scrollTickRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => stopAutoScroll, [stopAutoScroll]);
-
-  /** إيماءة لكل صف: ضغطة مطوّلة ثم سحب يحدد ما يمر به الإصبع + تمرير تلقائي عند الأطراف. */
-  function useRowDragGesture(item: DownloadItem, index: number) {
-    return useMemo(() => {
-      const pan = Gesture.Pan()
-        .activateAfterLongPress(350)
-        .onBegin(() => {
-          dragSelectRef.current = { anchorIndex: index, lastId: item.id };
-        })
-        .onStart(() => {
-          if (dragSelectRef.current) dragSelectRef.current.lastId = item.id;
-          void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-          setSelectedIds((current) => {
-            const next = new Set(current);
-            next.add(item.id);
-            return next;
-          });
-        })
-        .onUpdate((event) => {
-          const drag = dragSelectRef.current;
-          if (!drag) return;
-          // نحدد حسب موضع الإصبع داخل الصف الحالي: فوق منتصفه = الصفوف قبله، تحته = من بعده.
-          const midY = event.y;
-          const start = drag.anchorIndex ?? index;
-          const step = midY < 0 ? -1 : midY > ROW_GESTURE_HEIGHT ? 1 : 0;
-          if (step !== 0) {
-            const targetIndex = Math.max(0, Math.min(filteredItems.length - 1, start + step));
-            const lastIdx = drag.lastId ? filteredItems.findIndex((c) => c.id === drag.lastId) : -1;
-            const from = Math.min(start, lastIdx >= 0 ? lastIdx : start);
-            const to = targetIndex;
-            const lo = Math.min(from, to);
-            const hi = Math.max(from, to);
-            for (let i = lo; i <= hi; i++) {
-              const id = filteredItems[i]?.id;
-              if (!id) continue;
-              setSelectedIds((current) => {
-                if (current.has(id)) return current;
-                const next = new Set(current);
-                next.add(id);
-                return next;
-              });
-            }
-            drag.lastId = filteredItems[to]?.id ?? drag.lastId;
-          }
-          // تمرير تلقائي عند ملامسة الأطراف (يُنفَّذ بمؤقّت بسيط حتى يتوقف السحب).
-          const edge = 40;
-          const dir = event.y < -edge ? 1 : event.y > ROW_GESTURE_HEIGHT + edge ? -1 : 0;
-          autoScrollRef.current.dir = dir;
-          if (dir !== 0 && scrollTickRef.current === null) {
-            scrollTickRef.current = setInterval(() => {
-              const d = autoScrollRef.current.dir;
-              if (d === 0) return;
-              listFlatRef.current?.scrollToOffset({
-                offset: Math.max(0, listScrollRef.current + d * 22),
-                animated: false,
-              });
-            }, 40);
-          }
-        })
-        .onEnd(() => {
-          stopAutoScroll();
-          dragSelectRef.current = null;
-        })
-        .onFinalize(() => {
-          stopAutoScroll();
-          dragSelectRef.current = null;
-        });
-      return pan;
-    }, [item.id, index, filteredItems, stopAutoScroll]);
-  }
 
   /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
   function toggleSelection(id: string) {
@@ -2014,7 +2021,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item, index }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} rowGesture={useRowDragGesture(item, index)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
+            renderItem={({ item, index }) => <DownloadRow item={item} index={index} items={filteredItems} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
           </View>
