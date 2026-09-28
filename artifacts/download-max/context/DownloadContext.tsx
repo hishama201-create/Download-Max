@@ -508,18 +508,12 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
     const dir = await snaptubeTypeDir(type);
     if (dir) {
       try {
-        await FileSystem.moveAsync({ from: localUri, to: `${dir}${filename}` });
+        // (v2.0.15) نسخ لا نقل: الأصل يبقى داخل مساحة التطبيق لأن item.fileUri
+        // يشير إليه — النقلة كانت تترك مساراً ميتاً، فيفشل فتح الملف ويختفي عن التطبيق.
+        await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
         return true;
-      } catch (moveError) {
-        console.error('[v2.0.12] فشل النقل المباشر إلى هيكل Snaptube:', moveError);
-        // فشل النقل (قفل ملف مثلًا)؟ نجرّب نسخاً ثم نحذف الأصل.
-        try {
-          await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
-          await FileSystem.deleteAsync(localUri, { idempotent: true }).catch(() => undefined);
-          return true;
-        } catch (copyError) {
-          console.error('[v2.0.12] فشل النسخ أيضاً إلى هيكل Snaptube:', copyError);
-        }
+      } catch (copyError) {
+        console.error('[v2.0.15] فشل النسخ إلى هيكل Snaptube:', copyError);
       }
     }
   }
@@ -989,6 +983,10 @@ async function openWithViewer(item: DownloadItem) {
   const mime = mimeFor(item.fileUri) !== '*/*'
     ? mimeFor(item.fileUri)
     : item.type === 'image' ? 'image/*' : item.type === 'audio' ? 'audio/*' : 'video/*';
+  // (v2.0.15) لا نطلق مشغّلاً على مسار ميت — إطلاق IntentLauncher على ملف
+  // غير موجود سبب معروف لتجميد/سقوط التطبيق على أندرويد.
+  const fileInfo = await FileSystem.getInfoAsync(item.fileUri).catch(() => null);
+  if (!fileInfo?.exists) return;
   try {
     await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
       data: `content://${applicationId}.SharingFileProvider/expo_files/${relative}`,
@@ -1170,7 +1168,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           totalBytes: size,
           fileUri: target,
           // (v2.0.11) فشل النسخ إلى مجلد الجهاز لا يمرّ بصمت — الملف محفوظ في مساحة التطبيق وننبه المستخدم.
-          error: mirrored ? undefined : 'الملف محفوظ في مساحة التطبيق — لم نستطع نسخه إلى مجلد الجهاز',
+          error: mirrored ? undefined : 'محفوظ داخل التطبيق — امنح صلاحية «الوصول لجميع الملفات» ليظهر في مجلد الجهاز',
         });
         void upsertHistoryEntry(historyEntryOf({ ...item, status: 'completed', progress: 1, bytesWritten: size, totalBytes: size, fileUri: target }));
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -1396,7 +1394,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           title: resolvedTitle,
           format: finalFormat,
           // (v2.0.11) تنبيه شفاف: فشل النسخ المطابق لا يبقى صامتاً.
-          error: mirrored ? undefined : 'الملف محفوظ في مساحة التطبيق — لم نستطع نسخه إلى مجلد الجهاز',
+          error: mirrored ? undefined : 'محفوظ داخل التطبيق — امنح صلاحية «الوصول لجميع الملفات» ليظهر في مجلد الجهاز',
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalBytes?.bytesWritten, totalBytes: finalBytes?.totalBytes, fileUri: target }));
@@ -1769,13 +1767,17 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (!resumable) return;
     pauseRequestedRef.current.add(id);
     try {
-      const state = await resumable.pauseAsync();
+      // (v2.0.15) بعض الأجهزة لا تعيد حالة الاستئناف من الوحدة الأصلية؛
+      // كتابة قيمة فارغة كانت تُسقط التطبيق — نتخطّىها بدل ذلك.
+      const state = (await resumable.pauseAsync().catch(() => undefined)) as { fileUri?: string } | undefined;
       // (v2.0.12) نحفظ الرابط المباشر مع الحالة — الاستئناف سيستخدمه مباشرة بلا استخراج جديد.
       const directUrl = directUrlRef.current.get(id);
-      await AsyncStorage.setItem(
-        RESUME_KEY_PREFIX + id,
-        JSON.stringify(directUrl ? { ...state, __directUrl: directUrl } : state),
-      );
+      if (state?.fileUri) {
+        await AsyncStorage.setItem(
+          RESUME_KEY_PREFIX + id,
+          JSON.stringify(directUrl ? { ...state, __directUrl: directUrl } : state),
+        );
+      }
       patchItem(id, { status: 'paused', error: undefined });
       void upsertHistoryEntry(historyEntryOf({ ...item, status: 'paused' }));
     } catch {
