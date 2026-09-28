@@ -240,6 +240,23 @@ function safeFilename(title: string, format: string) {
   return `${cleaned}.${format}`;
 }
 
+/**
+ * (v2.0.17) اسم غير مكرر داخل المجلد: لو الملف موجود يُرقّم تلقائياً
+ * «اسم (1).mp4» بدل الكتابة فوق ملف المستخدم القديم.
+ */
+async function uniqueFilename(dir: string, filename: string): Promise<string> {
+  const dot = filename.lastIndexOf('.');
+  const stem = dot > 0 ? filename.slice(0, dot) : filename;
+  const ext = dot > 0 ? filename.slice(dot) : '';
+  let candidate = filename;
+  let n = 1;
+  for (;;) {
+    const info = await FileSystem.getInfoAsync(`${dir}${candidate}`).catch(() => null);
+    if (!info?.exists) return candidate;
+    candidate = `${stem} (${n++})${ext}`;
+  }
+}
+
 /** يحاول استخراج اسم ملف مقروء من مسار الرابط المباشر. */
 /**
  * (v2.0.16) بعض خدمات الاستخراج ترجع رابطاً وهمياً (مثل link.invalid) بدل رابط حقيقي،
@@ -1186,12 +1203,17 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!/^https?:\/\//i.test(item.url)) {
         // الاسم الأصلي من نظام المشاركة محفوظ في العنوان، ونضمن امتداداً صالحاً دائماً.
         const filename = safeFilename(item.title, extensionFor(mimeFor(item.format), item.title, item.type));
-        const typeDir = await ensureTypeDir(baseDirectory, item.type);
-        const target = `${typeDir || baseDirectory}${filename}`;
+        // (v2.0.17) عند توفر الصلاحية: النسخة تذهب مباشرة لمجلد الجهاز — بلا نسخة داخلية ولا نقل.
+        const publicDir = Platform.OS === 'android' && (await hasStorageAccess())
+          ? await snaptubeTypeDir(item.type)
+          : null;
+        const typeDir = publicDir ?? await ensureTypeDir(baseDirectory, item.type);
+        const finalName = await uniqueFilename(typeDir || baseDirectory, filename);
+        const target = `${typeDir || baseDirectory}${finalName}`;
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
-        const mirrored = await mirrorToDeviceDownloads(target, filename, item.type, downloadDirRef.current);
+        const mirrored = publicDir ? true : await mirrorToDeviceDownloads(target, finalName, item.type, downloadDirRef.current);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1240,8 +1262,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // (v2.0.16) رابط وهمي من خدمة الاستخراج — لا نبدأ تنزيلاً محكوماً بالفشل.
         throw new Error('الخدمة لم ترجع رابطاً صالحاً — جرّب جودة أخرى أو رابطاً بديلاً');
       }
-      const initialTypeDir = await ensureTypeDir(baseDirectory, item.type);
-      let target = `${initialTypeDir || baseDirectory}${safeFilename(item.title, item.format)}`;
+      // (v2.0.17) الوجهة الفعلية: مجلد الجهاز مباشرة عند توفر الصلاحية — الملف ينزل
+      // في مكانه الصحيح من البداية (هيكل Snaptube)، بلا نسخة داخلية ولا نقل ولا خطأ أحمر.
+      const publicDest = Platform.OS === 'android' && (await hasStorageAccess())
+        ? await snaptubeTypeDir(item.type)
+        : null;
+      const initialTypeDir = publicDest ?? await ensureTypeDir(baseDirectory, item.type);
+      let target = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(item.title, item.format))}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
       let resolvedTitle = item.title;
@@ -1405,21 +1432,25 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         let finalFormat = resolvedFormat;
         const uriExt = result.uri.split('.').pop()?.toLowerCase();
         if (uriExt && /^[a-z0-9]{2,5}$/i.test(uriExt) && MIME_TYPES[uriExt]) finalFormat = uriExt;
-        const finalFilename = safeFilename(resolvedTitle, finalFormat);
-        if (result.uri !== `${baseDirectory}${finalFilename}`) {
+        const finalFilename = await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, finalFormat));
+        if (result.uri !== `${initialTypeDir}${finalFilename}`) {
           try {
-            await FileSystem.moveAsync({ from: result.uri, to: `${baseDirectory}${finalFilename}` });
+            await FileSystem.moveAsync({ from: result.uri, to: `${initialTypeDir}${finalFilename}` });
           } catch {
             // نُبقي المسار الأصلي عند تعذر النقل.
           }
         }
-        target = `${baseDirectory}${finalFilename}`;
-        let safNow = downloadDirRef.current;
-        if (!safNow && Platform.OS === 'android' && !(await hasStorageAccess())) {
-          // أول تنزيل بلا إعداد سابق: نطلب اختيار مجلد التنزيل مرة واحدة تلقائياً.
-          safNow = await requestAndStoreDeviceDir(setDownloadDirRef.current, null);
+        target = `${initialTypeDir}${finalFilename}`;
+        // (v2.0.17) نزّلنا مباشرة في مجلد الجهاز؟ لا نسخ مزدوج إطلاقاً.
+        let mirrored = true;
+        if (!publicDest) {
+          let safNow = downloadDirRef.current;
+          if (!safNow && Platform.OS === 'android' && !(await hasStorageAccess())) {
+            // أول تنزيل بلا إعداد سابق: نطلب اختيار مجلد التنزيل مرة واحدة تلقائياً.
+            safNow = await requestAndStoreDeviceDir(setDownloadDirRef.current, null);
+          }
+          mirrored = await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
         }
-        const mirrored = await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -2071,7 +2102,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const known = new Set(itemsRef.current.map((item) => item.fileUri));
     // نفحص مجلد التنزيلات في الجهاز إن كانت الصلاحية متاحة، ومجلد التطبيق دائماً.
     const roots: string[] = [await baseDownloadDir()].filter(Boolean) as string[];
-    if (await hasStorageAccess()) roots.unshift(await publicDownloadRoot());
+    if (await hasStorageAccess()) {
+      roots.unshift(await publicDownloadRoot());
+      // (v2.0.17) هيكل Snaptube: DownloadMax/download/DownloadMax Video|Music|Image
+      const snaptubeRoot = `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/`;
+      const snaptubeInfo = await FileSystem.getInfoAsync(snaptubeRoot).catch(() => null);
+      if (snaptubeInfo?.exists) roots.unshift(snaptubeRoot);
+    }
     const uris: string[] = [];
     for (const root of roots) uris.push(...(await mediaFilesIn(root)));
     const adopted: DownloadItem[] = [];

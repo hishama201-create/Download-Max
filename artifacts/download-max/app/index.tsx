@@ -44,7 +44,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.16';
+const APP_VERSION = '2.0.17';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1645,8 +1645,9 @@ export default function HomeScreen() {
   }
 
   // الوجهة الحقيقية لملفات المستخدم: المسار العام إن سارِ الإذن، وإلا المجلد المختار مرة واحدة.
+  // (v2.0.17) المسار الفعلي الحالي: هيكل DownloadMax/download — نفس وجهة كل تنزيل جديد.
   const deviceSavePath = publicSaveOk
-    ? '/storage/emulated/0/Download/Download Max'
+    ? '/storage/emulated/0/DownloadMax/download'
     : downloadDir
       ? `${dirLabel(downloadDir)} · محفوظ ✓`
       : null;
