@@ -181,6 +181,7 @@ type DownloadContextValue = {
   shareFile: (item: DownloadItem) => Promise<void>;
   /** (2) ينسخ الملف من مساحة التطبيق إلى مجلد التنزيلات الحقيقي في جهاز المستخدم. */
   copyToDeviceDownloads: (item: DownloadItem) => Promise<{ ok: boolean; message: string }>;
+  syncPendingToDevice: () => Promise<number>;
   enableDeviceAutoSave: () => Promise<{ ok: boolean; where: string | null; message: string }>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
@@ -240,6 +241,25 @@ function safeFilename(title: string, format: string) {
 }
 
 /** يحاول استخراج اسم ملف مقروء من مسار الرابط المباشر. */
+/**
+ * (v2.0.16) بعض خدمات الاستخراج ترجع رابطاً وهمياً (مثل link.invalid) بدل رابط حقيقي،
+ * فيبدأ التنزيل ويفشل بلا أمل وتكرار المحاولة يفشل بنفس الشكل. نرفضه مبكراً برسالة واضحة.
+ */
+function isUsableMediaUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (!host.includes('.')) return false;
+    if (host === 'link.invalid' || host.endsWith('.invalid')) return false;
+    if (host === 'example.com' || host.endsWith('.example.com') || host.endsWith('.example')) return false;
+    if (host === 'localhost' || host === '127.0.0.1') return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function prettyNameFromUrl(url: string): string | null {
   try {
     const last = new URL(url).pathname.split('/').filter(Boolean).pop();
@@ -589,6 +609,17 @@ async function restoreLegacyHashTitles(
   for (const item of items) {
     if (item.status !== 'completed' || !item.resolvedUrl && !/^https?:\/\//i.test(item.url)) continue;
     if (looksLikeHumanName(item.title)) continue;
+    // (v2.0.16) يوتيوب أولاً: عنوان الصفحة هو الاسم الحقيقي (للصوت والصور معاً)،
+    // فالرابط المباشر للصيغة often بلا اسم مفيد («54394» أو بصمة).
+    if (isYoutubeUrl(item.url)) {
+      try {
+        const ytTitle = await fetchYoutubeTitle(item.url);
+        if (ytTitle && looksLikeHumanName(ytTitle)) {
+          await patchItem(item.id, { title: ytTitle.slice(0, 80) });
+          continue;
+        }
+      } catch { /* نكمل للمصدر التالي */ }
+    }
     try {
       const candidate = await fetchRemoteFileInfo(item.url);
       const name = candidate.filename ?? prettyNameFromUrl(item.url);
@@ -1204,6 +1235,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
       } else {
         [mediaUrl] = await resolveMediaUrls(item.url, item.requestOptions);
+      }
+      if (!isUsableMediaUrl(mediaUrl)) {
+        // (v2.0.16) رابط وهمي من خدمة الاستخراج — لا نبدأ تنزيلاً محكوماً بالفشل.
+        throw new Error('الخدمة لم ترجع رابطاً صالحاً — جرّب جودة أخرى أو رابطاً بديلاً');
       }
       const initialTypeDir = await ensureTypeDir(baseDirectory, item.type);
       let target = `${initialTypeDir || baseDirectory}${safeFilename(item.title, item.format)}`;
@@ -2116,6 +2151,28 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   }, [setDownloadDir]);
 
   /**
+   * (v2.0.16) بعد منح صلاحية «الوصول لجميع الملفات» نُعيد محاولة نقل كل ملف بقي
+   * داخل التطبيق فقط، ونمسح الخطأ الأحمر عنه — تلقائياً عند رجوع المستخدم للتطبيق.
+   */
+  const syncPendingToDevice = useCallback(async (): Promise<number> => {
+    if (Platform.OS !== 'android' || !(await hasStorageAccess())) return 0;
+    const pending = itemsRef.current.filter(
+      (entry) => entry.status === 'completed' && !!entry.fileUri && !!entry.error?.includes('الوصول لجميع الملفات'),
+    );
+    let moved = 0;
+    for (const entry of pending) {
+      const source = entry.fileUri;
+      if (!source) continue;
+      const filename = source.split('/').pop() ?? 'file';
+      if (await mirrorToDeviceDownloads(source, filename, entry.type, downloadDirRef.current)) {
+        patchItem(entry.id, { error: undefined });
+        moved += 1;
+      }
+    }
+    return moved;
+  }, [patchItem]);
+
+  /**
    * تفعيل الحفظ التلقائي في مجلد التنزيلات الحقيقي بجهاز المستخدم — مرة واحدة فقط:
    * 1) إن سارت صلاحية «الوصول لجميع الملفات» نستخدم «Download/Download Max» بلا أي خطوة.
    * 2) وإلا نفتح منتقي المجلدات الرسمي مرة واحدة ونحفظ اختياره، وبعدها كل تنزيل
@@ -2184,6 +2241,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     setDownloadDir,
     refreshFromDevice,
     copyToDeviceDownloads,
+    syncPendingToDevice,
     enableDeviceAutoSave,
     restoreFromTrash,
     deletePermanently,
@@ -2194,7 +2252,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     pauseDownload,
     resumeDownload,
     removeDownload,
-    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, copyToDeviceDownloads, enableDeviceAutoSave]);
+    clearCompleted, openFile, shareFile, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, copyToDeviceDownloads, syncPendingToDevice, enableDeviceAutoSave]);
 
   return <DownloadContext.Provider value={value}>{children}</DownloadContext.Provider>;
 }

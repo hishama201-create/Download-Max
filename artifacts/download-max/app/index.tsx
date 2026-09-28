@@ -35,7 +35,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, ensureDownloadFolders } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, ensureDownloadFolders, openAllFilesAccessSettings } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 /** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
@@ -44,7 +44,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.15';
+const APP_VERSION = '2.0.16';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -797,7 +797,13 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
 // التحديد باقٍ عبر الضغطة المطوّلة على الصف (Pressable عادي، بلا طبقة إيماءة).
 
 
-function DownloadRow({ item, onSelect, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected }: {
+/**
+ * (v2.0.16) عزل المقاطع اللاتينية/الأرقام داخل السطر العربي (LRI…PDI).
+ * بدونها كان RTL يعكس «4.9 MB / 55.0 MB» فيظهر «MB 4.9».
+ */
+const ltr = (value: string) => `\u2066${value}\u2069`;
+
+function DownloadRow({ item, onSelect, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, onGrantStorage, selected }: {
   item: DownloadItem;
   onRetry: () => void;
   onPause: () => void;
@@ -807,17 +813,18 @@ function DownloadRow({ item, onSelect, onRetry, onPause, onResume, onRemove, onS
   onOpen: () => void;
   onVault: () => void;
   onMore: () => void;
+  onGrantStorage: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
   // (v2.0.15) بلا غلاف إيماءة: الصف عنصر عادي وأي ضغطة تصل للزر مباشرة.
   return (
-    <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} selected={selected} onSelect={onSelect} />
+    <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} onGrantStorage={onGrantStorage} selected={selected} onSelect={onSelect} />
   );
 }
 
 /** جسم الصف نفسه — منفصل حتى نلفّه بالإيماءة فقط عند توفرها. */
-function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected, onSelect }: {
+function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, onGrantStorage, selected, onSelect }: {
   item: DownloadItem;
   onRetry: () => void;
   onPause: () => void;
@@ -827,6 +834,7 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
   onOpen: () => void;
   onVault: () => void;
   onMore: () => void;
+  onGrantStorage: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -843,6 +851,10 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
         : isActive
           ? `جارٍ التحميل · ${percentLabel(item)}`
           : 'في الانتظار';
+  // (v2.0.16) الصور: ملفها داخل التطبيق نفسه هو الصورة المصغّرة — بلا توليد إضافي.
+  const thumbSource = item.thumbnailUri ?? (item.type === 'image' && item.fileUri ? item.fileUri : null);
+  // (v2.0.16) من Astraر لازم: زر فتح إعدادات الصلاحية العام مباشرة.
+  const needsStorageGrant = !!item.error && item.error.includes('الوصول لجميع الملفات');
   return (
     <Pressable
       onLongPress={onSelect}
@@ -855,9 +867,9 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
           <Feather name="check" size={13} color="#fff" />
         </View>
       ) : null}
-      {item.status === 'completed' && item.thumbnailUri ? (
+      {item.status === 'completed' && thumbSource ? (
         <View style={[styles.fileThumbWrap, { backgroundColor: colors.muted }]}>
-          <Image source={{ uri: item.thumbnailUri }} style={styles.fileThumbImage} resizeMode="cover" />
+          <Image source={{ uri: thumbSource }} style={styles.fileThumbImage} resizeMode="cover" />
           {item.type === 'video' ? (
             <View style={styles.fileThumbBadge}>
               <Feather name="play" size={10} color="#fff" />
@@ -879,9 +891,9 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
       <View style={styles.rowBody}>
         <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
         <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
-          {typeLabels[item.type]} · {item.format.toUpperCase()} · {statusLabel}
-          {(isActive || isPaused) && item.bytesWritten ? ` · ${formatBytes(item.bytesWritten)}` : ''}
-          {item.totalBytes ? ` / ${formatBytes(item.totalBytes)}` : ''}
+          {typeLabels[item.type]} · {ltr(item.format.toUpperCase())} · {statusLabel}
+          {(isActive || isPaused) && item.bytesWritten ? ` · ${ltr(formatBytes(item.bytesWritten))}` : ''}
+          {item.totalBytes ? ` / ${ltr(formatBytes(item.totalBytes))}` : ''}
         </Text>
         {isActive || isPaused ? (
           <View style={styles.progressLine}>
@@ -897,7 +909,16 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
             ) : null}
           </View>
         ) : item.error ? (
-          <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
+          <View style={styles.errorRow}>
+            <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
+            {/* (v2.0.16) بدل جملة حمراء ميتة: زر يفتح إعدادات «الوصول لجميع الملفات». */}
+            {needsStorageGrant ? (
+              <Pressable onPress={onGrantStorage} style={[styles.grantBtn, { borderColor: colors.destructive }]}>
+                <Feather name="shield" size={11} color={colors.destructive} />
+                <Text style={[styles.grantBtnText, { color: colors.destructive }]}>منح الصلاحية</Text>
+              </Pressable>
+            ) : null}
+          </View>
         ) : null}
       </View>
       <View style={styles.rowActions}>
@@ -1289,7 +1310,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { items, syncPendingToDevice, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1664,6 +1685,9 @@ export default function HomeScreen() {
       const publicOk = Platform.OS === 'android' && (await hasStorageAccess());
       setPublicSaveOk(publicOk);
       if (publicOk) {
+        // (v2.0.16) الصلاحية أُعطيت للتو؟ ننقل ما بقي داخل التطبيق ونمسح الخطأ الأحمر.
+        const moved = await syncPendingToDevice();
+        if (!cancelled && moved > 0) setNotice(`نُقل ${moved} ملف إلى مجلد الجهاز ✓`);
         const added = await refreshFromDevice();
         if (!cancelled && added > 0) setNotice(`استرجعنا ${added} ملف من تخزين الجهاز 📁`);
       }
@@ -1676,7 +1700,7 @@ export default function HomeScreen() {
       cancelled = true;
       subscription.remove();
     };
-  }, [refreshFromDevice]);
+  }, [refreshFromDevice, syncPendingToDevice]);
 
   // زر الرجوع في الجهاز: يغلق اللوحة المفتوحة، ثم يرجع في تاريخ صفحات جوجل،
   // ثم يلغي التحديد، وبعدها يعود للرئيسية — ولا يخرج التطبيق إلا من الصفحة الأولى.
@@ -1925,7 +1949,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
+            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} onGrantStorage={() => { void openAllFilesAccessSettings(); }} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
           </View>
@@ -2400,7 +2424,10 @@ const styles = StyleSheet.create({
   trashEmptyIcon: { width: 74, height: 74, borderRadius: 26, justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
   trashEmptyTitle: { fontSize: 16, fontWeight: '800', marginBottom: 5 },
   trashEmptyHint: { fontSize: 12, textAlign: 'center', lineHeight: 19, paddingHorizontal: 12 },
-  errorText: { fontSize: 10, lineHeight: 14, marginTop: 6 },
+  errorText: { fontSize: 10, lineHeight: 14, marginTop: 6, flexShrink: 1 },
+  errorRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginTop: 2 },
+  grantBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, borderWidth: 1, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
+  grantBtnText: { fontSize: 10, fontWeight: '800' },
   rowActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 5, gap: 1 },
   iconButton: { padding: 7 },
   emptyList: { flexGrow: 1 },
