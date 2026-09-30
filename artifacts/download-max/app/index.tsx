@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.19';
+const APP_VERSION = '2.0.20';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1299,7 +1299,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo, syncPendingToDevice, pickDeviceFolderNow, deviceSaveNeedsFolder } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1320,6 +1320,18 @@ export default function HomeScreen() {
   const [selectedFormat, setSelectedFormat] = useState('mp4');
   const [showFormatSheet, setShowFormatSheet] = useState(false);
   const [rememberFormat, setRememberFormat] = useState(false);
+  // (v2.0.20) إذا فشلت كل مسارات الحفظ العام: نطلب اختيار مجلد مرة واحدة — بلا رسائل حمراء.
+  const deviceFolderPromptedRef = useRef(false);
+  useEffect(() => {
+    if (!deviceSaveNeedsFolder || deviceFolderPromptedRef.current) return;
+    deviceFolderPromptedRef.current = true;
+    setNotice('ملفاتك تُحفظ داخل التطبيق فقط — اختر مجلد الحفظ في جهازك مرة واحدة…');
+    void (async () => {
+      const ok = await pickDeviceFolderNow();
+      setNotice(ok ? 'تم — ملفاتك تُحفظ الآن في مجلد الجهاز ✓' : 'لم يتم اختيار مجلد — الملفات تبقى داخل التطبيق');
+    })();
+  }, [deviceSaveNeedsFolder, pickDeviceFolderNow]);
+
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   // (v2.0.18) نتيجة فحص الرابط: العنوان الحقيقي + الصيغ الفعلية المتاحة لهذا الرابط.
   const [probedTitle, setProbedTitle] = useState<string | null>(null);
@@ -1686,6 +1698,9 @@ export default function HomeScreen() {
     let cancelled = false;
     const check = async () => {
       await ensureDownloadFolders();
+      // (v2.0.20) كل ملف ما زال داخل التطبيق فقط يُنسخ الآن إلى مجلد الجهاز تلقائياً.
+      const moved = await syncPendingToDevice();
+      if (!cancelled && moved > 0) setNotice(`نُسخ ${moved} ملف إلى مجلد الجهاز ✓`);
     };
     void check();
     const subscription = AppState.addEventListener('change', (state) => {
@@ -1695,7 +1710,7 @@ export default function HomeScreen() {
       cancelled = true;
       subscription.remove();
     };
-  }, []);
+  }, [syncPendingToDevice]);
 
   // زر الرجوع في الجهاز: يغلق اللوحة المفتوحة، ثم يرجع في تاريخ صفحات جوجل،
   // ثم يلغي التحديد، وبعدها يعود للرئيسية — ولا يخرج التطبيق إلا من الصفحة الأولى.

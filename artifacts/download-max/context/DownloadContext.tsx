@@ -151,6 +151,8 @@ export type DownloadItem = {
   fileUri?: string;
   error?: string;
   inVault?: boolean;
+  /** (v2.0.20) هل وُجدت نسخة من الملف في مجلد الجهاز؟ يمنع إعادة النسخ مع كل فتح. */
+  deviceSaved?: boolean;
   /** وقت النقل إلى سلة المحذوفات — وجوده يعني أن الملف في السلة. */
   deletedAt?: number;
   /** خيارات طلب الاستخراج (جودة الفيديو أو معدل الصوت المطلوبة). */
@@ -182,6 +184,10 @@ type DownloadContextValue = {
   /** (2) ينسخ الملف من مساحة التطبيق إلى مجلد التنزيلات الحقيقي في جهاز المستخدم. */
   copyToDeviceDownloads: (item: DownloadItem) => Promise<{ ok: boolean; message: string }>;
   syncPendingToDevice: () => Promise<number>;
+  /** (v2.0.20) يفتح منتقي مجلد الجهاز مرة واحدة ثم ينسخ كل ما بقي داخل التطبيق إليه. */
+  pickDeviceFolderNow: () => Promise<boolean>;
+  /** (v2.0.20) صحيح عندما فشلت كل مسارات الحفظ العام — تفتح الواجهة منتقي المجلد. */
+  deviceSaveNeedsFolder: boolean;
   enableDeviceAutoSave: () => Promise<{ ok: boolean; where: string | null; message: string }>;
   /** يستقبل الملف المشارَك من تطبيق آخر ويحفظه مباشرةً. */
   addSharedFile: (contentUri: string, mimeType: string | null, originalName: string | null) => Promise<void>;
@@ -500,7 +506,15 @@ export async function saveToPublicAlbum(localUri: string, filename: string, type
     }
     if (!granted) return false;
     const asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
-    if (!asset) return false;
+    if (!asset) {
+      // (v2.0.20) مسار بديل: نسخ مباشر إلى MediaStore عبر saveToLibraryAsync.
+      try {
+        await MediaLibrary.saveToLibraryAsync(localUri);
+        return true;
+      } catch {
+        return false;
+      }
+    }
     let album = await MediaLibrary.getAlbumAsync(ALBUM_NAME).catch(() => null);
     if (!album) album = await MediaLibrary.createAlbumAsync(ALBUM_NAME, asset, true).catch(() => null);
     else await MediaLibrary.addAssetsToAlbumAsync(asset, album, true).catch(() => undefined);
@@ -1251,6 +1265,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     commit((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   }, [commit]);
 
+  // (v2.0.20) صحيح عندما فشلت كل مسارات الحفظ العام لتنزيل مكتمل —
+  // الواجهة تفتح منتقي المجلد مرة واحدة بدل الفشل الصامت.
+  const [deviceSaveNeedsFolder, setDeviceSaveNeedsFolder] = useState(false);
+
   /** مهمة تنزيل واحدة: تستخرج الرابط المباشر ثم تنزّل مع تتبع التقدم. */
   const runJob = useCallback(async (id: string) => {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
@@ -1285,13 +1303,15 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
-        void mirrorToDeviceDownloads(target, finalName, item.type, downloadDirRef.current);
+        const deviceSaved = await mirrorToDeviceDownloads(target, finalName, item.type, downloadDirRef.current).catch(() => false);
+        if (!deviceSaved) setDeviceSaveNeedsFolder(true);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
           bytesWritten: size,
           totalBytes: size,
           fileUri: target,
+          deviceSaved: deviceSaved || undefined,
         });
         void upsertHistoryEntry(historyEntryOf({ ...item, status: 'completed', progress: 1, bytesWritten: size, totalBytes: size, fileUri: target }));
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -1507,8 +1527,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           }
         }
         target = `${initialTypeDir}${finalFilename}`;
-        // (v2.0.19) نسخة للمجلد العام عبر السلسلة المضمونة — الفشل غير حرج وبلا رسالة.
-        void mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current);
+        // (v2.0.20) نسخة لمجلد الجهاز عبر السلسلة المضمونة — النتيجة تُسجَّل على العنصر
+        // حتى لا تتكرر المحاولة، وفشلها الكلي يفتح منتقي المجلد مرة واحدة بدل الصمت.
+        const deviceSaved = await mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current).catch(() => false);
+        if (!deviceSaved) setDeviceSaveNeedsFolder(true);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1517,6 +1539,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           fileUri: target,
           title: resolvedTitle,
           format: finalFormat,
+          deviceSaved: deviceSaved || undefined,
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalBytes?.bytesWritten, totalBytes: finalBytes?.totalBytes, fileUri: target }));
@@ -1640,20 +1663,20 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         void syncHistorySnapshot(merged.filter((entry) => !entry.deletedAt).map(historyEntryOf));
         // (v2.0.12) تصحيح عناوين الهاش القديمة من الخادم في الخلفية
         void restoreLegacyHashTitles(merged.filter((entry) => !entry.deletedAt && entry.status === 'completed'), patchItem);
-        // (v2.0.18) إصلاح تلقائي لملفات الإصدارات القديمة: العناصر الموسومة بخطأ
-        // «الوصول لجميع الملفات» تُضاف نسختها إلى ألبوم «Download Max» ويمسح الخطأ —
-        // فتظهر في المعرض وملفات الجهاز بدون أي ضغطة من المستخدم.
+        // (v2.0.20) إصلاح تلقائي شامل: كل ملف مكتمل بلا نسخة في مجلد الجهاز
+        // (بما فيها ملفات الإصدارات القديمة الموسومة بالخطأ الأحمر) يُنسخ الآن
+        // عبر السلسلة المضمونة — ويظهر في ملفات الجهاز بدون أي ضغطة.
         if (Platform.OS !== 'web') {
           void (async () => {
             const broken = itemsRef.current.filter(
-              (entry) => entry.status === 'completed' && !!entry.fileUri && !!entry.error?.includes('الوصول لجميع الملفات'),
+              (entry) => entry.status === 'completed' && !!entry.fileUri && !entry.deviceSaved && !entry.inVault && !entry.deletedAt && entry.fileUri.startsWith('file://'),
             );
             for (const entry of broken) {
               const source = entry.fileUri;
               if (!source) continue;
               const filename = source.split('/').pop() ?? 'file';
               const ok = await mirrorToDeviceDownloads(source, filename, entry.type, downloadDirRef.current).catch(() => false);
-              if (ok) patchItem(entry.id, { error: undefined });
+              if (ok) patchItem(entry.id, { error: undefined, deviceSaved: true });
             }
           })();
         }
@@ -2261,26 +2284,48 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   }, [setDownloadDir]);
 
   /**
-   * (v2.0.16) بعد منح صلاحية «الوصول لجميع الملفات» نُعيد محاولة نقل كل ملف بقي
-   * داخل التطبيق فقط، ونمسح الخطأ الأحمر عنه — تلقائياً عند رجوع المستخدم للتطبيق.
+   * (v2.0.20) نسخ كل ملف مكتمل بلا نسخة جهاز إلى المجلد العام عبر السلسلة المضمونة
+   * (All Files → SAF المختار → ألبوم MediaStore → المسار العام). يعيد عدد الملفات
+   * المنقولة، وإن فشلت السلسلة كلياً مع وجود ملفات معلقة يرفع راية اختيار المجلد.
    */
   const syncPendingToDevice = useCallback(async (): Promise<number> => {
-    if (Platform.OS !== 'android' || !(await hasStorageAccess())) return 0;
+    if (Platform.OS === 'web') return 0;
+    let safDirNow = downloadDirRef.current;
+    if (!safDirNow) {
+      safDirNow = (await AsyncStorage.getItem(DOWNLOAD_DIR_KEY).catch(() => null)) ?? null;
+      if (safDirNow) downloadDirRef.current = safDirNow;
+    }
     const pending = itemsRef.current.filter(
-      (entry) => entry.status === 'completed' && !!entry.fileUri && !!entry.error?.includes('الوصول لجميع الملفات'),
+      (entry) => entry.status === 'completed' && !!entry.fileUri && !entry.deviceSaved && !entry.inVault && !entry.deletedAt && entry.fileUri.startsWith('file://'),
     );
     let moved = 0;
     for (const entry of pending) {
       const source = entry.fileUri;
       if (!source) continue;
       const filename = source.split('/').pop() ?? 'file';
-      if (await mirrorToDeviceDownloads(source, filename, entry.type, downloadDirRef.current)) {
-        patchItem(entry.id, { error: undefined });
+      const ok = await mirrorToDeviceDownloads(source, filename, entry.type, safDirNow).catch(() => false);
+      if (ok) {
+        patchItem(entry.id, { error: undefined, deviceSaved: true });
         moved += 1;
       }
     }
+    if (pending.length > 0 && moved === 0) setDeviceSaveNeedsFolder(true);
     return moved;
   }, [patchItem]);
+
+  /**
+   * (v2.0.20) يفتح منتقي مجلد الجهاز مرة واحدة (SAF الرسمي) ثم ينسخ فوراً كل ملف
+   * بقي داخل التطبيق إلى «المختار / Download Max / النوع». يعيد نجاح العملية.
+   */
+  const pickDeviceFolderNow = useCallback(async (): Promise<boolean> => {
+    if (Platform.OS === 'web') return false;
+    const picked = await pickDeviceDirectory();
+    if (!picked) return false;
+    if (picked !== downloadDirRef.current) await setDownloadDir(picked);
+    await syncPendingToDevice();
+    setDeviceSaveNeedsFolder(false);
+    return true;
+  }, [setDownloadDir, syncPendingToDevice]);
 
   /**
    * تفعيل الحفظ التلقائي في مجلد التنزيلات الحقيقي بجهاز المستخدم — مرة واحدة فقط:
@@ -2336,6 +2381,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     addCarouselImages,
     resolveCarouselVideo,
     probeFileSize,
+    pickDeviceFolderNow,
+    deviceSaveNeedsFolder,
   addSharedFile,
   retryDownload,
   pauseDownload,
@@ -2357,7 +2404,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     deletePermanently,
     emptyTrash,
     convertVideoToAudio,
-  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile,
+  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile, deviceSaveNeedsFolder, pickDeviceFolderNow,
     retryDownload,
     pauseDownload,
     resumeDownload,
