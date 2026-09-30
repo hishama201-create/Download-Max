@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.18';
+const APP_VERSION = '2.0.19';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1651,8 +1651,10 @@ export default function HomeScreen() {
     setNotice(result.message);
   }
 
-  // (v2.0.18) الوجهة الحقيقية: ألبوم «Download Max» في المعرض/ملفات الجهاز عبر MediaStore.
-  const deviceSavePath = 'المعرض · ألبوم Download Max (فيديو/صوت/صور)';
+  // (v2.0.19) الوجهة الحقيقية: مجلد «Download Max» داخل المجلد المختار (SAF)، وإلا ألبوم المعرض.
+  const deviceSavePath = downloadDir
+    ? `${dirLabel(downloadDir)} / Download Max`
+    : 'المعرض · ألبوم Download Max';
 
   function vaultAction(item: DownloadItem) {
     void moveToVault(item.id);

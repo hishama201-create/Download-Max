@@ -472,16 +472,32 @@ async function probeStorageAccess(): Promise<string | null> {
   }
 }
 
+/** (v2.0.19) مجلد النوع في هيكل Snaptube العام — يُنشأ تلقائياً إن لم يوجد (لصلاحية All Files). */
+async function snaptubeTypeDir(type: MediaType): Promise<string | null> {
+  try {
+    const dir = `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/${snaptubeSubfolderFor(type)}/`;
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+    return dir;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * (v2.0.18) المحرك الجديد للحفظ العام: نظام أندرويد الرسمي MediaStore عبر expo-media-library
- * (الموجودة أصلاً بالتطبيق) بدل كتابة الملفات المباشرة المعطوبة على أجهزة New Architecture.
- * الألبوم «Download Max» يُنشأ تلقائياً في المعرض/ملفات الجهاز من أول تنزيل وبصلاحية عادية —
- * وعلى أندرويد 13+ بلا أي نافذة إذن. الفشل هنا غير حرج: الملف يبقى محفوظاً في مساحة التطبيق.
+ * (v2.0.18) الحفظ في ألبوم «Download Max» عبر نظام أندرويد الرسمي MediaStore
+ * (expo-media-library الموجودة أصلاً بالتطبيق). بصلاحية وسائط عادية فقط،
+ * وطلب الإذن يُعرض مرة واحدة فقط عندما يمكن عرضه — لا نُزعج مستخدماً رفض سابقاً.
+ * الفشل غير حرج: الملف يبقى محفوظاً في مساحة التطبيق.
  */
 export async function saveToPublicAlbum(localUri: string, filename: string, type: MediaType): Promise<boolean> {
   if (Platform.OS === 'web') return false;
   try {
-    const { granted } = await MediaLibrary.requestPermissionsAsync();
+    const current = await MediaLibrary.getPermissionsAsync().catch(() => null);
+    let granted = !!current?.granted;
+    if (!granted && current?.canAskAgain) {
+      granted = !!(await MediaLibrary.requestPermissionsAsync().catch(() => null))?.granted;
+    }
     if (!granted) return false;
     const asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
     if (!asset) return false;
@@ -542,23 +558,34 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
 }
 
 /**
- * الحفظ التلقائي في مجلد التنزيلات الحقيقي بجهاز المستخدم، دون أي اختيار يدوي:
- * 1) المسار العام «Download/Download Max» إن كانت صلاحية الوصول سارية،
- * 2) وإلا «Download Max» داخل المجلد الذي اختاره المستخدم مرة واحدة (SAF).
- * يرجع true إذا حُفظ الملف فعلاً.
+ * (v2.0.19) سلسلة الحفظ في جهاز المستخدم بالترتيب المضمون — كل مسار صامت عند فشله:
+ * 1) «الوصول لجميع الملفات» متاح؟ نسخة في هيكل DownloadMax/download/… (الأفضل — ملف حقيقي).
+ * 2) المستخدم اختار مجلداً مرة واحدة (SAF)؟ نسخة في «المختار / Download Max / النوع» — مضمون
+ *    لأن صلاحية الشجرة محفوظة (أثبتت نجاحها بإنشائها المجلدات).
+ * 3) وإلا ألبوم «Download Max» عبر MediaStore (المعرض) بصلاحية وسائط عادية.
+ * 4) أخيراً المسار العام «Download/Download Max» إن سارت الصلاحية المباشرة.
+ * الأصل يبقى دائماً في مساحة التطبيق (fileUri يشير إليه) — والفشل الكلي لا يعرض أي خطأ.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
-  // (v2.0.18) المسار الأساسي: ألبوم «Download Max» عبر MediaStore — بلا صلاحية خاصة
-  // وبلا كتابة مباشرة معطوبة. الأصل يبقى في مساحة التطبيق (fileUri يشير إليه).
-  if (await saveToPublicAlbum(localUri, filename, type)) return true;
-  // (إصلاح v2.0.11) المجلد الذي اختاره المستخدم (SAF يدوي) — بعده مباشرة.
+  // ١) صلاحية All Files Access: هيكل Snaptube العام.
+  if (Platform.OS === 'android' && (await hasStorageAccess())) {
+    const dir = await snaptubeTypeDir(type);
+    if (dir) {
+      try {
+        await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
+        return true;
+      } catch { /* نكمل للمسار التالي */ }
+    }
+  }
+  // ٢) المجلد الذي اختاره المستخدم (SAF) — أضمن مسار متاح بلا أي صلاحية خاصة.
   if (safDir) {
-    // (v2.0.8) المجلد الأساسي «Download Max» ثم مجلد النوع داخله — بلا تكرار.
     const appRoot = await safAppRoot(safDir);
     const dir = await safSubfolder(appRoot, subfolderFor(type));
     if (await saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir)) return true;
-    // فشل SAF؟ نكمل للمسار العام بدل إفشال الحفظ كلياً.
   }
+  // ٣) ألبوم «Download Max» عبر MediaStore.
+  if (await saveToPublicAlbum(localUri, filename, type)) return true;
+  // ٤) المسار العام «Download/Download Max» كخيار أخير.
   if (await hasStorageAccess()) {
     try {
       const dir = `${await publicDownloadRoot()}${subfolderFor(type)}/`;
@@ -566,9 +593,7 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
       if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
       await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
       return true;
-    } catch {
-      // المسار العام غير متاح أيضاً.
-    }
+    } catch { /* المسار العام غير متاح أيضاً */ }
   }
   return false;
 }
@@ -1252,15 +1277,15 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!/^https?:\/\//i.test(item.url)) {
         // الاسم الأصلي من نظام المشاركة محفوظ في العنوان، ونضمن امتداداً صالحاً دائماً.
         const filename = safeFilename(item.title, extensionFor(mimeFor(item.format), item.title, item.type));
-        // (v2.0.18) الحفظ في مساحة التطبيق دائماً (فتح/مشاركة/حذف يعتمدون عليه)
-        // ثم إضافة نسخة إلى ألبوم «Download Max» عبر MediaStore — بلا أي رسالة خطأ.
+        // (v2.0.19) الحفظ في مساحة التطبيق دائماً (فتح/مشاركة/حذف يعتمدون عليه)
+        // ثم نسخة للمجلد العام عبر السلسلة المضمونة (SAF المختار → الألبوم) — بلا رسالة خطأ.
         const typeDir = await ensureTypeDir(baseDirectory, item.type);
         const finalName = await uniqueFilename(typeDir || baseDirectory, filename);
         const target = `${typeDir || baseDirectory}${finalName}`;
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
-        void saveToPublicAlbum(target, finalName, item.type);
+        void mirrorToDeviceDownloads(target, finalName, item.type, downloadDirRef.current);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1482,9 +1507,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           }
         }
         target = `${initialTypeDir}${finalFilename}`;
-        // (v2.0.18) إضافة نسخة إلى ألبوم «Download Max» عبر MediaStore — الفشل غير حرج
-        // ولا يعرض أي خطأ: الأصل محفوظ في مساحة التطبيق وفتحه يعمل دائماً.
-        void saveToPublicAlbum(target, finalFilename, item.type);
+        // (v2.0.19) نسخة للمجلد العام عبر السلسلة المضمونة — الفشل غير حرج وبلا رسالة.
+        void mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1628,7 +1652,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               const source = entry.fileUri;
               if (!source) continue;
               const filename = source.split('/').pop() ?? 'file';
-              const ok = await saveToPublicAlbum(source, filename, entry.type).catch(() => false);
+              const ok = await mirrorToDeviceDownloads(source, filename, entry.type, downloadDirRef.current).catch(() => false);
               if (ok) patchItem(entry.id, { error: undefined });
             }
           })();
