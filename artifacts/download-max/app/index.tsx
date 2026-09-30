@@ -35,7 +35,8 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, hasStorageAccess, ensureDownloadFolders, openAllFilesAccessSettings } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource } from '@/context/DownloadContext';
+import type { ProbedFormat } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
 /** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
@@ -44,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.17';
+const APP_VERSION = '2.0.18';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -803,7 +804,7 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
  */
 const ltr = (value: string) => `\u2066${value}\u2069`;
 
-function DownloadRow({ item, onSelect, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, onGrantStorage, selected }: {
+function DownloadRow({ item, onSelect, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected }: {
   item: DownloadItem;
   onRetry: () => void;
   onPause: () => void;
@@ -813,18 +814,17 @@ function DownloadRow({ item, onSelect, onRetry, onPause, onResume, onRemove, onS
   onOpen: () => void;
   onVault: () => void;
   onMore: () => void;
-  onGrantStorage: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
   // (v2.0.15) بلا غلاف إيماءة: الصف عنصر عادي وأي ضغطة تصل للزر مباشرة.
   return (
-    <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} onGrantStorage={onGrantStorage} selected={selected} onSelect={onSelect} />
+    <RowInner item={item} onRetry={onRetry} onPause={onPause} onResume={onResume} onRemove={onRemove} onShare={onShare} onOpen={onOpen} onVault={onVault} onMore={onMore} selected={selected} onSelect={onSelect} />
   );
 }
 
 /** جسم الصف نفسه — منفصل حتى نلفّه بالإيماءة فقط عند توفرها. */
-function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, onGrantStorage, selected, onSelect }: {
+function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen, onVault, onMore, selected, onSelect }: {
   item: DownloadItem;
   onRetry: () => void;
   onPause: () => void;
@@ -834,7 +834,6 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
   onOpen: () => void;
   onVault: () => void;
   onMore: () => void;
-  onGrantStorage: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -854,7 +853,6 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
   // (v2.0.16) الصور: ملفها داخل التطبيق نفسه هو الصورة المصغّرة — بلا توليد إضافي.
   const thumbSource = item.thumbnailUri ?? (item.type === 'image' && item.fileUri ? item.fileUri : null);
   // (v2.0.16) من Astraر لازم: زر فتح إعدادات الصلاحية العام مباشرة.
-  const needsStorageGrant = !!item.error && item.error.includes('الوصول لجميع الملفات');
   return (
     <Pressable
       onLongPress={onSelect}
@@ -909,16 +907,7 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
             ) : null}
           </View>
         ) : item.error ? (
-          <View style={styles.errorRow}>
-            <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
-            {/* (v2.0.16) بدل جملة حمراء ميتة: زر يفتح إعدادات «الوصول لجميع الملفات». */}
-            {needsStorageGrant ? (
-              <Pressable onPress={onGrantStorage} style={[styles.grantBtn, { borderColor: colors.destructive }]}>
-                <Feather name="shield" size={11} color={colors.destructive} />
-                <Text style={[styles.grantBtnText, { color: colors.destructive }]}>منح الصلاحية</Text>
-              </Pressable>
-            ) : null}
-          </View>
+          <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
         ) : null}
       </View>
       <View style={styles.rowActions}>
@@ -1310,7 +1299,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, syncPendingToDevice, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
+  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1332,9 +1321,12 @@ export default function HomeScreen() {
   const [showFormatSheet, setShowFormatSheet] = useState(false);
   const [rememberFormat, setRememberFormat] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  // (v2.0.18) نتيجة فحص الرابط: العنوان الحقيقي + الصيغ الفعلية المتاحة لهذا الرابط.
+  const [probedTitle, setProbedTitle] = useState<string | null>(null);
+  const [liveFormats, setLiveFormats] = useState<ProbedFormat[] | null>(null);
+  const [probing, setProbing] = useState(false);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   const [playingInBackground, setPlayingInBackground] = useState(false);
-  const [publicSaveOk, setPublicSaveOk] = useState(false);
   const googleRef = useRef<WebView | null>(null);
   const [googleCanGoBack, setGoogleCanGoBack] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -1478,13 +1470,28 @@ export default function HomeScreen() {
     if (!rememberFormat) {
       setPendingUrl(url);
       setShowFormatSheet(true);
+      // (v2.0.18) فحص الرابط في الخلفية: العنوان الحقيقي + الصيغ المتوفرة فعلاً.
+      const probedType = mediaType;
+      setProbedTitle(null);
+      setLiveFormats(null);
+      setProbing(true);
+      probeMediaSource(url, probedType)
+        .then((result) => {
+          setProbedTitle(result.title);
+          setLiveFormats(result.formats.length > 0 ? result.formats : null);
+        })
+        .catch(() => {
+          setProbedTitle(null);
+          setLiveFormats(null);
+        })
+        .finally(() => setProbing(false));
       return;
     }
     await startDownload(url);
   }
 
   /** يبدأ التحميل بالصيغة المختارة (أو الصيغة الممررة صراحةً)؛ إن كان الرابط منشوراً مختلطاً (صور + فيديو) يُسأل المستخدم أولاً عن الشكل المطلوب. */
-  async function startDownload(targetUrl: string, overrides?: { type: MediaType; format: string; skipMixedCheck?: boolean }) {
+  async function startDownload(targetUrl: string, overrides?: { type: MediaType; format: string; skipMixedCheck?: boolean; title?: string }) {
     // فحص المحتوى المختلط يُتخطى فقط عندما فُحص الرابط للتو (مثل مسار المشاركة) — لا إعادة فحص مكررة.
     if (overrides?.skipMixedCheck) {
       const type = overrides.type;
@@ -1521,7 +1528,8 @@ export default function HomeScreen() {
     const format = overrides?.format ?? selectedFormat;
     const count = await addSmartDownload({
       url: targetUrl,
-      title: guessedTitle(targetUrl),
+      // (v2.0.18) العنوان الحقيقي من فحص الرابط يُعتمد فوراً — لا هاش ولا اسم رابط.
+      title: overrides?.title ?? guessedTitle(targetUrl),
       type,
       format,
       quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
@@ -1641,16 +1649,10 @@ export default function HomeScreen() {
     }
     const result = await enableDeviceAutoSave();
     setNotice(result.message);
-    if (result.ok) setPublicSaveOk(Platform.OS === 'android' && (await hasStorageAccess()));
   }
 
-  // الوجهة الحقيقية لملفات المستخدم: المسار العام إن سارِ الإذن، وإلا المجلد المختار مرة واحدة.
-  // (v2.0.17) المسار الفعلي الحالي: هيكل DownloadMax/download — نفس وجهة كل تنزيل جديد.
-  const deviceSavePath = publicSaveOk
-    ? '/storage/emulated/0/DownloadMax/download'
-    : downloadDir
-      ? `${dirLabel(downloadDir)} · محفوظ ✓`
-      : null;
+  // (v2.0.18) الوجهة الحقيقية: ألبوم «Download Max» في المعرض/ملفات الجهاز عبر MediaStore.
+  const deviceSavePath = 'المعرض · ألبوم Download Max (فيديو/صوت/صور)';
 
   function vaultAction(item: DownloadItem) {
     void moveToVault(item.id);
@@ -1682,16 +1684,6 @@ export default function HomeScreen() {
     let cancelled = false;
     const check = async () => {
       await ensureDownloadFolders();
-      if (cancelled) return;
-      const publicOk = Platform.OS === 'android' && (await hasStorageAccess());
-      setPublicSaveOk(publicOk);
-      if (publicOk) {
-        // (v2.0.16) الصلاحية أُعطيت للتو؟ ننقل ما بقي داخل التطبيق ونمسح الخطأ الأحمر.
-        const moved = await syncPendingToDevice();
-        if (!cancelled && moved > 0) setNotice(`نُقل ${moved} ملف إلى مجلد الجهاز ✓`);
-        const added = await refreshFromDevice();
-        if (!cancelled && added > 0) setNotice(`استرجعنا ${added} ملف من تخزين الجهاز 📁`);
-      }
     };
     void check();
     const subscription = AppState.addEventListener('change', (state) => {
@@ -1701,7 +1693,7 @@ export default function HomeScreen() {
       cancelled = true;
       subscription.remove();
     };
-  }, [refreshFromDevice, syncPendingToDevice]);
+  }, []);
 
   // زر الرجوع في الجهاز: يغلق اللوحة المفتوحة، ثم يرجع في تاريخ صفحات جوجل،
   // ثم يلغي التحديد، وبعدها يعود للرئيسية — ولا يخرج التطبيق إلا من الصفحة الأولى.
@@ -1950,7 +1942,7 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} onGrantStorage={() => { void openAllFilesAccessSettings(); }} />}
+            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
           </View>
@@ -1999,9 +1991,16 @@ export default function HomeScreen() {
         <Pressable style={styles.modalBackdrop} onPress={() => setShowFormatSheet(false)}>
           <Pressable style={[styles.sheet, styles.sheetTall, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
             <View style={[styles.sheetHandle, { backgroundColor: colors.border }]} />
-            <Text style={[styles.sheetTitle, { color: colors.foreground }]}>المزيد من الصيغ</Text>
+            <Text style={[styles.sheetTitle, { color: colors.foreground }]} numberOfLines={2}>
+              {probedTitle ?? 'المزيد من الصيغ'}
+            </Text>
+            {probing ? (
+              <Text style={[styles.optionDetail, { color: colors.mutedForeground, marginBottom: 8 }]}>جارٍ فحص الرابط وجلب الصيغ المتوفرة…</Text>
+            ) : liveFormats ? (
+              <Text style={[styles.optionDetail, { color: colors.mutedForeground, marginBottom: 8 }]}>الصيغ المتوفرة لهذا الرابط — اختر واحدة</Text>
+            ) : null}
             <FlatList
-              data={qualityChoices(mediaType)}
+              data={liveFormats ?? qualityChoices(mediaType)}
               keyExtractor={(entry) => entry.format}
               style={{ flexGrow: 0 }}
               renderItem={({ item: option }) => {
@@ -2017,7 +2016,7 @@ export default function HomeScreen() {
               <Switch value={rememberFormat} onValueChange={(value) => setRememberFormat(value)} trackColor={{ true: colors.primary, false: colors.muted }} thumbColor="#fff" />
               <Text style={[styles.rememberText, { color: colors.foreground }]}>تذكر اختياري — تحميل مباشر بدون هذه النافذة</Text>
             </Pressable>
-            <Pressable testID="confirm-format" onPress={() => { setShowFormatSheet(false); if (pendingUrl) { const target = pendingUrl; setPendingUrl(null); void startDownload(target); } }} style={[styles.sheetConfirm, { backgroundColor: colors.primary }]}>
+            <Pressable testID="confirm-format" onPress={() => { setShowFormatSheet(false); if (pendingUrl) { const target = pendingUrl; const realTitle = probedTitle; setPendingUrl(null); setLiveFormats(null); setProbedTitle(null); void startDownload(target, realTitle ? { type: mediaType, format: selectedFormat, title: realTitle } : undefined); } }} style={[styles.sheetConfirm, { backgroundColor: colors.primary }]}>
               <Text style={[styles.sheetConfirmText, { color: colors.primaryForeground }]}>تحميل الآن</Text>
             </Pressable>
           </Pressable>
@@ -2427,8 +2426,6 @@ const styles = StyleSheet.create({
   trashEmptyHint: { fontSize: 12, textAlign: 'center', lineHeight: 19, paddingHorizontal: 12 },
   errorText: { fontSize: 10, lineHeight: 14, marginTop: 6, flexShrink: 1 },
   errorRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginTop: 2 },
-  grantBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, borderWidth: 1, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
-  grantBtnText: { fontSize: 10, fontWeight: '800' },
   rowActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 5, gap: 1 },
   iconButton: { padding: 7 },
   emptyList: { flexGrow: 1 },

@@ -388,6 +388,9 @@ const SNAPTUBE_DOWNLOAD_DIR = 'download';
 const SNAPTUBE_VIDEO_DIR = 'DownloadMax Video';
 const SNAPTUBE_MUSIC_DIR = 'DownloadMax Music';
 const SNAPTUBE_IMAGE_DIR = 'DownloadMax Image';
+/** (v2.0.18) اسم الألبوم العام في المعرض/ملفات الجهاز — يظهر كـ «Download Max». */
+const ALBUM_NAME = 'Download Max';
+
 /** مجلد النوع في هيكل Snaptube حسب نوع الوسيط. */
 function snaptubeSubfolderFor(type: MediaType): string {
   if (type === 'video') return SNAPTUBE_VIDEO_DIR;
@@ -470,18 +473,24 @@ async function probeStorageAccess(): Promise<string | null> {
 }
 
 /**
- * (v2.0.12) مجلد النوع في هيكل Snaptube العام — يُنشأ تلقائياً إن لم يوجد:
- * «/storage/emulated/0/DownloadMax/download/DownloadMax Video|Music|Image/».
- * يعيد null إذا كانت صلاحية All Files Access غير متاحة.
+ * (v2.0.18) المحرك الجديد للحفظ العام: نظام أندرويد الرسمي MediaStore عبر expo-media-library
+ * (الموجودة أصلاً بالتطبيق) بدل كتابة الملفات المباشرة المعطوبة على أجهزة New Architecture.
+ * الألبوم «Download Max» يُنشأ تلقائياً في المعرض/ملفات الجهاز من أول تنزيل وبصلاحية عادية —
+ * وعلى أندرويد 13+ بلا أي نافذة إذن. الفشل هنا غير حرج: الملف يبقى محفوظاً في مساحة التطبيق.
  */
-async function snaptubeTypeDir(type: MediaType): Promise<string | null> {
+export async function saveToPublicAlbum(localUri: string, filename: string, type: MediaType): Promise<boolean> {
+  if (Platform.OS === 'web') return false;
   try {
-    const dir = `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/${snaptubeSubfolderFor(type)}/`;
-    const info = await FileSystem.getInfoAsync(dir);
-    if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-    return dir;
+    const { granted } = await MediaLibrary.requestPermissionsAsync();
+    if (!granted) return false;
+    const asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
+    if (!asset) return false;
+    let album = await MediaLibrary.getAlbumAsync(ALBUM_NAME).catch(() => null);
+    if (!album) album = await MediaLibrary.createAlbumAsync(ALBUM_NAME, asset, true).catch(() => null);
+    else await MediaLibrary.addAssetsToAlbumAsync(asset, album, true).catch(() => undefined);
+    return !!album;
   } catch {
-    return null;
+    return false;
   }
 }
 
@@ -539,21 +548,9 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
  * يرجع true إذا حُفظ الملف فعلاً.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
-  // (v2.0.12) المسار الأساسي: هيكل Snaptube في جذر التخزين مع All Files Access —
-  // نقل مباشر بلا نسخ مزدوج وبلا مزوّد SAF: «DownloadMax/download/DownloadMax Video…».
-  if (Platform.OS === 'android' && (await hasStorageAccess())) {
-    const dir = await snaptubeTypeDir(type);
-    if (dir) {
-      try {
-        // (v2.0.15) نسخ لا نقل: الأصل يبقى داخل مساحة التطبيق لأن item.fileUri
-        // يشير إليه — النقلة كانت تترك مساراً ميتاً، فيفشل فتح الملف ويختفي عن التطبيق.
-        await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
-        return true;
-      } catch (copyError) {
-        console.error('[v2.0.15] فشل النسخ إلى هيكل Snaptube:', copyError);
-      }
-    }
-  }
+  // (v2.0.18) المسار الأساسي: ألبوم «Download Max» عبر MediaStore — بلا صلاحية خاصة
+  // وبلا كتابة مباشرة معطوبة. الأصل يبقى في مساحة التطبيق (fileUri يشير إليه).
+  if (await saveToPublicAlbum(localUri, filename, type)) return true;
   // (إصلاح v2.0.11) المجلد الذي اختاره المستخدم (SAF يدوي) — بعده مباشرة.
   if (safDir) {
     // (v2.0.8) المجلد الأساسي «Download Max» ثم مجلد النوع داخله — بلا تكرار.
@@ -753,21 +750,8 @@ export async function ensureDownloadFolders(): Promise<string | null> {
   for (const type of ['video', 'image', 'voice'] as MediaType[]) {
     await ensureTypeDir(base, type);
   }
-  // (v2.0.12) مجلدات هيكل Snaptube العامة تُجهّز أولاً: DownloadMax/download/…
-  if (Platform.OS === 'android' && (await hasStorageAccess())) {
-    for (const type of ['video', 'image', 'voice'] as MediaType[]) {
-      await snaptubeTypeDir(type);
-    }
-  }
-  // نفس المجلدات في تخزين الجهاز الحقيقي حتى يراها المستخدم في مدير الملفات.
-  if (await hasStorageAccess()) {
-    const root = await publicDownloadRoot();
-    for (const type of ['video', 'image', 'voice'] as MediaType[]) {
-      const dir = `${root}${type}/`;
-      const info = await FileSystem.getInfoAsync(dir).catch(() => null);
-      if (!info?.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
-    }
-  }
+  // (v2.0.18) الألبوم العام «Download Max» يُنشأ تلقائياً من أول تنزيل عبر MediaStore —
+  // لا حاجة لإنشاء مجلدات بالكتابة المباشرة (كانت تفشل بصمت على أجهزة New Architecture).
   return base;
 }
 
@@ -1099,6 +1083,71 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
   return [data.url as string];
 }
 
+export type ProbedFormat = { format: string; label: string; detail: string };
+export type MediaProbeResult = {
+  title: string | null;
+  type: MediaType;
+  /** الصيغ الحقيقية المتاحة لهذا الرابط — فارغة إن فشل الفحص (fallback للقائمة الثابتة). */
+  formats: ProbedFormat[];
+};
+
+const VIDEO_QUALITY_LABELS: Record<string, string> = {
+  '2160': '2160p 4K', '1440': '1440p 2K', '1080': '1080p HD', '720': '720p HD',
+  '480': '480p', '360': '360p', '240': '240p', '144': '144p',
+};
+
+/**
+ * (v2.0.18) فحص الرابط قبل التنزيل: يجلب العنوان الحقيقي ويجرّب الصيغ فعلياً لدى
+ * خدمة الاستخراج، فيعرض على المستخدم قائمة حية بما هو متوفر لهذا الرابط تحديداً
+ * بدل قائمة ثابتة مكتوبة يدوياً. الفحص لكل صيغة طلب واحد سريع؛ نجرّب الجودات
+ * الشائعة فقط حتى لا يتأخر ظهور النافذة، والفشل الفردي يُتجاهل بصمت.
+ */
+export async function probeMediaSource(sourceUrl: string, type: MediaType): Promise<MediaProbeResult> {
+  // العنوان الحقيقي أولاً (يوتيوب عبر oEmbed — بلا تكلفة).
+  let title: string | null = null;
+  if (isYoutubeUrl(sourceUrl)) {
+    title = await fetchYoutubeTitle(sourceUrl).catch(() => null);
+  }
+  const formats: ProbedFormat[] = [];
+  if (!/^https?:\/\//i.test(sourceUrl) || looksLikeDirectMedia(sourceUrl)) {
+    return { title, type, formats };
+  }
+  // الصيغ المرشحة حسب النوع — نجرّبها فعلياً لدى الخدمة.
+  const candidates: { format: string; label: string; detail: string; options: MediaRequestOptions }[] =
+    type === 'video'
+      ? ['1080', '720', '480', '360'].map((q) => ({
+          format: `mp4-${q}`,
+          label: VIDEO_QUALITY_LABELS[q] ?? `${q}p`,
+          detail: q === '1080' ? 'أفضل جودة HD' : q === '720' ? 'جودة عالية' : q === '480' ? 'جودة متوسطة' : 'توفير البيانات',
+          options: { mode: 'video' as const, videoQuality: q },
+        }))
+      : type === 'audio'
+        ? ['mp3-320', 'mp3-128', 'm4a-128', 'mp3-64'].map((f) => {
+            const [fmt, br] = f.split('-');
+            return {
+              format: f,
+              label: `${fmt.toUpperCase()} ${br}K`,
+              detail: br === '320' ? 'أعلى جودة — حجم أكبر' : br === '128' ? 'الأفضل للجوال — متوازن' : 'أصغر حجم',
+              options: { mode: 'audio' as const, audioFormat: fmt, audioBitrate: br },
+            };
+          })
+        : [];
+  const results = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        const urls = await resolveMediaUrls(sourceUrl, candidate.options);
+        return urls.length > 0 && isUsableMediaUrl(urls[0]) ? candidate : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  for (const found of results) {
+    if (found) formats.push({ format: found.format, label: found.label, detail: found.detail });
+  }
+  return { title, type, formats };
+}
+
 /** يفحص الرابط مسبقاً: إن كان منشور صور (كاروسيل) يعيد قائمة روابط كل الصور، وإلا قائمة فارغة. */
 export async function previewCarouselImages(sourceUrl: string): Promise<string[]> {
   try {
@@ -1203,25 +1252,21 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!/^https?:\/\//i.test(item.url)) {
         // الاسم الأصلي من نظام المشاركة محفوظ في العنوان، ونضمن امتداداً صالحاً دائماً.
         const filename = safeFilename(item.title, extensionFor(mimeFor(item.format), item.title, item.type));
-        // (v2.0.17) عند توفر الصلاحية: النسخة تذهب مباشرة لمجلد الجهاز — بلا نسخة داخلية ولا نقل.
-        const publicDir = Platform.OS === 'android' && (await hasStorageAccess())
-          ? await snaptubeTypeDir(item.type)
-          : null;
-        const typeDir = publicDir ?? await ensureTypeDir(baseDirectory, item.type);
+        // (v2.0.18) الحفظ في مساحة التطبيق دائماً (فتح/مشاركة/حذف يعتمدون عليه)
+        // ثم إضافة نسخة إلى ألبوم «Download Max» عبر MediaStore — بلا أي رسالة خطأ.
+        const typeDir = await ensureTypeDir(baseDirectory, item.type);
         const finalName = await uniqueFilename(typeDir || baseDirectory, filename);
         const target = `${typeDir || baseDirectory}${finalName}`;
         await FileSystem.copyAsync({ from: item.url, to: target });
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
-        const mirrored = publicDir ? true : await mirrorToDeviceDownloads(target, finalName, item.type, downloadDirRef.current);
+        void saveToPublicAlbum(target, finalName, item.type);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
           bytesWritten: size,
           totalBytes: size,
           fileUri: target,
-          // (v2.0.11) فشل النسخ إلى مجلد الجهاز لا يمرّ بصمت — الملف محفوظ في مساحة التطبيق وننبه المستخدم.
-          error: mirrored ? undefined : 'محفوظ داخل التطبيق — امنح صلاحية «الوصول لجميع الملفات» ليظهر في مجلد الجهاز',
         });
         void upsertHistoryEntry(historyEntryOf({ ...item, status: 'completed', progress: 1, bytesWritten: size, totalBytes: size, fileUri: target }));
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -1262,12 +1307,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // (v2.0.16) رابط وهمي من خدمة الاستخراج — لا نبدأ تنزيلاً محكوماً بالفشل.
         throw new Error('الخدمة لم ترجع رابطاً صالحاً — جرّب جودة أخرى أو رابطاً بديلاً');
       }
-      // (v2.0.17) الوجهة الفعلية: مجلد الجهاز مباشرة عند توفر الصلاحية — الملف ينزل
-      // في مكانه الصحيح من البداية (هيكل Snaptube)، بلا نسخة داخلية ولا نقل ولا خطأ أحمر.
-      const publicDest = Platform.OS === 'android' && (await hasStorageAccess())
-        ? await snaptubeTypeDir(item.type)
-        : null;
-      const initialTypeDir = publicDest ?? await ensureTypeDir(baseDirectory, item.type);
+      // (v2.0.18) الوجهة: مساحة التطبيق دائماً — الألبوم العام يُضاف تلقائياً بعد الاكتمال.
+      const initialTypeDir = await ensureTypeDir(baseDirectory, item.type);
       let target = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(item.title, item.format))}`;
 
       // جلب الاسم الأصلي والنوع من ترويسات الخادم حتى يُحفظ الملف باسمه وصيغته الحقيقية.
@@ -1441,16 +1482,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           }
         }
         target = `${initialTypeDir}${finalFilename}`;
-        // (v2.0.17) نزّلنا مباشرة في مجلد الجهاز؟ لا نسخ مزدوج إطلاقاً.
-        let mirrored = true;
-        if (!publicDest) {
-          let safNow = downloadDirRef.current;
-          if (!safNow && Platform.OS === 'android' && !(await hasStorageAccess())) {
-            // أول تنزيل بلا إعداد سابق: نطلب اختيار مجلد التنزيل مرة واحدة تلقائياً.
-            safNow = await requestAndStoreDeviceDir(setDownloadDirRef.current, null);
-          }
-          mirrored = await mirrorToDeviceDownloads(target, finalFilename, item.type, safNow);
-        }
+        // (v2.0.18) إضافة نسخة إلى ألبوم «Download Max» عبر MediaStore — الفشل غير حرج
+        // ولا يعرض أي خطأ: الأصل محفوظ في مساحة التطبيق وفتحه يعمل دائماً.
+        void saveToPublicAlbum(target, finalFilename, item.type);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1459,8 +1493,6 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           fileUri: target,
           title: resolvedTitle,
           format: finalFormat,
-          // (v2.0.11) تنبيه شفاف: فشل النسخ المطابق لا يبقى صامتاً.
-          error: mirrored ? undefined : 'محفوظ داخل التطبيق — امنح صلاحية «الوصول لجميع الملفات» ليظهر في مجلد الجهاز',
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalBytes?.bytesWritten, totalBytes: finalBytes?.totalBytes, fileUri: target }));
@@ -1584,6 +1616,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         void syncHistorySnapshot(merged.filter((entry) => !entry.deletedAt).map(historyEntryOf));
         // (v2.0.12) تصحيح عناوين الهاش القديمة من الخادم في الخلفية
         void restoreLegacyHashTitles(merged.filter((entry) => !entry.deletedAt && entry.status === 'completed'), patchItem);
+        // (v2.0.18) إصلاح تلقائي لملفات الإصدارات القديمة: العناصر الموسومة بخطأ
+        // «الوصول لجميع الملفات» تُضاف نسختها إلى ألبوم «Download Max» ويمسح الخطأ —
+        // فتظهر في المعرض وملفات الجهاز بدون أي ضغطة من المستخدم.
+        if (Platform.OS !== 'web') {
+          void (async () => {
+            const broken = itemsRef.current.filter(
+              (entry) => entry.status === 'completed' && !!entry.fileUri && !!entry.error?.includes('الوصول لجميع الملفات'),
+            );
+            for (const entry of broken) {
+              const source = entry.fileUri;
+              if (!source) continue;
+              const filename = source.split('/').pop() ?? 'file';
+              const ok = await saveToPublicAlbum(source, filename, entry.type).catch(() => false);
+              if (ok) patchItem(entry.id, { error: undefined });
+            }
+          })();
+        }
 
         for (const item of merged) {
           if (item.status === 'downloading' || item.status === 'queued') {
