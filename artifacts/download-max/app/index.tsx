@@ -35,7 +35,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess, openAllFilesAccessSettings } from '@/context/DownloadContext';
 import type { ProbedFormat } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.20';
+const APP_VERSION = '2.0.21';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1332,6 +1332,21 @@ export default function HomeScreen() {
     })();
   }, [deviceSaveNeedsFolder, pickDeviceFolderNow]);
 
+  // (v2.0.21) بوابة «الوصول لجميع الملفات»: فحص عند الإقلاع وعند العودة من الإعدادات.
+  // إن مُنحت الصلاحية للتو يختفي البانر، وتتولى تأثيرات المزامنة نسخ الملفات فوراً.
+  const [allFilesGranted, setAllFilesGranted] = useState<boolean | null>(null);
+  const [storageGateDismissed, setStorageGateDismissed] = useState(false);
+  useEffect(() => {
+    if (Platform.OS !== 'android') { setAllFilesGranted(true); return; }
+    let cancelled = false;
+    const check = () => {
+      void hasStorageAccess().then((granted) => { if (!cancelled) setAllFilesGranted(granted); });
+    };
+    check();
+    const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') check(); });
+    return () => { cancelled = true; subscription.remove(); };
+  }, []);
+
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   // (v2.0.18) نتيجة فحص الرابط: العنوان الحقيقي + الصيغ الفعلية المتاحة لهذا الرابط.
   const [probedTitle, setProbedTitle] = useState<string | null>(null);
@@ -1824,6 +1839,22 @@ export default function HomeScreen() {
       </View>
 
       <View style={styles.content}>
+        {/* (v2.0.21) بوابة صلاحية «جميع الملفات»: خطوة واحدة تضمن حفظ كل تنزيل في مجلد الجهاز. */}
+        {Platform.OS === 'android' && allFilesGranted === false && !storageGateDismissed ? (
+          <View style={[styles.storageGate, { backgroundColor: `${colors.primary}12`, borderColor: `${colors.primary}44` }]}>
+            <Feather name="shield" size={18} color={colors.primary} />
+            <View style={styles.storageGateCopy}>
+              <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>مكّن حفظ الملفات في جهازك</Text>
+              <Text style={[styles.storageGateBody, { color: colors.mutedForeground }]} numberOfLines={2}>خطوة واحدة: اسمح بالوصول لجميع الملفات ليُحفظ كل تنزيل تلقائياً في مجلد «Download» — مثل تطبيقات التنزيل الأخرى.</Text>
+            </View>
+            <Pressable testID="grant-all-files" accessibilityLabel="منح صلاحية جميع الملفات" onPress={() => { void openAllFilesAccessSettings(); }} style={[styles.storageGateBtn, { backgroundColor: colors.primary }]}>
+              <Text style={[styles.storageGateBtnText, { color: colors.primaryForeground }]}>منح الآن</Text>
+            </Pressable>
+            <Pressable accessibilityLabel="إخفاء التنبيه مؤقتاً" onPress={() => setStorageGateDismissed(true)} hitSlop={8}>
+              <Feather name="x" size={15} color={colors.mutedForeground} />
+            </Pressable>
+          </View>
+        ) : null}
         {activeTab === 'home' ? (
           <FlatList
             data={[{ key: 'home' }]}
@@ -2328,6 +2359,13 @@ const styles = StyleSheet.create({
   searchInput: { flex: 1, fontSize: 13, minHeight: 42, textAlign: 'left' },
   wifiBanner: { borderRadius: 13, borderWidth: 1, padding: 11, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
   wifiBannerText: { flex: 1, fontSize: 11, fontWeight: '700', lineHeight: 16 },
+  // (v2.0.21) بانر صلاحية «جميع الملفات» أعلى كل التبويبات.
+  storageGate: { borderRadius: 16, borderWidth: 1, padding: 13, flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+  storageGateCopy: { flex: 1, gap: 2 },
+  storageGateTitle: { fontSize: 13, fontWeight: '800' },
+  storageGateBody: { fontSize: 11, lineHeight: 16 },
+  storageGateBtn: { borderRadius: 11, paddingHorizontal: 13, paddingVertical: 9 },
+  storageGateBtnText: { fontSize: 12, fontWeight: '800' },
   pinDots: { flexDirection: 'row', justifyContent: 'center', gap: 14, marginTop: 18 },
   pinDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 2 },
   pinGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 10, marginTop: 22, width: 252, alignSelf: 'center' },
@@ -2393,13 +2431,6 @@ const styles = StyleSheet.create({
   downloadButtonText: { fontSize: 15, fontWeight: '800' },
   legalNote: { fontSize: 10, textAlign: 'center', marginTop: 12 },
   bottomNav: { minHeight: 68, borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
-  storageGate: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32, gap: 16 },
-  storageGateIcon: { width: 92, height: 92, borderRadius: 46, alignItems: 'center', justifyContent: 'center' },
-  storageGateHint: { fontSize: 13, textAlign: 'center', lineHeight: 20, paddingHorizontal: 20 },
-  storageGateError: { fontSize: 11, textAlign: 'center', paddingHorizontal: 20, fontWeight: '700' },
-  storageGateTitle: { fontSize: 16, fontWeight: '700', textAlign: 'center', lineHeight: 26 },
-  storageGateButton: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 26, paddingVertical: 13, borderRadius: 999, borderWidth: 1 },
-  storageGateButtonText: { fontSize: 15, fontWeight: '700' },
   googleScreen: { flex: 1 },
   googleWeb: { flex: 1, backgroundColor: 'transparent' },
   navItem: { minWidth: 90, alignItems: 'center', gap: 4 },

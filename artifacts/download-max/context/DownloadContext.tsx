@@ -581,6 +581,8 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
  * الأصل يبقى دائماً في مساحة التطبيق (fileUri يشير إليه) — والفشل الكلي لا يعرض أي خطأ.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
+  // (v2.0.21) صفّر سبب الفشل قبل بدء السلسلة حتى لا يظهر سبب ملف سابق لملف جديد.
+  lastDeviceSaveError = null;
   // ١) صلاحية All Files Access: هيكل Snaptube العام.
   if (Platform.OS === 'android' && (await hasStorageAccess())) {
     const dir = await snaptubeTypeDir(type);
@@ -588,7 +590,7 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
       try {
         await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
         return true;
-      } catch { /* نكمل للمسار التالي */ }
+      } catch (error) { noteDeviceSaveError('نسخ AllFiles', error); /* نكمل للمسار التالي */ }
     }
   }
   // ٢) المجلد الذي اختاره المستخدم (SAF) — أضمن مسار متاح بلا أي صلاحية خاصة.
@@ -596,9 +598,12 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
     const appRoot = await safAppRoot(safDir);
     const dir = await safSubfolder(appRoot, subfolderFor(type));
     if (await saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir)) return true;
+  } else {
+    noteDeviceSaveError('SAF', 'لم يتم اختيار مجلد حفظ في الجهاز');
   }
   // ٣) ألبوم «Download Max» عبر MediaStore.
   if (await saveToPublicAlbum(localUri, filename, type)) return true;
+  if (!lastDeviceSaveError) noteDeviceSaveError('MediaStore', 'إذن الوسائط غير ممنوح — مرفوض نهائياً غالباً');
   // ٤) المسار العام «Download/Download Max» كخيار أخير.
   if (await hasStorageAccess()) {
     try {
@@ -607,7 +612,7 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
       if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
       await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
       return true;
-    } catch { /* المسار العام غير متاح أيضاً */ }
+    } catch (error) { noteDeviceSaveError('مسار Download', error); /* المسار العام غير متاح أيضاً */ }
   }
   return false;
 }
@@ -891,6 +896,18 @@ function extensionFor(mimeType: string | null, originalName: string | null, type
 const SAF_BASE64_FALLBACK_LIMIT = 24 * 1024 * 1024;
 
 /**
+ * (v2.0.21) آخر سبب فشل حقيقي في الحفظ بمجلد الجهاز — يُعرض باختصار بدل الصمت.
+ * كان سبب فشل كتابة SAF يبتلع في console فقط ولا يعرفه أحد؛ الآن يُسجّل هنا
+ * ويُعرض تحت الملف ومنه نعرف بالضبط أين تعطّلت السلسلة (SAF / AllFiles / MediaStore).
+ */
+let lastDeviceSaveError: string | null = null;
+function noteDeviceSaveError(tag: string, error?: unknown): string {
+  const raw = error instanceof Error ? error.message : error ? String(error) : 'غير معروف';
+  lastDeviceSaveError = `${tag}: ${raw.length > 110 ? `${raw.slice(0, 110)}…` : raw}`;
+  return lastDeviceSaveError;
+}
+
+/**
  * (إصلاح v2.0.9) نسخ الملف إلى مستند SAF بالتدفق الأصلي عبر واجهة الملفات الحديثة.
  * سبب ملفات «الحجم 0» السابقة: copyAsync القديمة تحوّل داخلياً وجهات content://
  * إلى مسار محلي لا معنى له فتفشل، وخطة Base64 تنهار مع الفيديوهات الكبيرة —
@@ -914,11 +931,13 @@ async function streamCopyToSafFile(localUri: string, safFileUri: string): Promis
         const reread = new NativeFile(safFileUri).size;
         if (expected === 0 || reread === expected) return true;
       } catch (copyError) {
+        noteDeviceSaveError('نسخ SAF بالتدفق', copyError);
         console.error('[v2.0.12] خطأ النسخ بالتدفق إلى SAF (محاولة ' + (attempt + 1) + '):', copyError);
       }
     }
     return false;
   } catch (error) {
+    noteDeviceSaveError('نسخ SAF بالتدفق', error);
     console.error('[v2.0.12] خطأ غير متوقع في النسخ إلى SAF:', error);
     return false;
   }
@@ -954,6 +973,7 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
         await FileSystem.writeAsStringAsync(safFileUri, data, { encoding: FileSystem.EncodingType.Base64 });
         return true;
       } catch (base64Error) {
+        noteDeviceSaveError('نسخ SAF (Base64)', base64Error);
         console.error('[v2.0.12] فشلت خطة Base64 الأخيرة:', base64Error);
       }
     }
@@ -963,6 +983,7 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
     await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
     return false;
   } catch (error) {
+    noteDeviceSaveError('إنشاء/حفظ ملف SAF', error);
     console.error('[v2.0.12] فشل الحفظ في مجلد SAF:', error);
     if (safFileUri) await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
     // فشل الحفظ في المجلد المختار — يبقى الملف في مجلد التطبيق.
@@ -1675,8 +1696,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               const source = entry.fileUri;
               if (!source) continue;
               const filename = source.split('/').pop() ?? 'file';
-              const ok = await mirrorToDeviceDownloads(source, filename, entry.type, downloadDirRef.current).catch(() => false);
-              if (ok) patchItem(entry.id, { error: undefined, deviceSaved: true });
+            const ok = await mirrorToDeviceDownloads(source, filename, entry.type, downloadDirRef.current).catch((error) => {
+              noteDeviceSaveError('مزامنة الجهاز', error);
+              return false;
+            });
+            if (ok) patchItem(entry.id, { error: undefined, deviceSaved: true });
+            // (v2.0.21) السبب الحقيقي القصير بدل النص القديم المخيف — ويُمسح تلقائياً عند نجاح النسخ.
+            else if (lastDeviceSaveError) patchItem(entry.id, { error: `لم يُحفظ في مجلد الجهاز — ${lastDeviceSaveError}` });
             }
           })();
         }
@@ -2280,7 +2306,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (await saveFileToSafDirectory(source, filename, mimeFor(filename), typeDir)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
     }
-    return { ok: false, message: (await storageAccessError()) ?? 'تعذّر نسخ الملف' };
+    // (v2.0.21) لا نُرجع رسالة الفحص الخام (توست إنجليزي مخيف) — سبب حقيقي قصير أو رسالة ودّية.
+    return { ok: false, message: lastDeviceSaveError
+      ? `تعذّر النسخ إلى الجهاز — ${lastDeviceSaveError}`
+      : 'تعذّر النسخ — امنح صلاحية «جميع الملفات» من البانر أعلى الشاشة' };
   }, [setDownloadDir]);
 
   /**
@@ -2303,10 +2332,16 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const source = entry.fileUri;
       if (!source) continue;
       const filename = source.split('/').pop() ?? 'file';
-      const ok = await mirrorToDeviceDownloads(source, filename, entry.type, safDirNow).catch(() => false);
+      const ok = await mirrorToDeviceDownloads(source, filename, entry.type, safDirNow).catch((error) => {
+        noteDeviceSaveError('مزامنة الجهاز', error);
+        return false;
+      });
       if (ok) {
         patchItem(entry.id, { error: undefined, deviceSaved: true });
         moved += 1;
+      } else if (lastDeviceSaveError) {
+        // (v2.0.21) بدل الصمت: السبب الحقيقي القصير — ويُمسح تلقائياً عند نجاح النسخ لاحقاً.
+        patchItem(entry.id, { error: `لم يُحفظ في مجلد الجهاز — ${lastDeviceSaveError}` });
       }
     }
     if (pending.length > 0 && moved === 0) setDeviceSaveNeedsFolder(true);
