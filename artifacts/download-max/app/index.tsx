@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.22';
+const APP_VERSION = '2.0.23';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1850,6 +1850,10 @@ export default function HomeScreen() {
             <View style={styles.storageGateCopy}>
               <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>مكّن حفظ الملفات في جهازك</Text>
               <Text style={[styles.storageGateBody, { color: colors.mutedForeground }]} numberOfLines={2}>خطوة واحدة: اسمح بالوصول لجميع الملفات ليُحفظ كل تنزيل تلقائياً في مجلد «Download» — مثل تطبيقات التنزيل الأخرى.</Text>
+              {/* (v2.0.23) باب بديل: بعض أجهزة سامسونج لا تفتح شاشة المفتاح مباشرة — إعدادات التطبيق فيها نفس المفتاح باسم «الملفات والوسائط». */}
+              <Pressable onPress={() => { void Linking.openSettings(); }} hitSlop={6}>
+                <Text style={[styles.storageGateAlt, { color: colors.primary }]}>لا يظهر المفتاح؟ افتح إعدادات التطبيق ←</Text>
+              </Pressable>
             </View>
             <Pressable testID="grant-all-files" accessibilityLabel="منح صلاحية جميع الملفات" onPress={() => { void openAllFilesAccessSettings(); }} style={[styles.storageGateBtn, { backgroundColor: colors.primary }]}>
               <Text style={[styles.storageGateBtnText, { color: colors.primaryForeground }]}>منح الآن</Text>
@@ -2370,6 +2374,7 @@ const styles = StyleSheet.create({
   storageGateBody: { fontSize: 11, lineHeight: 16 },
   storageGateBtn: { borderRadius: 11, paddingHorizontal: 13, paddingVertical: 9 },
   storageGateBtnText: { fontSize: 12, fontWeight: '800' },
+  storageGateAlt: { fontSize: 10.5, fontWeight: '800', marginTop: 2 },
   pinDots: { flexDirection: 'row', justifyContent: 'center', gap: 14, marginTop: 18 },
   pinDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 2 },
   pinGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 10, marginTop: 22, width: 252, alignSelf: 'center' },

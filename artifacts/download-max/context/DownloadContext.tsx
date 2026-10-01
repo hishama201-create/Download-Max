@@ -584,8 +584,9 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
  * الأصل يبقى دائماً في مساحة التطبيق (fileUri يشير إليه) — والفشل الكلي لا يعرض أي خطأ.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
-  // (v2.0.21) صفّر سبب الفشل قبل بدء السلسلة حتى لا يظهر سبب ملف سابق لملف جديد.
+  // (v2.0.21) صفّر سجل الأسباب قبل بدء السلسلة حتى لا يظهر سبب ملف سابق لملف جديد.
   lastDeviceSaveError = null;
+  deviceSaveErrorLog = [];
   // ١) صلاحية All Files Access: هيكل Snaptube العام.
   if (Platform.OS === 'android' && (await hasStorageAccess())) {
     const dir = await snaptubeTypeDir(type);
@@ -606,7 +607,7 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
   }
   // ٣) ألبوم «Download Max» عبر MediaStore.
   if (await saveToPublicAlbum(localUri, filename, type)) return true;
-  if (!lastDeviceSaveError) noteDeviceSaveError('MediaStore', 'تعذّر الحفظ في معرض الصور (ألبوم Download Max)');
+  deviceSaveErrorLog.push('المعرض: تعذّر الحفظ في ألبوم Download Max');
   // ٤) المسار العام «Download/Download Max» كخيار أخير.
   if (await hasStorageAccess()) {
     try {
@@ -900,14 +901,22 @@ const SAF_BASE64_FALLBACK_LIMIT = 24 * 1024 * 1024;
 
 /**
  * (v2.0.21) آخر سبب فشل حقيقي في الحفظ بمجلد الجهاز — يُعرض باختصار بدل الصمت.
- * كان سبب فشل كتابة SAF يبتلع في console فقط ولا يعرفه أحد؛ الآن يُسجّل هنا
- * ويُعرض تحت الملف ومنه نعرف بالضبط أين تعطّلت السلسلة (SAF / AllFiles / MediaStore).
+ * (v2.0.23) سجل كامل لكل مسار فاشل في السلسلة (AllFiles/SAF/المعرض) — يُعرض تحت
+ * الملف كسلسلة أسباب حتى نعرف بالضبط أي أبواب رفضها الجهاز، لا آخر باب فقط.
  */
 let lastDeviceSaveError: string | null = null;
+let deviceSaveErrorLog: string[] = [];
 function noteDeviceSaveError(tag: string, error?: unknown): string {
   const raw = error instanceof Error ? error.message : error ? String(error) : 'غير معروف';
   lastDeviceSaveError = `${tag}: ${raw.length > 110 ? `${raw.slice(0, 110)}…` : raw}`;
+  deviceSaveErrorLog.push(lastDeviceSaveError);
   return lastDeviceSaveError;
+}
+/** (v2.0.23) يبني نص التشخيص الكامل من كل الأبواب الفاشلة في آخر سلسلة نسخ. */
+function deviceSaveErrorSummary(): string | null {
+  if (deviceSaveErrorLog.length === 0) return lastDeviceSaveError;
+  const joined = deviceSaveErrorLog.slice(0, 3).join(' · ');
+  return joined.length > 140 ? `${joined.slice(0, 140)}…` : joined;
 }
 
 /**
@@ -923,9 +932,12 @@ async function streamCopyToSafFile(localUri: string, safFileUri: string): Promis
     const target = new NativeFile(safFileUri);
     // (v2.0.12) محاولتان: بعض مزوّدات SAF (سامسونج خصوصاً) تُرجع size قديماً/خاطئاً
     // مباشرة بعد كتابة ملف كبير — إعادة المحاولة تعطي النظام فرصة لتحديث المقاس.
+    // (v2.0.23) المحاولة الثانية بتقنية مختلفة: نسخ بلا overwrite — بعض مزودات
+    // سامسونج ترفض الكتابة فوق مستند موجود (أنشأناه فارغاً بـ createFileAsync)
+    // بينما تقبل النسخ في مستند جديد. المحاولتان تغطيان السلوكين.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await source.copy(target, { overwrite: true });
+        await source.copy(target, { overwrite: attempt === 0 });
         const expected = source.size;
         const actual = target.size;
         if (expected === 0 || actual === expected) return true;
@@ -1704,8 +1716,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               return false;
             });
             if (ok) patchItem(entry.id, { error: undefined, deviceSaved: true });
-            // (v2.0.21) السبب الحقيقي القصير بدل النص القديم المخيف — ويُمسح تلقائياً عند نجاح النسخ.
-            else if (lastDeviceSaveError) patchItem(entry.id, { error: `لم يُحفظ في مجلد الجهاز — ${lastDeviceSaveError}` });
+            // (v2.0.23) سلسلة الأسباب الكاملة بدل النص القديم — وتُمسح تلقائياً عند نجاح النسخ.
+            else if (deviceSaveErrorSummary()) patchItem(entry.id, { error: `لم يُحفظ في مجلد الجهاز — ${deviceSaveErrorSummary()}` });
             }
           })();
         }
@@ -2309,9 +2321,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (await saveFileToSafDirectory(source, filename, mimeFor(filename), typeDir)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
     }
-    // (v2.0.21) لا نُرجع رسالة الفحص الخام (توست إنجليزي مخيف) — سبب حقيقي قصير أو رسالة ودّية.
-    return { ok: false, message: lastDeviceSaveError
-      ? `تعذّر النسخ إلى الجهاز — ${lastDeviceSaveError}`
+    // (v2.0.21) لا نُرجع رسالة الفحص الخام (توست إنجليزي مخيف) — سلسلة الأسباب أو رسالة ودّية.
+    const summary = deviceSaveErrorSummary();
+    return { ok: false, message: summary
+      ? `تعذّر النسخ إلى الجهاز — ${summary}`
       : 'تعذّر النسخ — امنح صلاحية «جميع الملفات» من البانر أعلى الشاشة' };
   }, [setDownloadDir]);
 
@@ -2342,9 +2355,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (ok) {
         patchItem(entry.id, { error: undefined, deviceSaved: true });
         moved += 1;
-      } else if (lastDeviceSaveError) {
-        // (v2.0.21) بدل الصمت: السبب الحقيقي القصير — ويُمسح تلقائياً عند نجاح النسخ لاحقاً.
-        patchItem(entry.id, { error: `لم يُحفظ في مجلد الجهاز — ${lastDeviceSaveError}` });
+      } else if (deviceSaveErrorSummary()) {
+        // (v2.0.23) بدل الصمت: سلسلة الأسباب الكاملة — وتُمسح تلقائياً عند نجاح النسخ لاحقاً.
+        patchItem(entry.id, { error: `لم يُحفظ في مجلد الجهاز — ${deviceSaveErrorSummary()}` });
       }
     }
     if (pending.length > 0 && moved === 0) setDeviceSaveNeedsFolder(true);
