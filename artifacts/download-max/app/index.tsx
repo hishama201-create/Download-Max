@@ -35,7 +35,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess, openAllFilesAccessSettings } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess } from '@/context/DownloadContext';
 import type { ProbedFormat } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
@@ -1057,6 +1057,9 @@ function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut
           <Text style={[styles.vaultSubtitle, { color: colors.mutedForeground }]}>
             {pin ? 'رمز من 4 أرقام لفتح ملفاتك الخاصة' : stage === 'confirm' ? 'أعد إدخال الرمز للتأكيد' : 'احتفظ بملفاتك الخاصة هنا · لن تظهر في التشغيل أو التنزيلات'}
           </Text>
+          <Text style={[styles.vaultSubtitle, { color: colors.mutedForeground }]}>
+            الخزنة تخفي الملفات داخل التطبيق، لكنها لا تشفّر محتواها.
+          </Text>
           {error ? <Text style={[styles.vaultError, { color: colors.destructive }]}>رمز خاطئ، حاول مرة أخرى</Text> : null}
           <PinPad draft={draft} colors={colors} onDigit={pressDigit} onDelete={() => setDraft((current) => current.slice(0, -1))} />
         </View>
@@ -1674,8 +1677,8 @@ export default function HomeScreen() {
    * جديد ينزل فيه تلقائياً بلا زر «نسخ».
    */
   async function enableAutoSave() {
-    if (Platform.OS === 'web') {
-      setNotice('الحفظ في مجلد الجهاز متاح في تطبيق أندرويد');
+    if (Platform.OS !== 'android') {
+      setNotice('الحفظ التلقائي في مجلد الجهاز متاح على Android فقط');
       return;
     }
     const result = await enableDeviceAutoSave();
@@ -1683,13 +1686,20 @@ export default function HomeScreen() {
   }
 
   // (v2.0.19) الوجهة الحقيقية: مجلد «Download Max» داخل المجلد المختار (SAF)، وإلا ألبوم المعرض.
+  const selectedSaveRoot = downloadDir ? dirLabel(downloadDir) : '';
   const deviceSavePath = downloadDir
-    ? `${dirLabel(downloadDir)} / Download Max`
-    : 'المعرض · ألبوم Download Max';
+    ? selectedSaveRoot.toLowerCase() === 'download max'
+      ? selectedSaveRoot
+      : `${selectedSaveRoot} / Download Max`
+    : Platform.OS === 'android' && allFilesGranted
+      ? 'DownloadMax / download'
+      : 'المعرض · ألبوم Download Max';
 
-  function vaultAction(item: DownloadItem) {
-    void moveToVault(item.id);
-    setNotice('نُقل الملف إلى الخزنة 🔒');
+  async function vaultAction(item: DownloadItem) {
+    const moved = await moveToVault(item.id);
+    setNotice(moved
+      ? 'نُقل الملف إلى الخزنة 🔒'
+      : 'أُخفي الملف في التطبيق، لكن تعذّر نقله إلى مجلد الخزنة');
   }
 
   /** يبدأ تحويل الفيديو المختار إلى صوت بالصيغة المحددة. */
@@ -1776,12 +1786,16 @@ export default function HomeScreen() {
   }
 
   /** ينقل كل الملفات المحددة إلى الخزنة دفعة واحدة. */
-  function vaultSelected() {
+  async function vaultSelected() {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
-    for (const id of ids) void moveToVault(id);
+    const outcomes: boolean[] = [];
+    for (const id of ids) outcomes.push(await moveToVault(id));
     setSelectedIds(new Set());
-    setNotice(`نُقل ${ids.length} ملف إلى الخزنة 🔒`);
+    const moved = outcomes.filter(Boolean).length;
+    setNotice(moved === ids.length
+      ? `نُقل ${moved} ملف إلى الخزنة 🔒`
+      : `نُقل ${moved} من ${ids.length} ملف؛ بعض الملفات أُخفيت داخل التطبيق فقط`);
   }
 
   /** مشاركة الملفات المحددة عبر لوحة مشاركة أندرويد (ملف واحد أو عدة ملفات). */
@@ -1844,19 +1858,15 @@ export default function HomeScreen() {
 
       <View style={styles.content}>
         {/* (v2.0.21) بوابة صلاحية «جميع الملفات»: خطوة واحدة تضمن حفظ كل تنزيل في مجلد الجهاز. */}
-        {Platform.OS === 'android' && allFilesGranted === false && !storageGateDismissed ? (
+        {Platform.OS === 'android' && allFilesGranted === false && !downloadDir && !storageGateDismissed ? (
           <View style={[styles.storageGate, { backgroundColor: `${colors.primary}12`, borderColor: `${colors.primary}44` }]}>
             <Feather name="shield" size={18} color={colors.primary} />
             <View style={styles.storageGateCopy}>
               <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>مكّن حفظ الملفات في جهازك</Text>
-              <Text style={[styles.storageGateBody, { color: colors.mutedForeground }]} numberOfLines={2}>خطوة واحدة: اسمح بالوصول لجميع الملفات ليُحفظ كل تنزيل تلقائياً في مجلد «Download» — مثل تطبيقات التنزيل الأخرى.</Text>
-              {/* (v2.0.23) باب بديل: بعض أجهزة سامسونج لا تفتح شاشة المفتاح مباشرة — إعدادات التطبيق فيها نفس المفتاح باسم «الملفات والوسائط». */}
-              <Pressable onPress={() => { void Linking.openSettings(); }} hitSlop={6}>
-                <Text style={[styles.storageGateAlt, { color: colors.primary }]}>لا يظهر المفتاح؟ افتح إعدادات التطبيق ←</Text>
-              </Pressable>
+              <Text style={[styles.storageGateBody, { color: colors.mutedForeground }]} numberOfLines={2}>اختر مجلد الحفظ مرة واحدة عبر منتقي Android الرسمي؛ لا تحتاج إلى صلاحية الوصول لجميع الملفات.</Text>
             </View>
-            <Pressable testID="grant-all-files" accessibilityLabel="منح صلاحية جميع الملفات" onPress={() => { void openAllFilesAccessSettings(); }} style={[styles.storageGateBtn, { backgroundColor: colors.primary }]}>
-              <Text style={[styles.storageGateBtnText, { color: colors.primaryForeground }]}>منح الآن</Text>
+            <Pressable testID="choose-download-folder" accessibilityLabel="اختيار مجلد الحفظ" onPress={() => { void enableAutoSave(); }} style={[styles.storageGateBtn, { backgroundColor: colors.primary }]}>
+              <Text style={[styles.storageGateBtnText, { color: colors.primaryForeground }]}>اختيار مجلد</Text>
             </Pressable>
             <Pressable accessibilityLabel="إخفاء التنبيه مؤقتاً" onPress={() => setStorageGateDismissed(true)} hitSlop={8}>
               <Feather name="x" size={15} color={colors.mutedForeground} />

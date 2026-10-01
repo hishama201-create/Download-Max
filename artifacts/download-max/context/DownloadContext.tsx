@@ -198,7 +198,7 @@ type DownloadContextValue = {
   resumeDownload: (id: string) => Promise<void>;
   removeDownload: (id: string) => Promise<void>;
   clearCompleted: () => Promise<void>;
-  moveToVault: (id: string) => Promise<void>;
+  moveToVault: (id: string) => Promise<boolean>;
   removeFromVault: (id: string) => Promise<void>;
   setQueueOptions: (options: { maxTasks: MaxTasks; maxTasksCellular: MaxTasks; allowMobileData: boolean }) => void;
   /** مجلد التنزيل المختار (SAF URI) أو null للحفظ الداخلي. */
@@ -250,7 +250,7 @@ function safeFilename(title: string, format: string) {
  * (v2.0.17) اسم غير مكرر داخل المجلد: لو الملف موجود يُرقّم تلقائياً
  * «اسم (1).mp4» بدل الكتابة فوق ملف المستخدم القديم.
  */
-async function uniqueFilename(dir: string, filename: string): Promise<string> {
+async function uniqueFilename(dir: string, filename: string, ignoreUri?: string): Promise<string> {
   const dot = filename.lastIndexOf('.');
   const stem = dot > 0 ? filename.slice(0, dot) : filename;
   const ext = dot > 0 ? filename.slice(dot) : '';
@@ -258,7 +258,7 @@ async function uniqueFilename(dir: string, filename: string): Promise<string> {
   let n = 1;
   for (;;) {
     const info = await FileSystem.getInfoAsync(`${dir}${candidate}`).catch(() => null);
-    if (!info?.exists) return candidate;
+    if (!info?.exists || `${dir}${candidate}` === ignoreUri) return candidate;
     candidate = `${stem} (${n++})${ext}`;
   }
 }
@@ -449,6 +449,7 @@ const PROBE_FILE = `file://${PUBLIC_DOWNLOAD_DIR}download-max-probe.tmp`;
  * فنتحقق بالكتابة: ننشئ ملفاً صغيراً في المجلد العام ثم نحذفه فوراً.
  */
 export async function hasStorageAccess(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
   return (await storageAccessError()) === null;
 }
 
@@ -592,49 +593,48 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
 }
 
 /**
- * (v2.0.19) سلسلة الحفظ في جهاز المستخدم بالترتيب المضمون — كل مسار صامت عند فشله:
- * 1) «الوصول لجميع الملفات» متاح؟ نسخة في هيكل DownloadMax/download/… (الأفضل — ملف حقيقي).
- * 2) المستخدم اختار مجلداً مرة واحدة (SAF)؟ نسخة في «المختار / Download Max / النوع» — مضمون
- *    لأن صلاحية الشجرة محفوظة (أثبتت نجاحها بإنشائها المجلدات).
- * 3) وإلا ألبوم «Download Max» عبر MediaStore (المعرض) بصلاحية وسائط عادية.
- * 4) أخيراً المسار العام «Download/Download Max» إن سارت الصلاحية المباشرة.
- * الأصل يبقى دائماً في مساحة التطبيق (fileUri يشير إليه) — والفشل الكلي لا يعرض أي خطأ.
+ * يحفظ نسخة الجهاز في الوجهة التي اختارها المستخدم أولاً.
+ * إذا لم يختر مجلداً، نستخدم مجلد التطبيق العام عند توافر All Files، ثم ألبوم
+ * MediaStore للصور والفيديو. لا نكتب في وجهة بديلة بصمت بعد فشل SAF.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
-  // (v2.0.21) صفّر سجل الأسباب قبل بدء السلسلة حتى لا يظهر سبب ملف سابق لملف جديد.
+  // صفّر سجل الأسباب قبل بدء السلسلة حتى لا يظهر سبب ملف سابق لملف جديد.
   lastDeviceSaveError = null;
   deviceSaveErrorLog = [];
-  // ١) صلاحية All Files Access: هيكل Snaptube العام.
-  if (Platform.OS === 'android' && (await hasStorageAccess())) {
-    const dir = await snaptubeTypeDir(type);
-    if (dir) {
-      try {
-        await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
-        return true;
-      } catch (error) { noteDeviceSaveError('نسخ AllFiles', error); /* نكمل للمسار التالي */ }
+  if (Platform.OS === 'web') return false;
+
+  // اختار المستخدم وجهة SAF؟ احفظ فيها أولاً، ولا تحوّل النجاح إلى مسار آخر بصمت.
+  if (safDir) {
+    try {
+      const appRoot = await safAppRoot(safDir);
+      const dir = await safSubfolder(appRoot, subfolderFor(type));
+      return await saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir);
+    } catch (error) {
+      noteDeviceSaveError('حفظ SAF', error);
+      return false;
     }
   }
-  // ٢) المجلد الذي اختاره المستخدم (SAF) — أضمن مسار متاح بلا أي صلاحية خاصة.
-  if (safDir) {
-    const appRoot = await safAppRoot(safDir);
-    const dir = await safSubfolder(appRoot, subfolderFor(type));
-    if (await saveFileToSafDirectory(localUri, filename, mimeFor(filename), dir)) return true;
-  } else {
-    noteDeviceSaveError('SAF', 'لم يتم اختيار مجلد حفظ في الجهاز');
-  }
-  // ٣) ألبوم «Download Max» عبر MediaStore.
-  if (await saveToPublicAlbum(localUri, filename, type)) return true;
-  deviceSaveErrorLog.push('المعرض: تعذّر الحفظ في ألبوم Download Max');
-  // ٤) المسار العام «Download/Download Max» كخيار أخير.
-  if (await hasStorageAccess()) {
+
+  // All Files اختياري؛ عند توافره تكون الوجهة العامة ثابتة وواضحة.
+  if (Platform.OS === 'android' && await hasStorageAccess()) {
+    const dir = await snaptubeTypeDir(type);
+    if (!dir) {
+      noteDeviceSaveError('حفظ All Files', 'تعذّر إنشاء مجلد التنزيلات العام');
+      return false;
+    }
     try {
-      const dir = `${await publicDownloadRoot()}${subfolderFor(type)}/`;
-      const info = await FileSystem.getInfoAsync(dir);
-      if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
       await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
       return true;
-    } catch (error) { noteDeviceSaveError('مسار Download', error); /* المسار العام غير متاح أيضاً */ }
+    } catch (error) {
+      noteDeviceSaveError('نسخ All Files', error);
+      return false;
+    }
   }
+
+  // لا مجلد مختار ولا All Files: الصور والفيديو يمكن حفظهما في المعرض عبر MediaStore.
+  if (type !== 'audio' && await saveToPublicAlbum(localUri, filename, type)) return true;
+  deviceSaveErrorLog.push('المعرض: تعذّر الحفظ في ألبوم Download Max');
+  if (type === 'audio') noteDeviceSaveError('حفظ الصوت', 'اختر مجلداً لحفظ الملف الصوتي');
   return false;
 }
 
@@ -953,29 +953,19 @@ async function isSafFileHasContent(safFileUri: string): Promise<boolean> {
  * المضمون في كود expo نفسه: نسخ NativeFile (المصدر) ← NativeDirectory (المجلد)
  * مباشرة، بلا إنشاء ملف فارغ مسبقاً.
  *
- * سبب كسر النسخ القديم (v2.0.9–23): كنا ننشئ أولاً ملفاً فارغاً بـ createFileAsync
- * ثم ننسخ المحتوى فوقه — فمع overwrite:false يرمي expo DestinationAlreadyExistsException
- * فوراً (الملف الفارغ موجود أصلاً)، ومع overwrite:true يحذف expo الملف الموجود ثم
- * يكتب في رابط ميت فترمي سامسونج IllegalArgumentException. أما النسخ إلى المجلد نفسه
- * فتجد expo الملف بنفس الاسم، تحذفه عبر SAF عند الاستبدال، ثم تنشئ مستنداً طازجاً
- * بـ createFile وتكتب فيه بتدفق أصلي (copyFileWithChannelFallback) — أي حجم بلا مشاكل.
+ * النسخ يتم مباشرة إلى المجلد الأصلي، من دون إنشاء ملف فارغ مسبقاً أو استبدال
+ * ملف موجود بالاسم نفسه؛ فشل التعارض لا يجوز أن يحذف نسخة المستخدم السابقة.
  */
 async function saveFileToSafDirectory(localUri: string, filename: string, mimeType: string, directoryUri: string): Promise<boolean> {
   try {
     const source = new NativeFile(localUri);
     const targetDir = new NativeDirectory(directoryUri);
-    // المحاولة الأولى بلا استبدال — تحفظ أي نسخة سابقة بنفس الاسم. إن تعارض الاسم
-    // نعيد بمحاولة استبدال: تحذف القديم عبر SAF ثم تكتب في مستند طازج (آمن هنا
-    // لأن الوجهة مجلد — وليست رابط ملف ميت كما في النسخة القديمة).
+    let copied = false;
     try {
       await source.copy(targetDir, { overwrite: false });
+      copied = true;
     } catch (firstError) {
       noteDeviceSaveError('نسخ SAF', firstError);
-      try {
-        await source.copy(targetDir, { overwrite: true });
-      } catch (overwriteError) {
-        noteDeviceSaveError('استبدال SAF', overwriteError);
-      }
     }
     // التحقق الفعلي: الملف موجود في المجلد وفيه محتوى. قراءة الحجم مباشرة بعد
     // الكتابة قد تخفق مع مزودات سامسونج — ننتظر قليلاً ونعيد القراءة قبل الحكم.
@@ -986,7 +976,7 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
       await new Promise((resolve) => setTimeout(resolve, 400));
       return isSafFileHasContent(child);
     };
-    if (await verifyChild()) return true;
+    if (copied && await verifyChild()) return true;
     // خطة Base64 الأخيرة عبر مستند جديد طازج باسم فريد — للملفات الصغيرة فقط
     // (كتابة مستند SAF موجود غير موثوقة على سامسونج: canWrite قد ترجع false).
     const info = await FileSystem.getInfoAsync(localUri).catch(() => null);
@@ -1349,7 +1339,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         const info = await FileSystem.getInfoAsync(target);
         const size = 'size' in info && typeof info.size === 'number' ? info.size : undefined;
         const deviceSaved = await mirrorToDeviceDownloads(target, finalName, item.type, downloadDirRef.current).catch(() => false);
-        if (!deviceSaved) setDeviceSaveNeedsFolder(true);
+        if (!deviceSaved && Platform.OS === 'android') setDeviceSaveNeedsFolder(true);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -1505,7 +1495,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!resumable) {
         // إزالة أي بقايا من محاولة سابقة حتى يبدأ التقدم من الصفر.
         const existing = await FileSystem.getInfoAsync(target);
-        if (existing.exists) await FileSystem.deleteAsync(target, { idempotent: true });
+        if (existing.exists) {
+          const filename = target.split('/').pop() ?? safeFilename(item.title, item.format);
+          target = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, filename)}`;
+        }
         resumable = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
       }
       resumablesRef.current.set(id, resumable);
@@ -1558,24 +1551,32 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           const live = itemsRef.current.find((candidate) => candidate.id === id);
           if (live && !live.deletedAt) await patchItem(id, { status: 'paused' });
         }
-      } else if (result.status === 200) {
+      } else if (result.status === 200 || result.status === 206) {
         // ضمان صيغة صحيحة: إن كان الرابط المباشر يحمل امتداداً واضحاً نعتمده.
         let finalFormat = resolvedFormat;
         const uriExt = result.uri.split('.').pop()?.toLowerCase();
         if (uriExt && /^[a-z0-9]{2,5}$/i.test(uriExt) && MIME_TYPES[uriExt]) finalFormat = uriExt;
-        const finalFilename = await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, finalFormat));
-        if (result.uri !== `${initialTypeDir}${finalFilename}`) {
+        let finalFilename = await uniqueFilename(
+          initialTypeDir || baseDirectory,
+          safeFilename(resolvedTitle, finalFormat),
+          result.uri,
+        );
+        let finalUri = result.uri;
+        const desiredUri = `${initialTypeDir || baseDirectory}${finalFilename}`;
+        if (result.uri !== desiredUri) {
           try {
-            await FileSystem.moveAsync({ from: result.uri, to: `${initialTypeDir}${finalFilename}` });
+            await FileSystem.moveAsync({ from: result.uri, to: desiredUri });
+            finalUri = desiredUri;
           } catch {
-            // نُبقي المسار الأصلي عند تعذر النقل.
+            // لا نسجّل وجهة غير موجودة إذا تعذّر تغيير الاسم.
+            finalFilename = result.uri.split('/').pop() ?? finalFilename;
           }
         }
-        target = `${initialTypeDir}${finalFilename}`;
+        target = finalUri;
         // (v2.0.20) نسخة لمجلد الجهاز عبر السلسلة المضمونة — النتيجة تُسجَّل على العنصر
         // حتى لا تتكرر المحاولة، وفشلها الكلي يفتح منتقي المجلد مرة واحدة بدل الصمت.
         const deviceSaved = await mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current).catch(() => false);
-        if (!deviceSaved) setDeviceSaveNeedsFolder(true);
+        if (!deviceSaved && Platform.OS === 'android') setDeviceSaveNeedsFolder(true);
         await patchItem(id, {
           status: 'completed',
           progress: 1,
@@ -2086,7 +2087,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const moveToVault = useCallback(async (id: string) => {
+  const moveToVault = useCallback(async (id: string): Promise<boolean> => {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     // اخفاء فعلي: نقل الملف الى مجلد خاص مخفي (.vault) مع .nomedia لاخفائه من ماسح الوسائط
     if (item?.fileUri && !/^https?:\/\//i.test(item.fileUri) && Platform.OS !== 'web') {
@@ -2100,13 +2101,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           if (!dirInfo.exists) await FileSystem.makeDirectoryAsync(vaultDir, { intermediates: true });
           const markerInfo = await FileSystem.getInfoAsync(vaultMarker);
           if (!markerInfo.exists) await FileSystem.writeAsStringAsync(vaultMarker, '', { encoding: FileSystem.EncodingType.UTF8 });
-          const movedUri = `${vaultDir}${filename}`;
-          const existing = await FileSystem.getInfoAsync(movedUri);
-          if (existing.exists) await FileSystem.deleteAsync(movedUri, { idempotent: true });
+          const movedUri = `${vaultDir}${await uniqueFilename(vaultDir, filename)}`;
           await FileSystem.moveAsync({ from: item.fileUri, to: movedUri });
           patchItem(id, { inVault: true, fileUri: movedUri });
           await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-          return;
+          return true;
         }
       } catch {
         // فشل النقل الفعلي — نكتفي بالإخفاء المنطقي حتى لا يفقد المستخدم الملف.
@@ -2114,6 +2113,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
     patchItem(id, { inVault: true });
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    return false;
   }, [patchItem]);
 
   const removeFromVault = useCallback(async (id: string) => {
@@ -2123,9 +2123,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       try {
         const baseDirectory = (await baseDownloadDir()) ?? FileSystem.documentDirectory;
         const filename = item.fileUri.split('/').pop() ?? '';
-        const restoredUri = `${baseDirectory ?? ''}${filename}`;
-        const existing = await FileSystem.getInfoAsync(restoredUri);
-        if (existing.exists) await FileSystem.deleteAsync(restoredUri, { idempotent: true });
+        const restoreDir = baseDirectory ?? FileSystem.documentDirectory ?? '';
+        const restoredUri = `${restoreDir}${await uniqueFilename(restoreDir, filename)}`;
         await FileSystem.moveAsync({ from: item.fileUri, to: restoredUri });
         if (item.type === 'image' || item.type === 'video') {
           try {
@@ -2320,6 +2319,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (await mirrorToDeviceDownloads(source, filename, item.type, downloadDirRef.current)) {
       return { ok: true, message: 'نُسخ إلى مجلد التنزيلات في جهازك ✓' };
     }
+    if (Platform.OS !== 'android') {
+      return { ok: false, message: 'نسخ الملف إلى مجلد خارجي متاح على Android فقط.' };
+    }
     // الحفظ التلقائي غير متاح: نطلب منه اختيار مجلده مرة واحدة ثم ننسخ دائماً
     // في «المختار / Download Max / نوع الوسيط» — نفس المسار الأساسي (v2.0.8).
     const picked = await pickDeviceDirectory();
@@ -2334,7 +2336,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const summary = deviceSaveErrorSummary();
     return { ok: false, message: summary
       ? `تعذّر النسخ إلى الجهاز — ${summary}`
-      : 'تعذّر النسخ — امنح صلاحية «جميع الملفات» من البانر أعلى الشاشة' };
+      : 'تعذّر النسخ — اختر مجلد حفظ في الجهاز وحاول مرة أخرى' };
   }, [setDownloadDir]);
 
   /**
@@ -2343,7 +2345,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
    * المنقولة، وإن فشلت السلسلة كلياً مع وجود ملفات معلقة يرفع راية اختيار المجلد.
    */
   const syncPendingToDevice = useCallback(async (): Promise<number> => {
-    if (Platform.OS === 'web') return 0;
+    if (Platform.OS !== 'android') return 0;
     let safDirNow = downloadDirRef.current;
     if (!safDirNow) {
       safDirNow = (await AsyncStorage.getItem(DOWNLOAD_DIR_KEY).catch(() => null)) ?? null;
@@ -2380,7 +2382,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
    * لا «تم» كاذبة بعد اليوم: اختيار المجلد وحده ليس نجاحاً.
    */
   const pickDeviceFolderNow = useCallback(async (): Promise<{ picked: boolean; moved: number; failed: number }> => {
-    if (Platform.OS === 'web') return { picked: false, moved: 0, failed: 0 };
+    if (Platform.OS !== 'android') return { picked: false, moved: 0, failed: 0 };
     const picked = await pickDeviceDirectory();
     if (!picked) return { picked: false, moved: 0, failed: 0 };
     if (picked !== downloadDirRef.current) await setDownloadDir(picked);
@@ -2400,15 +2402,32 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
    *    جديد ينزل تلقائياً فيه. المستخدم لا يضغط «نسخ» أبداً بعد ذلك.
    */
   const enableDeviceAutoSave = useCallback(async (): Promise<{ ok: boolean; where: string | null; message: string }> => {
-    if (await hasStorageAccess()) {
-      const root = await publicDownloadRoot();
-      if (root) {
+    if (Platform.OS !== 'android') {
+      return { ok: false, where: null, message: 'الحفظ التلقائي في مجلد الجهاز متاح على Android فقط.' };
+    }
+    const selectedDir = downloadDirRef.current;
+    if (selectedDir) {
+      try {
+        const appRoot = await safAppRoot(selectedDir);
         for (const type of ['video', 'image', 'voice'] as MediaType[]) {
-          const dir = `${root}${subfolderFor(type)}/`;
-          const info = await FileSystem.getInfoAsync(dir).catch(() => null);
-          if (!info?.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
+          const typeDir = await safSubfolder(appRoot, subfolderFor(type));
+          if (typeDir === appRoot || !(await isSafDirAlive(typeDir))) {
+            return { ok: false, where: null, message: 'تعذّر تجهيز مجلد الحفظ المختار — اختر مجلداً آخر.' };
+          }
         }
-        return { ok: true, where: root, message: 'كل تنزيل جديد يُحفظ تلقائياً في مجلد التنزيلات ✓' };
+        return { ok: true, where: appRoot, message: 'كل تنزيل جديد سيُحفظ في المجلد الذي اخترته تلقائياً ✓' };
+      } catch {
+        return { ok: false, where: null, message: 'تعذّر الوصول إلى مجلد الحفظ المختار — اختره مجدداً.' };
+      }
+    }
+    if (await hasStorageAccess()) {
+      const root = `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/`;
+      let ready = true;
+      for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+        if (!(await snaptubeTypeDir(type))) ready = false;
+      }
+      if (ready) {
+        return { ok: true, where: root, message: 'كل تنزيل جديد يُحفظ تلقائياً في مجلد DownloadMax ✓' };
       }
     }
     const picked = await pickDeviceDirectory();

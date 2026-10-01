@@ -11,6 +11,7 @@
       "supportsTablet": false
     },
     "android": {
+      "versionCode": 25,
       "intentFilters": [
         {
           "action": "SEND",
