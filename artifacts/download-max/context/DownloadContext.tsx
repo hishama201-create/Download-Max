@@ -9,7 +9,7 @@ import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
 import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { Linking, Platform } from 'react-native';
+import { DeviceEventEmitter, Linking, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 import { setPublicRootProvider, syncHistorySnapshot, upsertHistoryEntry, deleteHistoryEntry } from '@/context/historyDb';
 import { extractAudioFromVideo } from '@/context/audio';
@@ -24,6 +24,52 @@ const RESUME_KEY_PREFIX = '@download-max/resume/';
 /** مدة بقاء الملفات في سلة المحذوفات قبل حذفها تلقائياً (30 يوماً). */
 const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
+type ForegroundDownloadBridge = {
+  upsertDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
+  updateDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
+  removeDownload: (id: string) => void;
+  consumePendingActions: () => Promise<{ id: string; action: string }[]>;
+};
+
+const foregroundDownloadBridge = NativeModules.DownloadForeground as ForegroundDownloadBridge | undefined;
+let notificationPermissionRequested = false;
+
+async function requestDownloadNotificationPermission(): Promise<boolean> {
+  if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return true;
+  try {
+    const permission = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
+    if (await PermissionsAndroid.check(permission)) return true;
+    if (notificationPermissionRequested) return false;
+    notificationPermissionRequested = true;
+    return (await PermissionsAndroid.request(permission, {
+      title: 'إشعار التنزيلات',
+      message: 'اسمح بالإشعارات لمتابعة تقدم التنزيل والتحكم به عند استخدام تطبيقات أخرى.',
+      buttonPositive: 'السماح',
+      buttonNegative: 'ليس الآن',
+    })) === PermissionsAndroid.RESULTS.GRANTED;
+  } catch {
+    return false;
+  }
+}
+
+function updateForegroundDownload(item: DownloadItem, fileUri = '', totalBytes = item.totalBytes ?? 0, paused = false) {
+  if (Platform.OS !== 'android') return;
+  try {
+    foregroundDownloadBridge?.updateDownload(item.id, item.title, fileUri, totalBytes, paused);
+  } catch {
+    // الإشعار واجهة مساعدة؛ لا نوقف التنزيل إن تعذر تحديثه.
+  }
+}
+
+function removeForegroundDownload(id: string) {
+  if (Platform.OS !== 'android') return;
+  try {
+    foregroundDownloadBridge?.removeDownload(id);
+  } catch {
+    // لا يؤثر فشل تنظيف الإشعار في سجل التنزيل.
+  }
+}
+
 /**
  * خدمة تحويل روابط الصفحات إلى روابط وسائط مباشرة.
  * يمكن تغييرها لكل بيئة عبر EXPO_PUBLIC_EXTRACTOR_URL (تُثبَّت وقت البناء).
@@ -33,6 +79,26 @@ const EXTRACTOR_API_URL =
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed';
 export type MediaType = 'video' | 'audio' | 'image';
+
+function canonicalDownloadUrl(value: string): string {
+  const cleaned = value.trim();
+  try {
+    const parsed = new URL(cleaned);
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return cleaned;
+  }
+}
+
+function hasActiveDuplicate(items: DownloadItem[], sourceUrl: string): boolean {
+  const key = canonicalDownloadUrl(sourceUrl);
+  return items.some((item) =>
+    !item.deletedAt &&
+    (item.status === 'queued' || item.status === 'downloading' || item.status === 'paused') &&
+    canonicalDownloadUrl(item.sourceUrl ?? item.url) === key,
+  );
+}
 
 // خدمة يوتيوب الاحتياطية: تشتغل عندما ترفض الخدمة الأساسية الفيديو (youtube.login ومشقاته).
 // تعيد اسم الفيديو الحقيقي + رابط تنزيل نهائي بعد تجهيز الملف.
@@ -140,6 +206,8 @@ export function requestOptionsFor(type: MediaType, format: string): MediaRequest
 export type DownloadItem = {
   id: string;
   url: string;
+  /** الرابط الأصلي الذي أدخله المستخدم؛ يبقى ثابتاً حتى لو تغيّر رابط الوسائط المستخرج. */
+  sourceUrl?: string;
   title: string;
   type: MediaType;
   format: string;
@@ -168,7 +236,7 @@ type DownloadContextValue = {
   items: DownloadItem[];
   activeCount: number;
   waitingForWifi: boolean;
-  addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<void>;
+  addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<boolean>;
   /** يضيف تنزيلاً ذكياً: يكشف كاروسيل الصور وينشئ مهمة لكل صورة. يعيد عدد المهام. */
   addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
   /** يضيف صور كاروسيل مختارة مسبقاً (روابط مباشرة) كمهام تنزيل. يعيد عددها. */
@@ -949,7 +1017,8 @@ async function isSafFileHasContent(safFileUri: string): Promise<boolean> {
 }
 
 /**
- * (v2.0.24) ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم — بالنمط الصحيح
+ * (v2.0.26) ينسخ ملفاً محلياً إلى مجلد SAF من دون إنشاء نسخة احتياطية ثانية
+ * إذا نجح النسخ الأصلي — بالنمط الصحيح
  * المضمون في كود expo نفسه: نسخ NativeFile (المصدر) ← NativeDirectory (المجلد)
  * مباشرة، بلا إنشاء ملف فارغ مسبقاً.
  *
@@ -960,12 +1029,31 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
   try {
     const source = new NativeFile(localUri);
     const targetDir = new NativeDirectory(directoryUri);
+    // إذا كان الملف موجوداً فعلاً، لا ننشئ نسخة Base64 باسم بديل عند تعذر قراءة
+    // metadata لحظياً — كان ذلك يترك نسختين متطابقتين في مجلد SAF.
+    const existing = await findSafChildByName(directoryUri, filename);
+    let differentFileHasSameName = false;
+    if (existing) {
+      let sourceSize = 0;
+      let existingSize = 0;
+      try { sourceSize = source.size; } catch { /* مزود SAF قد يؤخر metadata */ }
+      try { existingSize = new NativeFile(existing).size; } catch { /* نعالج الحجم المجهول بحذر */ }
+      differentFileHasSameName = sourceSize > 0 && existingSize > 0 && sourceSize !== existingSize;
+      if (!differentFileHasSameName) {
+        if (await isSafFileHasContent(existing)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (await isSafFileHasContent(existing)) return true;
+        return false;
+      }
+    }
     let copied = false;
-    try {
-      await source.copy(targetDir, { overwrite: false });
-      copied = true;
-    } catch (firstError) {
-      noteDeviceSaveError('نسخ SAF', firstError);
+    if (!differentFileHasSameName) {
+      try {
+        await source.copy(targetDir, { overwrite: false });
+        copied = true;
+      } catch (firstError) {
+        noteDeviceSaveError('نسخ SAF', firstError);
+      }
     }
     // التحقق الفعلي: الملف موجود في المجلد وفيه محتوى. قراءة الحجم مباشرة بعد
     // الكتابة قد تخفق مع مزودات سامسونج — ننتظر قليلاً ونعيد القراءة قبل الحكم.
@@ -976,7 +1064,15 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
       await new Promise((resolve) => setTimeout(resolve, 400));
       return isSafFileHasContent(child);
     };
-    if (copied && await verifyChild()) return true;
+    if (copied) {
+      // بعض مزودات SAF تتأخر في إظهار حجم الملف بعد نجاح النسخ. نعيد الفحص
+      // عدة مرات، لكن لا ننشئ مستنداً ثانياً إذا نجح النسخ الأصلي.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (await verifyChild()) return true;
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      return true;
+    }
     // خطة Base64 الأخيرة عبر مستند جديد طازج باسم فريد — للملفات الصغيرة فقط
     // (كتابة مستند SAF موجود غير موثوقة على سامسونج: canWrite قد ترجع false).
     const info = await FileSystem.getInfoAsync(localUri).catch(() => null);
@@ -1271,29 +1367,28 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
   }, []);
   const commit = useCallback((updater: (current: DownloadItem[]) => DownloadItem[]) => {
-    setItems((current) => {
-      const next = updater(current);
-      itemsRef.current = next;
-      const stateChanged = next.some((entry, index) => {
-        const previous = current[index];
-        return !previous || previous.id !== entry.id || previous.status !== entry.status;
-      });
-      if (stateChanged) {
-        if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
-        persistPending = null;
-        persistNow(next);
-      } else if (persistTimer) {
-        persistPending = next;
-      } else {
-        persistPending = next;
-        persistTimer = setTimeout(() => {
-          persistTimer = null;
-          if (persistPending) persistNow(persistPending);
-          persistPending = null;
-        }, 1200);
-      }
-      return next;
+    const current = itemsRef.current;
+    const next = updater(current);
+    itemsRef.current = next;
+    setItems(next);
+    const stateChanged = next.some((entry, index) => {
+      const previous = current[index];
+      return !previous || previous.id !== entry.id || previous.status !== entry.status;
     });
+    if (stateChanged) {
+      if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+      persistPending = null;
+      persistNow(next);
+    } else if (persistTimer) {
+      persistPending = next;
+    } else {
+      persistPending = next;
+      persistTimer = setTimeout(() => {
+        persistTimer = null;
+        if (persistPending) persistNow(persistPending);
+        persistPending = null;
+      }, 1200);
+    }
   }, [persistNow]);
 
   const patchItem = useCallback((id: string, patch: Partial<DownloadItem>) => {
@@ -1313,6 +1408,16 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    if (Platform.OS === 'android') {
+      try {
+        // ابدأ الخدمة فور خروج المهمة من الطابور؛ Android يقيّد تشغيل FGS
+        // إذا انتقل التطبيق للخلفية قبل إنشاء الإشعار.
+        foregroundDownloadBridge?.upsertDownload(id, item.title, '', item.totalBytes ?? 0, false);
+      } catch {
+        // يبقى التنزيل متاحاً حتى لو لم تتوفر وحدة الإشعار.
+      }
+      await requestDownloadNotificationPermission();
+    }
     await patchItem(id, { status: 'downloading', progress: item.progress > 0 ? item.progress : 0, error: undefined });
 
     if (Platform.OS === 'web') {
@@ -1323,6 +1428,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
+      if (itemsRef.current.find((candidate) => candidate.id === id)?.deletedAt) return;
       const baseDirectory = await baseDownloadDir();
       if (!baseDirectory) throw new Error('تعذر الوصول إلى مساحة التخزين.');
 
@@ -1387,6 +1493,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // (v2.0.16) رابط وهمي من خدمة الاستخراج — لا نبدأ تنزيلاً محكوماً بالفشل.
         throw new Error('الخدمة لم ترجع رابطاً صالحاً — جرّب جودة أخرى أو رابطاً بديلاً');
       }
+      if (itemsRef.current.find((candidate) => candidate.id === id)?.deletedAt) return;
       // (v2.0.18) الوجهة: مساحة التطبيق دائماً — الألبوم العام يُضاف تلقائياً بعد الاكتمال.
       const initialTypeDir = await ensureTypeDir(baseDirectory, item.type);
       let target = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(item.title, item.format))}`;
@@ -1419,8 +1526,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (resolvedTitle !== item.title || resolvedFormat !== item.format) {
         await patchItem(id, { title: resolvedTitle, format: resolvedFormat });
       }
+      const foregroundItem = { ...item, title: resolvedTitle };
+      updateForegroundDownload(foregroundItem, target, remoteInfo.length ?? item.totalBytes ?? 0, false);
+      const notificationPaused = () =>
+        pauseRequestedRef.current.has(id) ||
+        itemsRef.current.find((candidate) => candidate.id === id)?.status === 'paused';
 
       let lastAt = 0;
+      let lastNotificationAt = 0;
 
       // (6) أحداث التقدّم من expo-file-system القديمة لا تصل تحت New Architecture، فيبقى
       // الشريط عند 0% حتى يكتمل الملف. نقيس حجم الملف على القرص بأنفسنا كل ~350ms.
@@ -1436,6 +1549,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             if (now - lastAt < 300) return;
             lastAt = now;
             bytesRef.current.set(id, { bytesWritten: stat.size, totalBytes: expected > 0 ? expected : undefined });
+            if (now - lastNotificationAt >= 1000) {
+              lastNotificationAt = now;
+              updateForegroundDownload(foregroundItem, target, expected, notificationPaused());
+            }
             if (expected <= 0) {
               // ما نعرف الحجم الكلي — نحدّث البايتات على الأقل ليشوف المستخدم الملف يكبر.
               patchItem(id, { progress: 0.001, bytesWritten: stat.size });
@@ -1461,6 +1578,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         progressRef.current.set(id, { progress: nextProgress, at: now });
         bytesRef.current.set(id, { bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
         patchItem(id, { progress: nextProgress, bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
+        if (now - lastNotificationAt >= 1000) {
+          lastNotificationAt = now;
+          updateForegroundDownload(foregroundItem, target, expected, notificationPaused());
+        }
       };
 
       // استئناف من نقطة توقف محفوظة (إن وُجدت) بدل البدء من الصفر.
@@ -1492,6 +1613,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
       } catch { /* حالة الاستئناف غير صالحة — بدء عادي */ }
 
+      if (pauseRequestedRef.current.has(id)) {
+        pauseRequestedRef.current.delete(id);
+        await patchItem(id, { status: 'paused', error: undefined });
+        updateForegroundDownload(foregroundItem, target, remoteInfo.length ?? item.totalBytes ?? 0, true);
+        return;
+      }
+      if (itemsRef.current.find((candidate) => candidate.id === id)?.deletedAt) return;
+
       if (!resumable) {
         // إزالة أي بقايا من محاولة سابقة حتى يبدأ التقدم من الصفر.
         const existing = await FileSystem.getInfoAsync(target);
@@ -1501,6 +1630,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
         resumable = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
       }
+      updateForegroundDownload(foregroundItem, target, remoteInfo.length ?? item.totalBytes ?? 0, false);
       resumablesRef.current.set(id, resumable);
 
       // الحفاظ على البايتات المحمّلة سابقاً عند الاستئناف (قد لا يصل حدث تقدم جديد قبل الاكتمال).
@@ -1613,6 +1743,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     } finally {
       activeIdsRef.current.delete(id);
+      const latest = itemsRef.current.find((candidate) => candidate.id === id);
+      if (!latest || latest.status !== 'paused') removeForegroundDownload(id);
       pumpRef.current();
     }
   }, [patchItem]);
@@ -1796,8 +1928,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   }, [patchItem, enqueue, purgeExpiredTrash]);
 
   const addDownload = useCallback(async (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => {
+    const sourceUrl = input.sourceUrl ?? input.url;
+    if (hasActiveDuplicate(itemsRef.current, sourceUrl)) return false;
     const item: DownloadItem = {
       ...input,
+      sourceUrl,
       id: createId(),
       status: 'queued',
       progress: 0,
@@ -1806,6 +1941,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     commit((current) => [item, ...current]);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     enqueue(item.id);
+    return true;
   }, [commit, enqueue]);
 
   /** يجلب حجم الملف لجودة/معدل محدد عبر طلب استخراج حقيقي ثم ترويسة الحجم. */
@@ -1827,6 +1963,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
   /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. يوتيوب يجلب اسمه الحقيقي فوراً. */
   const addSmartDownload = useCallback(async (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => {
+    if (hasActiveDuplicate(itemsRef.current, input.url)) return 0;
     let title = input.title;
     if ((!title || /^(watch|shorts|\d+)$/i.test(title)) && isYoutubeUrl(input.url)) {
       const realTitle = await fetchYoutubeTitle(input.url);
@@ -1844,20 +1981,22 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       // تعذر التحليل المسبق — تُضاف المهمة كالمعتاد ويعرض الخطأ داخلها عند التنفيذ.
     }
     if (!carousel) {
-      await addDownload({
+      const added = await addDownload({
         url: mediaUrls[0],
+        sourceUrl: input.url,
         title: title ?? 'ملف من الإنترنت',
         type: input.type,
         format: input.format,
         quality: input.quality,
         requestOptions: requestOptionsFor(input.type, input.format),
       });
-      return 1;
+      return added ? 1 : 0;
     }
     const now = Date.now();
     const created: DownloadItem[] = mediaUrls.map((mediaUrl, index) => ({
       id: createId(),
       url: mediaUrl,
+      sourceUrl: input.url,
       title: `صورة ${index + 1} من ${mediaUrls.length}`,
       type: 'image' as MediaType,
       format: 'jpg',
@@ -1875,10 +2014,18 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   /** يضيف الصور المختارة من شبكة الكاروسيل كمهام تنزيل جاهزة (روابط مباشرة بلا تحليل جديد). */
   const addCarouselImages = useCallback(async (input: { urls: string[]; title?: string }) => {
     const now = Date.now();
-    const created: DownloadItem[] = input.urls.map((mediaUrl, index) => ({
+    const seen = new Set<string>();
+    const filteredUrls = input.urls.filter((mediaUrl) => {
+      const key = canonicalDownloadUrl(mediaUrl);
+      if (seen.has(key) || hasActiveDuplicate(itemsRef.current, mediaUrl)) return false;
+      seen.add(key);
+      return true;
+    });
+    const created: DownloadItem[] = filteredUrls.map((mediaUrl, index) => ({
       id: createId(),
       url: mediaUrl,
-      title: input.title ? `${input.title} ${index + 1}` : `صورة ${index + 1} من ${input.urls.length}`,
+      sourceUrl: mediaUrl,
+      title: input.title ? `${input.title} ${index + 1}` : `صورة ${index + 1} من ${filteredUrls.length}`,
       type: 'image' as MediaType,
       format: 'jpg',
       quality: 'كاروسيل الصور',
@@ -1886,9 +2033,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       progress: 0,
       createdAt: now - index,
     }));
-    commit((current) => [...created, ...current]);
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    for (const entry of created) enqueue(entry.id);
+    if (created.length > 0) {
+      commit((current) => [...created, ...current]);
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      for (const entry of created) enqueue(entry.id);
+    }
     return created.length;
   }, [commit, enqueue]);
 
@@ -1937,12 +2086,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   /** يحفظ ملفاً مشارَكاً من تطبيق آخر (content:// أو file://) مباشرةً بلا حاجة لرابط إنترنت. */
   const addSharedFile = useCallback(async (contentUri: string, mimeType: string | null, originalName: string | null) => {
     if (Platform.OS === 'web') return;
+    if (hasActiveDuplicate(itemsRef.current, contentUri)) return;
     const type = typeFromMime(mimeType);
     const extension = extensionFor(mimeType, originalName, type);
     const baseName = (originalName?.replace(/\.[^.]+$/, '') ?? '').replace(/[^\w\s\u0600-\u06FF-]/g, '').trim().slice(0, 48);
     const item: DownloadItem = {
       id: createId(),
       url: contentUri,
+      sourceUrl: contentUri,
       title: baseName || `ملف مشترك ${new Date().toLocaleTimeString('ar', { hour: '2-digit', minute: '2-digit' })}`,
       type,
       format: extension,
@@ -1977,8 +2128,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const resumable = resumablesRef.current.get(id);
-    if (!resumable) return;
     pauseRequestedRef.current.add(id);
+    if (!resumable) {
+      // لا يوجد ملف جزئي بعد (مثلاً أثناء تحليل الرابط)؛ أوقف المهمة قبل أن
+      // تبدأ النقل الفعلي، ثم اتركها قابلة للاستئناف من الواجهة أو الإشعار.
+      patchItem(id, { status: 'paused', error: undefined });
+      updateForegroundDownload(item, '', item.totalBytes ?? 0, true);
+      return;
+    }
     try {
       // (v2.0.15) بعض الأجهزة لا تعيد حالة الاستئناف من الوحدة الأصلية؛
       // كتابة قيمة فارغة كانت تُسقط التطبيق — نتخطّىها بدل ذلك.
@@ -1992,6 +2149,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         );
       }
       patchItem(id, { status: 'paused', error: undefined });
+      updateForegroundDownload(item, state?.fileUri ?? '', item.totalBytes ?? 0, true);
       void upsertHistoryEntry(historyEntryOf({ ...item, status: 'paused' }));
     } catch {
       pauseRequestedRef.current.delete(id);
@@ -2003,6 +2161,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const resumeDownload = useCallback(async (id: string) => {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item || item.status !== 'paused') return;
+    pauseRequestedRef.current.delete(id);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     patchItem(id, { status: 'queued', progress: item.progress, error: undefined });
     enqueue(id);
@@ -2010,6 +2169,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
   /** الحذف العادي ينقل الملف إلى سلة المحذوفات لمدة 30 يوماً. */
   const removeDownload = useCallback(async (id: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
     queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
     const resumable = resumablesRef.current.get(id);
     if (resumable) {
@@ -2020,11 +2180,27 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // المهمة ربما انتهت بالفعل
       }
     }
+    if (item && (item.status === 'downloading' || item.status === 'paused')) removeForegroundDownload(id);
     progressRef.current.delete(id);
     bytesRef.current.delete(id);
     directUrlRef.current.delete(id);
     patchItem(id, { deletedAt: Date.now(), status: 'completed', error: undefined, inVault: false });
   }, [patchItem]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const handleAction = (payload: { id?: string; action?: string }) => {
+      if (!payload.id) return;
+      if (payload.action === 'pause') void pauseDownload(payload.id);
+      else if (payload.action === 'resume') void resumeDownload(payload.id);
+      else if (payload.action === 'cancel') void removeDownload(payload.id);
+    };
+    const subscription = DeviceEventEmitter.addListener('DownloadForegroundAction', handleAction);
+    void foregroundDownloadBridge?.consumePendingActions()
+      .then((actions) => actions.forEach(handleAction))
+      .catch(() => undefined);
+    return () => subscription.remove();
+  }, [pauseDownload, resumeDownload, removeDownload]);
 
   /** إعادة ملف من السلة إلى قائمة التنزيلات. */
   const restoreFromTrash = useCallback(async (id: string) => {

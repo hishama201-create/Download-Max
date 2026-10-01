@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.24';
+const APP_VERSION = '2.0.26';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -855,8 +855,6 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
   // (v2.0.16) من Astraر لازم: زر فتح إعدادات الصلاحية العام مباشرة.
   return (
     <Pressable
-      onLongPress={onSelect}
-      delayLongPress={350}
       onPress={selected ? onSelect : item.status === 'completed' && item.fileUri ? onOpen : undefined}
       style={[styles.downloadRow, { backgroundColor: colors.card, borderColor: selected ? colors.primary : colors.border, borderWidth: selected ? 1.6 : 1 }]}
     >
@@ -1309,6 +1307,10 @@ export default function HomeScreen() {
   const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
   const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
   const listScrollRef = useRef<number>(0);
+  const downloadRowRefs = useRef(new Map<string, View>());
+  const dragVisitedIds = useRef(new Set<string>());
+  const dragSelecting = useRef(false);
+  const dragJustFinished = useRef(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
@@ -1367,6 +1369,37 @@ export default function HomeScreen() {
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
+  const selectRowAtScreenY = useCallback((screenY: number) => {
+    if (!dragSelecting.current) return;
+    for (const [id, row] of downloadRowRefs.current) {
+      row.measureInWindow((_x, top, _width, height) => {
+        if (screenY < top || screenY > top + height || dragVisitedIds.current.has(id)) return;
+        dragVisitedIds.current.add(id);
+        setSelectedIds((current) => {
+          if (current.has(id)) return current;
+          const next = new Set(current);
+          next.add(id);
+          return next;
+        });
+        void Haptics.selectionAsync();
+      });
+    }
+  }, []);
+  const downloadSelectionGesture = useMemo(() => Gesture.Pan()
+    .activateAfterLongPress(350)
+    .runOnJS(true)
+    .onStart((event) => {
+      dragSelecting.current = true;
+      dragVisitedIds.current.clear();
+      selectRowAtScreenY(event.absoluteY);
+    })
+    .onUpdate((event) => selectRowAtScreenY(event.absoluteY))
+    .onFinalize(() => {
+      if (!dragSelecting.current) return;
+      dragSelecting.current = false;
+      dragJustFinished.current = true;
+      setTimeout(() => { dragJustFinished.current = false; }, 250);
+    }), [selectRowAtScreenY]);
   // شبكة اختيار صور الكاروسيل: الصور مصغّرة مع صح/بدون صح ثم تنزيل المحدد فقط.
   const [carouselGallery, setCarouselGallery] = useState<{ urls: string[]; selected: boolean[]; title?: string } | null>(null);
   // (v2.0.12) التحديد بالسحب داخل شبكة صور الكاروسيل: ضغطة مطوّلة ثم مرور على الصور.
@@ -1537,7 +1570,7 @@ export default function HomeScreen() {
         format,
         quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
       });
-      setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
+      setNotice(count === 0 ? 'هذا الرابط موجود بالفعل في قائمة التنزيل.' : count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
       setActiveTab('downloads');
       return;
     }
@@ -1568,7 +1601,7 @@ export default function HomeScreen() {
       format,
       quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
     });
-    setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
+    setNotice(count === 0 ? 'هذا الرابط موجود بالفعل في قائمة التنزيل.' : count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
     setActiveTab('downloads');
   }
 
@@ -1590,8 +1623,8 @@ export default function HomeScreen() {
         setNotice(null);
       }
       // تعذر جلب الصور — نضيف المهمة كصورة عادية.
-      await addSmartDownload({ url: target, title: guessedTitle(target), type: 'image', format: 'jpg', quality: 'صورة' });
-      setNotice('أُضيف التحميل إلى القائمة');
+      const count = await addSmartDownload({ url: target, title: guessedTitle(target), type: 'image', format: 'jpg', quality: 'صورة' });
+      setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.');
       setActiveTab('downloads');
       return;
     }
@@ -1769,6 +1802,7 @@ export default function HomeScreen() {
 
   /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
   function toggleSelection(id: string) {
+    if (dragJustFinished.current) return;
     setSelectedIds((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
@@ -1961,6 +1995,7 @@ export default function HomeScreen() {
           <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
           <View style={{ flex: 1 }}>
+          <GestureDetector gesture={downloadSelectionGesture}>
           <FlatList
             ref={listFlatRef}
             data={filteredItems}
@@ -2008,9 +2043,17 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
+            renderItem={({ item }) => (
+              <View ref={(node) => {
+                if (node) downloadRowRefs.current.set(item.id, node);
+                else downloadRowRefs.current.delete(item.id);
+              }}>
+                <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => { if (!dragJustFinished.current) showOpen(item); }} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />
+              </View>
+            )}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
+          </GestureDetector>
           </View>
         ) : null}
 
@@ -2018,7 +2061,7 @@ export default function HomeScreen() {
             والشاشة ما تفكّك، فيرجع المستخدم للفيديو من حيث توقّف. الإخفاء بـ display يحافظ
             على حالة المكوّن ويمنع لمس الطبقات المخفية. */}
         <View style={activeTab === 'youtube' ? styles.tabLayer : styles.tabLayerHidden} pointerEvents={activeTab === 'youtube' ? 'auto' : 'none'}>
-          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then(() => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
+          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.'); setActiveTab('downloads'); }); }} />
         </View>
       </View>
 
@@ -2157,7 +2200,7 @@ export default function HomeScreen() {
                 const picked = carouselGallery.urls.filter((_, index) => carouselGallery.selected[index]);
                 setCarouselGallery(null);
                 void addCarouselImages({ urls: picked, title: carouselGallery.title }).then((count) => {
-                  setNotice(`تمت إضافة ${count} صور للتحميل ✓`);
+                  setNotice(count ? `تمت إضافة ${count} صور للتحميل ✓` : 'الصور المحددة موجودة بالفعل في قائمة التنزيل.');
                   setActiveTab('downloads');
                 });
               }}
