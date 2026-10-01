@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.21';
+const APP_VERSION = '2.0.22';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1327,8 +1327,12 @@ export default function HomeScreen() {
     deviceFolderPromptedRef.current = true;
     setNotice('ملفاتك تُحفظ داخل التطبيق فقط — اختر مجلد الحفظ في جهازك مرة واحدة…');
     void (async () => {
-      const ok = await pickDeviceFolderNow();
-      setNotice(ok ? 'تم — ملفاتك تُحفظ الآن في مجلد الجهاز ✓' : 'لم يتم اختيار مجلد — الملفات تبقى داخل التطبيق');
+      // (v2.0.22) رسالة صادقة حسب النتيجة الفعلية — لا «تم» كاذبة لو فشل النسخ.
+      const result = await pickDeviceFolderNow();
+      if (!result.picked) setNotice('لم يتم اختيار مجلد — الملفات تبقى داخل التطبيق');
+      else if (result.moved > 0) setNotice(`تم — نُسخ ${result.moved} ملف إلى مجلد الجهاز ✓`);
+      else if (result.failed > 0) setNotice('المجلد محفوظ ✓ لكن النظام رفض كتابة الملفات — السبب ظاهر بالأحمر تحت كل ملف');
+      else setNotice('تم اختيار المجلد ✓ — كل تنزيل قادم سيُحفظ فيه');
     })();
   }, [deviceSaveNeedsFolder, pickDeviceFolderNow]);
 

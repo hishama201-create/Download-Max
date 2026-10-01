@@ -185,7 +185,7 @@ type DownloadContextValue = {
   copyToDeviceDownloads: (item: DownloadItem) => Promise<{ ok: boolean; message: string }>;
   syncPendingToDevice: () => Promise<number>;
   /** (v2.0.20) يفتح منتقي مجلد الجهاز مرة واحدة ثم ينسخ كل ما بقي داخل التطبيق إليه. */
-  pickDeviceFolderNow: () => Promise<boolean>;
+  pickDeviceFolderNow: () => Promise<{ picked: boolean; moved: number; failed: number }>;
   /** (v2.0.20) صحيح عندما فشلت كل مسارات الحفظ العام — تفتح الواجهة منتقي المجلد. */
   deviceSaveNeedsFolder: boolean;
   enableDeviceAutoSave: () => Promise<{ ok: boolean; where: string | null; message: string }>;
@@ -491,34 +491,37 @@ async function snaptubeTypeDir(type: MediaType): Promise<string | null> {
 }
 
 /**
- * (v2.0.18) الحفظ في ألبوم «Download Max» عبر نظام أندرويد الرسمي MediaStore
- * (expo-media-library الموجودة أصلاً بالتطبيق). بصلاحية وسائط عادية فقط،
- * وطلب الإذن يُعرض مرة واحدة فقط عندما يمكن عرضه — لا نُزعج مستخدماً رفض سابقاً.
- * الفشل غير حرج: الملف يبقى محفوظاً في مساحة التطبيق.
+ * (v2.0.22) الحفظ في ألبوم «Download Max» عبر نظام أندرويد الرسمي MediaStore.
+ * الإصلاح الجذري: كنا نشترط إذن الوسائط قبل أي محاولة — وهذا الإذن (READ_MEDIA_*)
+ * غير معلن في app.json فلا يُمنح على أندرويد 13+ أبداً، فيُتخطى المسار بصمت رغم أن
+ * الكتابة في MediaStore لا تحتاج أي إذن على أندرويد 10+ (تأكيد من كود expo نفسه:
+ * hasWritePermissions ترجع false على TIRAMISU = لا استثناء أبداً).
+ * الآن: محاولة مباشرة أولاً، وطلب الإذن فقط كخطة أخيرة للأجهزة الأقدم.
  */
 export async function saveToPublicAlbum(localUri: string, filename: string, type: MediaType): Promise<boolean> {
   if (Platform.OS === 'web') return false;
   try {
-    const current = await MediaLibrary.getPermissionsAsync().catch(() => null);
-    let granted = !!current?.granted;
-    if (!granted && current?.canAskAgain) {
-      granted = !!(await MediaLibrary.requestPermissionsAsync().catch(() => null))?.granted;
-    }
-    if (!granted) return false;
-    const asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
+    let asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
     if (!asset) {
-      // (v2.0.20) مسار بديل: نسخ مباشر إلى MediaStore عبر saveToLibraryAsync.
-      try {
-        await MediaLibrary.saveToLibraryAsync(localUri);
-        return true;
-      } catch {
-        return false;
+      // مسار بديل مباشر: نسخ إلى MediaStore عبر saveToLibraryAsync (بلا أذونات أيضاً).
+      const savedDirectly = await MediaLibrary.saveToLibraryAsync(localUri).then(() => true).catch(() => false);
+      if (savedDirectly) return true;
+      // فشلت المحاولتان — نطلب الإذن إن أمكن عرضه (أجهزة أقدم) ونعيد المحاولة.
+      const current = await MediaLibrary.getPermissionsAsync().catch(() => null);
+      if (current?.canAskAgain) {
+        const asked = await MediaLibrary.requestPermissionsAsync().catch(() => null);
+        if (asked?.granted) {
+          asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
+          if (!asset) return await MediaLibrary.saveToLibraryAsync(localUri).then(() => true).catch(() => false);
+        }
       }
+      if (!asset) return false;
     }
-    let album = await MediaLibrary.getAlbumAsync(ALBUM_NAME).catch(() => null);
-    if (!album) album = await MediaLibrary.createAlbumAsync(ALBUM_NAME, asset, true).catch(() => null);
-    else await MediaLibrary.addAssetsToAlbumAsync(asset, album, true).catch(() => undefined);
-    return !!album;
+    // الملف الآن في المعرض — نجاح ولو فشل تجميعه في ألبوم «Download Max».
+    const album = await MediaLibrary.getAlbumAsync(ALBUM_NAME).catch(() => null);
+    if (album) await MediaLibrary.addAssetsToAlbumAsync(asset, album, true).catch(() => undefined);
+    else await MediaLibrary.createAlbumAsync(ALBUM_NAME, asset, true).catch(() => undefined);
+    return true;
   } catch {
     return false;
   }
@@ -603,7 +606,7 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
   }
   // ٣) ألبوم «Download Max» عبر MediaStore.
   if (await saveToPublicAlbum(localUri, filename, type)) return true;
-  if (!lastDeviceSaveError) noteDeviceSaveError('MediaStore', 'إذن الوسائط غير ممنوح — مرفوض نهائياً غالباً');
+  if (!lastDeviceSaveError) noteDeviceSaveError('MediaStore', 'تعذّر الحفظ في معرض الصور (ألبوم Download Max)');
   // ٤) المسار العام «Download/Download Max» كخيار أخير.
   if (await hasStorageAccess()) {
     try {
@@ -2349,17 +2352,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   }, [patchItem]);
 
   /**
-   * (v2.0.20) يفتح منتقي مجلد الجهاز مرة واحدة (SAF الرسمي) ثم ينسخ فوراً كل ملف
-   * بقي داخل التطبيق إلى «المختار / Download Max / النوع». يعيد نجاح العملية.
+   * (v2.0.22) يفتح منتقي مجلد الجهاز مرة واحدة (SAF الرسمي) ثم ينسخ فوراً كل ملف
+   * بقي داخل التطبيق إلى «المختار / Download Max / النوع». يعيد النتيجة الحقيقية:
+   * picked (اختار مجلداً؟) و moved (كم ملف نُسخ فعلاً) و failed (كم فشل) —
+   * لا «تم» كاذبة بعد اليوم: اختيار المجلد وحده ليس نجاحاً.
    */
-  const pickDeviceFolderNow = useCallback(async (): Promise<boolean> => {
-    if (Platform.OS === 'web') return false;
+  const pickDeviceFolderNow = useCallback(async (): Promise<{ picked: boolean; moved: number; failed: number }> => {
+    if (Platform.OS === 'web') return { picked: false, moved: 0, failed: 0 };
     const picked = await pickDeviceDirectory();
-    if (!picked) return false;
+    if (!picked) return { picked: false, moved: 0, failed: 0 };
     if (picked !== downloadDirRef.current) await setDownloadDir(picked);
-    await syncPendingToDevice();
-    setDeviceSaveNeedsFolder(false);
-    return true;
+    const before = itemsRef.current.filter(
+      (entry) => entry.status === 'completed' && !!entry.fileUri && !entry.deviceSaved && !entry.inVault && !entry.deletedAt && entry.fileUri.startsWith('file://'),
+    ).length;
+    const moved = await syncPendingToDevice();
+    const failed = Math.max(before - moved, 0);
+    if (moved > 0) setDeviceSaveNeedsFolder(false);
+    return { picked: true, moved, failed };
   }, [setDownloadDir, syncPendingToDevice]);
 
   /**
