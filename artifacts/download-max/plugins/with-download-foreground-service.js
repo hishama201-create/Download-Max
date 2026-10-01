@@ -4,7 +4,7 @@ const {
   withAndroidManifest,
   withDangerousMod,
   withMainApplication,
-} = require('@expo/config-plugins');
+} = require('expo/config-plugins');
 
 const SERVICE_NAME = '.DownloadForegroundService';
 
