@@ -501,18 +501,34 @@ async function snaptubeTypeDir(type: MediaType): Promise<string | null> {
 export async function saveToPublicAlbum(localUri: string, filename: string, type: MediaType): Promise<boolean> {
   if (Platform.OS === 'web') return false;
   try {
-    let asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
+    let asset = await MediaLibrary.createAssetAsync(localUri).catch((error) => {
+      // (v2.0.24) لا نبتلع خطأ المعرض — نسجله حتى نعرف سبب فشل MediaStore الحقيقي.
+      noteDeviceSaveError('المعرض (createAsset)', error);
+      return null;
+    });
     if (!asset) {
       // مسار بديل مباشر: نسخ إلى MediaStore عبر saveToLibraryAsync (بلا أذونات أيضاً).
-      const savedDirectly = await MediaLibrary.saveToLibraryAsync(localUri).then(() => true).catch(() => false);
+      const savedDirectly = await MediaLibrary.saveToLibraryAsync(localUri).then(() => true).catch((error) => {
+        noteDeviceSaveError('المعرض (saveToLibrary)', error);
+        return false;
+      });
       if (savedDirectly) return true;
       // فشلت المحاولتان — نطلب الإذن إن أمكن عرضه (أجهزة أقدم) ونعيد المحاولة.
       const current = await MediaLibrary.getPermissionsAsync().catch(() => null);
       if (current?.canAskAgain) {
         const asked = await MediaLibrary.requestPermissionsAsync().catch(() => null);
         if (asked?.granted) {
-          asset = await MediaLibrary.createAssetAsync(localUri).catch(() => null);
-          if (!asset) return await MediaLibrary.saveToLibraryAsync(localUri).then(() => true).catch(() => false);
+          asset = await MediaLibrary.createAssetAsync(localUri).catch((error) => {
+            noteDeviceSaveError('المعرض (بعد الإذن)', error);
+            return null;
+          });
+          if (!asset) {
+            const retried = await MediaLibrary.saveToLibraryAsync(localUri).then(() => true).catch((error) => {
+              noteDeviceSaveError('المعرض (بعد الإذن saveToLibrary)', error);
+              return false;
+            });
+            if (retried) return true;
+          }
         }
       }
       if (!asset) return false;
@@ -522,7 +538,8 @@ export async function saveToPublicAlbum(localUri: string, filename: string, type
     if (album) await MediaLibrary.addAssetsToAlbumAsync(asset, album, true).catch(() => undefined);
     else await MediaLibrary.createAlbumAsync(ALBUM_NAME, asset, true).catch(() => undefined);
     return true;
-  } catch {
+  } catch (error) {
+    noteDeviceSaveError('المعرض', error);
     return false;
   }
 }
@@ -920,46 +937,8 @@ function deviceSaveErrorSummary(): string | null {
 }
 
 /**
- * (إصلاح v2.0.9) نسخ الملف إلى مستند SAF بالتدفق الأصلي عبر واجهة الملفات الحديثة.
- * سبب ملفات «الحجم 0» السابقة: copyAsync القديمة تحوّل داخلياً وجهات content://
- * إلى مسار محلي لا معنى له فتفشل، وخطة Base64 تنهار مع الفيديوهات الكبيرة —
- * فيبقى الملف الفارغ من createFileAsync يتيمة في مجلدات المستخدم.
- * هنا: نسخ Native Stream بلا مرور بالذاكرة + تحقق أن الحجم المكتوب يطابق الأصل.
+ * (v2.0.10) تحقق بديل أن مستند SAF الناتج فيه محتوى فعلًا — عبر واجهة الملفات الحديثة.
  */
-async function streamCopyToSafFile(localUri: string, safFileUri: string): Promise<boolean> {
-  try {
-    const source = new NativeFile(localUri);
-    const target = new NativeFile(safFileUri);
-    // (v2.0.12) محاولتان: بعض مزوّدات SAF (سامسونج خصوصاً) تُرجع size قديماً/خاطئاً
-    // مباشرة بعد كتابة ملف كبير — إعادة المحاولة تعطي النظام فرصة لتحديث المقاس.
-    // (v2.0.23) المحاولة الثانية بتقنية مختلفة: نسخ بلا overwrite — بعض مزودات
-    // سامسونج ترفض الكتابة فوق مستند موجود (أنشأناه فارغاً بـ createFileAsync)
-    // بينما تقبل النسخ في مستند جديد. المحاولتان تغطيان السلوكين.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await source.copy(target, { overwrite: attempt === 0 });
-        const expected = source.size;
-        const actual = target.size;
-        if (expected === 0 || actual === expected) return true;
-        // الحجم غير مطابق؟ ننتظر قليلاً ونعيد قراءته قبل الحكم بالفشل.
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        const reread = new NativeFile(safFileUri).size;
-        if (expected === 0 || reread === expected) return true;
-      } catch (copyError) {
-        noteDeviceSaveError('نسخ SAF بالتدفق', copyError);
-        console.error('[v2.0.12] خطأ النسخ بالتدفق إلى SAF (محاولة ' + (attempt + 1) + '):', copyError);
-      }
-    }
-    return false;
-  } catch (error) {
-    noteDeviceSaveError('نسخ SAF بالتدفق', error);
-    console.error('[v2.0.12] خطأ غير متوقع في النسخ إلى SAF:', error);
-    return false;
-  }
-}
-
-/** ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم (مكان التنزيل). */
-/** (v2.0.10) تحقق بديل أن مستند SAF الناتج فيه محتوى فعلًا — عبر واجهة الملفات الحديثة. */
 async function isSafFileHasContent(safFileUri: string): Promise<boolean> {
   try {
     const size = new NativeFile(safFileUri).size;
@@ -969,38 +948,68 @@ async function isSafFileHasContent(safFileUri: string): Promise<boolean> {
   }
 }
 
+/**
+ * (v2.0.24) ينسخ ملفاً محلياً إلى مجلد SAF الذي اختاره المستخدم — بالنمط الصحيح
+ * المضمون في كود expo نفسه: نسخ NativeFile (المصدر) ← NativeDirectory (المجلد)
+ * مباشرة، بلا إنشاء ملف فارغ مسبقاً.
+ *
+ * سبب كسر النسخ القديم (v2.0.9–23): كنا ننشئ أولاً ملفاً فارغاً بـ createFileAsync
+ * ثم ننسخ المحتوى فوقه — فمع overwrite:false يرمي expo DestinationAlreadyExistsException
+ * فوراً (الملف الفارغ موجود أصلاً)، ومع overwrite:true يحذف expo الملف الموجود ثم
+ * يكتب في رابط ميت فترمي سامسونج IllegalArgumentException. أما النسخ إلى المجلد نفسه
+ * فتجد expo الملف بنفس الاسم، تحذفه عبر SAF عند الاستبدال، ثم تنشئ مستنداً طازجاً
+ * بـ createFile وتكتب فيه بتدفق أصلي (copyFileWithChannelFallback) — أي حجم بلا مشاكل.
+ */
 async function saveFileToSafDirectory(localUri: string, filename: string, mimeType: string, directoryUri: string): Promise<boolean> {
-  let safFileUri: string | null = null;
   try {
-    const baseName = filename.replace(/\.[^.]+$/, '') || 'download';
-    safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(directoryUri, baseName, mimeType);
-    // (v2.0.9) النسخ بالتدفق الأصلي أولاً — يعمل مع أي حجم وبلا كارثة ذاكرة.
-    // (ملاحظة v2.0.10): NativeFile.size قد يقرأ 0 مع بعض مزودات SAF حتى لو نجح
-    // النسخ فعلاً — لذا فشل التتبع وحده لا يلغي النتيجة؛ نتحقق من الملف الناتج بنفسه.
-    if (await streamCopyToSafFile(localUri, safFileUri)) return true;
-    if (await isSafFileHasContent(safFileUri)) return true;
-    // خطة Base64 أخيرة — للملفات الصغيرة فقط (سابقاً كانت تُجرب مع الكل فتنهار).
+    const source = new NativeFile(localUri);
+    const targetDir = new NativeDirectory(directoryUri);
+    // المحاولة الأولى بلا استبدال — تحفظ أي نسخة سابقة بنفس الاسم. إن تعارض الاسم
+    // نعيد بمحاولة استبدال: تحذف القديم عبر SAF ثم تكتب في مستند طازج (آمن هنا
+    // لأن الوجهة مجلد — وليست رابط ملف ميت كما في النسخة القديمة).
+    try {
+      await source.copy(targetDir, { overwrite: false });
+    } catch (firstError) {
+      noteDeviceSaveError('نسخ SAF', firstError);
+      try {
+        await source.copy(targetDir, { overwrite: true });
+      } catch (overwriteError) {
+        noteDeviceSaveError('استبدال SAF', overwriteError);
+      }
+    }
+    // التحقق الفعلي: الملف موجود في المجلد وفيه محتوى. قراءة الحجم مباشرة بعد
+    // الكتابة قد تخفق مع مزودات سامسونج — ننتظر قليلاً ونعيد القراءة قبل الحكم.
+    const verifyChild = async (): Promise<boolean> => {
+      const child = await findSafChildByName(directoryUri, filename);
+      if (!child) return false;
+      if (await isSafFileHasContent(child)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return isSafFileHasContent(child);
+    };
+    if (await verifyChild()) return true;
+    // خطة Base64 الأخيرة عبر مستند جديد طازج باسم فريد — للملفات الصغيرة فقط
+    // (كتابة مستند SAF موجود غير موثوقة على سامسونج: canWrite قد ترجع false).
     const info = await FileSystem.getInfoAsync(localUri).catch(() => null);
     const size = info?.exists && 'size' in info && typeof info.size === 'number' ? info.size : 0;
     if (size > 0 && size <= SAF_BASE64_FALLBACK_LIMIT) {
       try {
+        const baseName = filename.replace(/\.[^.]+$/, '') || 'download';
+        const ext = (filename.split('.').pop() || 'bin').toLowerCase();
+        const fallbackUri = await FileSystem.StorageAccessFramework.createFileAsync(
+          directoryUri,
+          `${baseName}-${Date.now()}.${ext}`,
+          mimeType,
+        );
         const data = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
-        await FileSystem.writeAsStringAsync(safFileUri, data, { encoding: FileSystem.EncodingType.Base64 });
+        await FileSystem.writeAsStringAsync(fallbackUri, data, { encoding: FileSystem.EncodingType.Base64 });
         return true;
       } catch (base64Error) {
         noteDeviceSaveError('نسخ SAF (Base64)', base64Error);
-        console.error('[v2.0.12] فشلت خطة Base64 الأخيرة:', base64Error);
       }
     }
-    // (إصلاح v2.0.12) الحكم بالحذف بعد فحص فعلي: مستند فيه بيانات لا يُحذف أبداً —
-    // حذف نسخة ناجحة بسبب قراءة حجم خاطئ كان سبب «فشل النسخ» الزائف على سامسونج.
-    if (await isSafFileHasContent(safFileUri)) return true;
-    await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
     return false;
   } catch (error) {
-    noteDeviceSaveError('إنشاء/حفظ ملف SAF', error);
-    console.error('[v2.0.12] فشل الحفظ في مجلد SAF:', error);
-    if (safFileUri) await FileSystem.deleteAsync(safFileUri, { idempotent: true }).catch(() => undefined);
+    noteDeviceSaveError('حفظ ملف SAF', error);
     // فشل الحفظ في المجلد المختار — يبقى الملف في مجلد التطبيق.
     return false;
   }
