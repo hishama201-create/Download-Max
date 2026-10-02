@@ -9,6 +9,7 @@ import { cleanupSlideshowTemp, fetchSlideshowBundle, generateSlideshowVideo } fr
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   AppState,
   BackHandler,
@@ -37,17 +38,12 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess, saveToPublicAlbum } from '@/context/DownloadContext';
 import type { ProbedFormat } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
-/** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
-/**
- * رقم الإصدار المعروض في «حول التطبيق» وتذييل القائمة الجانبية.
- * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
- * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
- */
-const APP_VERSION = '2.0.27';
+/** الإصدار الظاهر للمستخدم يُقرأ من app.json، مع قيمة احتياطية لنسخة البناء. */
+const APP_VERSION = `V${Constants.expoConfig?.version ?? '2.0.30'}`;
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1704,6 +1700,36 @@ export default function HomeScreen() {
     setNotice(result.message);
   }
 
+  async function runSaveImageToGallery(item: DownloadItem) {
+    if (!item.fileUri) {
+      setNotice('ملف الصورة غير متاح للحفظ');
+      return;
+    }
+    if (Platform.OS === 'web') {
+      setNotice('حفظ الصور في المعرض متاح من تطبيق Android');
+      return;
+    }
+    // عند عدم اختيار مجلد ومن دون إذن All Files، يكون الحفظ التلقائي قد أضاف
+    // الصورة إلى ألبوم Download Max بالفعل؛ تجنب إنشاء نسخة مكررة.
+    if (Platform.OS === 'android' && item.deviceSaved && !downloadDir && allFilesGranted === false) {
+      setNotice('الصورة محفوظة بالفعل في ألبوم Download Max');
+      return;
+    }
+    setNotice('جارٍ حفظ الصورة في المعرض...');
+    const filename = item.fileUri.split('/').pop() || item.title;
+    const saved = await saveToPublicAlbum(item.fileUri, filename, 'image');
+    setNotice(saved ? 'تم حفظ الصورة في ألبوم Download Max ✓' : 'تعذّر حفظ الصورة في المعرض');
+  }
+
+  function showImageDetails(item: DownloadItem) {
+    Alert.alert('معلومات الصورة', [
+      `الاسم: ${item.title}`,
+      `الصيغة: ${item.format.toUpperCase()}`,
+      `الحجم: ${formatBytes(item.totalBytes)}`,
+      `تاريخ الإضافة: ${new Date(item.createdAt).toLocaleString('ar')}`,
+    ].join('\n'));
+  }
+
 
 
   /**
@@ -2346,6 +2372,30 @@ export default function HomeScreen() {
                 <Text style={[styles.moreRowText, { color: colors.foreground }]}>{converting ? 'جارٍ التحويل...' : `تحويل إلى صوت (${convertFormat.toUpperCase()})`}</Text>
               </Pressable>
             ) : null}
+            {moreMenu?.type === 'image' ? (
+              <>
+                <Pressable
+                  testID="image-open"
+                  onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) showOpen(target); }}
+                  style={styles.moreRow}
+                >
+                  <View style={[styles.moreRowIcon, { backgroundColor: `${colors.primary}12` }]}>
+                    <Feather name="eye" size={18} color={colors.primary} />
+                  </View>
+                  <Text style={[styles.moreRowText, { color: colors.foreground }]}>فتح الصورة</Text>
+                </Pressable>
+                <Pressable
+                  testID="image-save-gallery"
+                  onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) void runSaveImageToGallery(target); }}
+                  style={styles.moreRow}
+                >
+                  <View style={[styles.moreRowIcon, { backgroundColor: `${colors.primary}12` }]}>
+                    <Feather name="image" size={18} color={colors.primary} />
+                  </View>
+                  <Text style={[styles.moreRowText, { color: colors.foreground }]}>حفظ في المعرض</Text>
+                </Pressable>
+              </>
+            ) : null}
             <Pressable
               testID="copy-to-device"
               onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) void runCopyToDevice(target); }}
@@ -2368,6 +2418,22 @@ export default function HomeScreen() {
               </View>
               <Text style={[styles.moreRowText, { color: colors.foreground }]}>مشاركة</Text>
             </Pressable>
+            {moreMenu?.type === 'image' ? (
+              <Pressable
+                testID="image-details"
+                onPress={() => {
+                  const target = moreMenu;
+                  setMoreMenu(null);
+                  if (target) requestAnimationFrame(() => showImageDetails(target));
+                }}
+                style={styles.moreRow}
+              >
+                <View style={[styles.moreRowIcon, { backgroundColor: `${colors.primary}12` }]}>
+                  <Feather name="info" size={18} color={colors.primary} />
+                </View>
+                <Text style={[styles.moreRowText, { color: colors.foreground }]}>معلومات الملف</Text>
+              </Pressable>
+            ) : null}
             <Pressable testID="menu-delete" onPress={() => { const target = moreMenu; setMoreMenu(null); if (target) setDeleteDialog({ mode: 'single', id: target.id }); }} style={styles.moreRow}>
               <View style={[styles.moreRowIcon, { backgroundColor: `${colors.destructive}12` }]}>
                 <Feather name="trash-2" size={18} color={colors.destructive} />
