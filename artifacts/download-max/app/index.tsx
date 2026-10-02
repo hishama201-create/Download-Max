@@ -881,14 +881,19 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
         <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
         <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
           {typeLabels[item.type]} · {ltr(item.format.toUpperCase())} · {statusLabel}
-          {(isActive || isPaused) && item.bytesWritten ? ` · ${ltr(formatBytes(item.bytesWritten))}` : ''}
           {item.totalBytes ? ` / ${ltr(formatBytes(item.totalBytes))}` : ''}
         </Text>
         {isActive || isPaused ? (
           <View style={styles.progressLine}>
-            <View style={[styles.progressTrack, { backgroundColor: colors.muted }]}>
-              <View style={[styles.progressFill, { backgroundColor: isPaused ? colors.mutedForeground : colors.primary, width: `${Math.max(item.progress * 100, 4)}%` }]} />
-            </View>
+            {item.totalBytes && item.totalBytes > 0 ? (
+              <View style={[styles.progressTrack, { backgroundColor: colors.muted }]}>
+                <View style={[styles.progressFill, { backgroundColor: isPaused ? colors.mutedForeground : colors.primary, width: `${Math.min(Math.max(item.progress * 100, 0), 100)}%` }]} />
+              </View>
+            ) : (
+              <View style={[styles.progressIndeterminate, { backgroundColor: colors.muted }]}>
+                {isPaused ? <Feather name="minus" size={14} color={colors.mutedForeground} /> : <ActivityIndicator size="small" color={colors.primary} />}
+              </View>
+            )}
             <Text style={[styles.progressPercent, { color: isPaused ? colors.mutedForeground : colors.primary }]}>{percentLabel(item)}</Text>
             {/* (v2.0.12) نص الحجم الكامل دائماً: «12.4 MB / 55.0 MB» بجانب النسبة. */}
             {(item.bytesWritten ?? 0) > 0 ? (
@@ -2531,6 +2536,7 @@ const styles = StyleSheet.create({
   rowMeta: { fontSize: 10, marginTop: 4 },
   progressLine: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 9 },
   progressTrack: { flex: 1, height: 7, borderRadius: 4, overflow: 'hidden' },
+  progressIndeterminate: { flex: 1, height: 18, alignItems: 'center', justifyContent: 'center' },
   progressFill: { height: '100%', borderRadius: 4 },
   progressPercent: { fontSize: 11, fontWeight: '800', minWidth: 32, textAlign: 'right' },
   openButton: { width: 30, height: 30, borderRadius: 15, justifyContent: 'center', alignItems: 'center' },

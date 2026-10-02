@@ -9,7 +9,7 @@ import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
 import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { DeviceEventEmitter, Linking, NativeModules, PermissionsAndroid, Platform } from 'react-native';
+import { AppState, DeviceEventEmitter, Linking, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 import { setPublicRootProvider, syncHistorySnapshot, upsertHistoryEntry, deleteHistoryEntry } from '@/context/historyDb';
 import { extractAudioFromVideo } from '@/context/audio';
@@ -1371,7 +1371,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     setItems(next);
     const stateChanged = next.some((entry, index) => {
       const previous = current[index];
-      return !previous || previous.id !== entry.id || previous.status !== entry.status;
+      return !previous || previous.id !== entry.id || previous.status !== entry.status || previous.fileUri !== entry.fileUri;
     });
     if (stateChanged) {
       if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
@@ -1392,6 +1392,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const patchItem = useCallback((id: string, patch: Partial<DownloadItem>) => {
     commit((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   }, [commit]);
+
+  // عند العودة من الخلفية، اقرأ الملف الجزئي الفعلي بدلاً من الاعتماد على آخر حدث JS وصل قبل مغادرة الشاشة.
+  const syncActiveDownloadProgress = useCallback(async () => {
+    const activeItems = itemsRef.current.filter(
+      (candidate) => (candidate.status === 'downloading' || candidate.status === 'paused') && !!candidate.fileUri,
+    );
+    await Promise.all(activeItems.map(async (candidate) => {
+      const fileUri = candidate.fileUri;
+      if (!fileUri) return;
+      const info = await FileSystem.getInfoAsync(fileUri).catch(() => null);
+      if (!info || !info.exists || !('size' in info) || typeof info.size !== 'number') return;
+      const bytesWritten = Math.max(info.size, candidate.bytesWritten ?? 0);
+      const totalBytes = candidate.totalBytes && candidate.totalBytes > 0 ? candidate.totalBytes : undefined;
+      const progress = totalBytes ? Math.min(Math.max(bytesWritten / totalBytes, 0), 0.99) : 0;
+      patchItem(candidate.id, { bytesWritten, totalBytes, progress });
+    }));
+  }, [patchItem]);
 
   // (v2.0.20) صحيح عندما فشلت كل مسارات الحفظ العام لتنزيل مكتمل —
   // الواجهة تفتح منتقي المجلد مرة واحدة بدل الفشل الصامت.
@@ -1644,6 +1661,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
         resumable = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
       }
+      await patchItem(id, {
+        fileUri: target,
+        totalBytes: expectedRemoteBytes > 0 ? expectedRemoteBytes : undefined,
+      });
       updateForegroundDownload(foregroundItem, target, expectedRemoteBytes, false);
       resumablesRef.current.set(id, resumable);
 
@@ -2136,7 +2157,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
     }
     directUrlRef.current.delete(id);
-    patchItem(id, { status: 'queued', progress: 0, bytesWritten: undefined, error: undefined });
+    patchItem(id, { status: 'queued', progress: 0, bytesWritten: undefined, fileUri: undefined, error: undefined });
     enqueue(id);
   }, [patchItem, enqueue]);
 
@@ -2235,6 +2256,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       .catch(() => undefined);
     return () => subscription.remove();
   }, [pauseDownload, resumeDownload, removeDownload]);
+
+  // استعد حجم الملفات النشطة عند عودة التطبيق إلى الواجهة؛ لا نعيد تشغيل التنزيل.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') void syncActiveDownloadProgress();
+    });
+    return () => subscription.remove();
+  }, [syncActiveDownloadProgress]);
 
   /** إعادة ملف من السلة إلى قائمة التنزيلات. */
   const restoreFromTrash = useCallback(async (id: string) => {
