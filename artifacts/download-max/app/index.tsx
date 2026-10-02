@@ -17,6 +17,7 @@ import {
   Keyboard,
   Linking,
   Modal,
+  NativeModules,
   Platform,
   Pressable,
   RefreshControl,
@@ -27,6 +28,7 @@ import {
   TextInput,
   TouchableOpacity,
   useColorScheme,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
@@ -45,7 +47,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.26';
+const APP_VERSION = '2.0.27';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -1299,6 +1301,7 @@ function AboutPanel({ colors, onBack }: { colors: Palette; onBack: () => void })
 export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
+  const { width: windowWidth } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo, syncPendingToDevice, pickDeviceFolderNow, deviceSaveNeedsFolder } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
@@ -1832,28 +1835,44 @@ export default function HomeScreen() {
       : `نُقل ${moved} من ${ids.length} ملف؛ بعض الملفات أُخفيت داخل التطبيق فقط`);
   }
 
-  /** مشاركة الملفات المحددة عبر لوحة مشاركة أندرويد (ملف واحد أو عدة ملفات). */
+  /** يشارك كل الملفات المحددة عبر لوحة Android، مع رفض المشاركة الجزئية إذا بقي تنزيل غير مكتمل. */
   async function shareSelected() {
-    const targets = visibleItems.filter((item) => selectedIds.has(item.id) && item.fileUri);
-    if (targets.length === 0) {
-      setNotice('الملفات المحددة لم تكتمل بعد');
+    const selectedItems = visibleItems.filter((item) => selectedIds.has(item.id));
+    if (selectedItems.length === 0) {
+      setNotice('حدد ملفاً واحداً على الأقل للمشاركة');
       return;
     }
+    if (selectedItems.some((item) => !item.fileUri)) {
+      setNotice('بعض الملفات المحددة لم تكتمل بعد — انتظر اكتمالها قبل المشاركة');
+      return;
+    }
+    const targets = selectedItems.filter((item) => !!item.fileUri);
     const available = await Sharing.isAvailableAsync();
     if (!available) {
       setNotice('المشاركة غير مدعومة على هذا الجهاز');
       return;
     }
     try {
-      const first = targets[0].fileUri!;
-      const shareUri = await toShareableUri(first);
-      await Sharing.shareAsync(shareUri, {
-        mimeType: mimeFromFile(first),
-        dialogTitle: targets.length === 1 ? 'مشاركة الملف' : `مشاركة ${targets.length} ملفات (شارك الباقي من المشغل)`,
-      });
+      if (targets.length > 1 && Platform.OS === 'android') {
+        const shareMultipleFiles = NativeModules.DownloadForeground?.shareMultipleFiles;
+        if (typeof shareMultipleFiles !== 'function') {
+          setNotice('مشاركة عدة ملفات غير متاحة في هذه النسخة — حدّث التطبيق');
+          return;
+        }
+        const shareUris = await Promise.all(targets.map((item) => toShareableUri(item.fileUri!)));
+        const mimeTypes = [...new Set(targets.map((item) => item.type === 'image' ? 'image/*' : item.type === 'video' ? 'video/*' : 'audio/*'))];
+        await shareMultipleFiles(shareUris, mimeTypes);
+      } else if (targets.length > 1) {
+        setNotice('مشاركة عدة ملفات دفعة واحدة متاحة حالياً على Android فقط');
+        return;
+      } else {
+        const first = targets[0].fileUri!;
+        const shareUri = await toShareableUri(first);
+        await Sharing.shareAsync(shareUri, { mimeType: mimeFromFile(first), dialogTitle: 'مشاركة الملف' });
+      }
       setSelectedIds(new Set());
     } catch {
-      setNotice('تعذّرت المشاركة — تأكد أن الملف موجود وحاول مجدداً');
+      setNotice('تعذّرت المشاركة — تأكد أن الملفات موجودة وحاول مجدداً');
     }
   }
 
@@ -2362,7 +2381,7 @@ export default function HomeScreen() {
 
       {/* شريط التحديد السفلي: مشاركة وحذف للملفات المحددة */}
       {selectedIds.size > 0 && !panel ? (
-        <View style={[styles.selectionBar, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 30 : Math.max(insets.bottom, 10) }]}>
+        <View style={[styles.selectionBar, windowWidth < 430 && styles.selectionBarCompact, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 30 : Math.max(insets.bottom, 10) }]}>
           <View style={styles.selectionCountWrap}>
             <Pressable accessibilityLabel="إلغاء التحديد" onPress={() => setSelectedIds(new Set())} style={styles.selectionCountWrap}>
               <Feather name="x" size={16} color={colors.mutedForeground} />
@@ -2373,7 +2392,7 @@ export default function HomeScreen() {
               <Text style={[styles.selectAllText, { color: colors.primary }]}>تحديد الكل</Text>
             </Pressable>
           </View>
-          <View style={styles.selectionActions}>
+          <View style={[styles.selectionActions, windowWidth < 430 && styles.selectionActionsCompact]}>
             <Pressable testID="selection-vault" accessibilityLabel="نقل المحدد للخزنة" onPress={vaultSelected} style={[styles.selectionAction, { backgroundColor: `${colors.accentForeground}16` }]}>
               <Feather name="lock" size={16} color={colors.accentForeground} />
               <Text style={[styles.selectionActionText, { color: colors.accentForeground }]}>خزنة</Text>
@@ -2610,12 +2629,14 @@ const styles = StyleSheet.create({
   noticeText: { flex: 1, fontSize: 12, fontWeight: '700' },
   selectionCheck: { position: 'absolute', top: 8, left: 8, width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center', zIndex: 5 },
   selectionBar: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 11, borderTopWidth: 1, elevation: 8, shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 14, shadowOffset: { width: 0, height: -4 } },
+  selectionBarCompact: { flexDirection: 'column', alignItems: 'stretch', gap: 10, paddingHorizontal: 14 },
   selectionCountWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   selectAllPill: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
   selectAllText: { fontSize: 11, fontWeight: '800' },
   selectionCount: { fontSize: 13, fontWeight: '800' },
   selectionActions: { flexDirection: 'row', gap: 9 },
-  selectionAction: { flexDirection: 'row', alignItems: 'center', gap: 7, paddingHorizontal: 17, paddingVertical: 10, borderRadius: 13 },
+  selectionActionsCompact: { justifyContent: 'space-between', gap: 8 },
+  selectionAction: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingHorizontal: 9, paddingVertical: 10, borderRadius: 13 },
   selectionActionText: { fontSize: 13, fontWeight: '800' },
   dialogOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'center', alignItems: 'center', padding: 28 },
   dialogCard: { width: '100%', maxWidth: 400, borderRadius: 20, padding: 22, alignItems: 'center' },

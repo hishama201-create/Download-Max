@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
+import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -15,6 +16,7 @@ import android.os.Looper
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.WritableArray
@@ -178,6 +180,51 @@ class DownloadForegroundModule(
   @ReactMethod
   fun removeListeners(_count: Double) {
     // Required by NativeEventEmitter's native-module contract.
+  }
+
+  /** Share all selected media in one Android sharesheet intent. */
+  @ReactMethod
+  fun shareMultipleFiles(fileUris: ReadableArray, mimeTypes: ReadableArray, promise: Promise) {
+    val activity = currentActivity
+    if (activity == null) {
+      promise.reject("E_SHARE_NO_ACTIVITY", "لا توجد نافذة نشطة لفتح لوحة المشاركة")
+      return
+    }
+
+    val uris = ArrayList<Uri>()
+    for (index in 0 until fileUris.size()) {
+      val rawUri = fileUris.getString(index)?.trim()
+      if (!rawUri.isNullOrEmpty()) uris.add(Uri.parse(rawUri))
+    }
+    if (uris.isEmpty()) {
+      promise.reject("E_SHARE_NO_FILES", "لا توجد ملفات صالحة للمشاركة")
+      return
+    }
+
+    val types = (0 until mimeTypes.size())
+      .mapNotNull { index -> mimeTypes.getString(index)?.trim()?.takeIf { it.contains('/') } }
+      .distinct()
+    val majorTypes = types.map { it.substringBefore('/') }.distinct()
+    val intentType = if (majorTypes.size == 1) "${majorTypes.first()}/*" else "*/*"
+
+    try {
+      val shareIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+        type = intentType
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (types.isNotEmpty()) putExtra(Intent.EXTRA_MIME_TYPES, types.toTypedArray())
+        val sharedItems = ClipData.newUri(appContext.contentResolver, "Download Max", uris.first())
+        for (index in 1 until uris.size) sharedItems.addItem(ClipData.Item(uris[index]))
+        clipData = sharedItems
+      }
+      val chooser = Intent.createChooser(shareIntent, "مشاركة ${uris.size} ملفات").apply {
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      activity.startActivity(chooser)
+      promise.resolve(true)
+    } catch (error: Exception) {
+      promise.reject("E_SHARE_MULTIPLE_FAILED", error.message ?: "تعذّرت مشاركة الملفات", error)
+    }
   }
 }
 
