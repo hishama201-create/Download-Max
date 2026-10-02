@@ -185,7 +185,7 @@ class DownloadForegroundModule(
   /** Share all selected media in one Android sharesheet intent. */
   @ReactMethod
   fun shareMultipleFiles(fileUris: ReadableArray, mimeTypes: ReadableArray, promise: Promise) {
-    val activity = currentActivity
+    val activity = appContext.currentActivity
     if (activity == null) {
       promise.reject("E_SHARE_NO_ACTIVITY", "لا توجد نافذة نشطة لفتح لوحة المشاركة")
       return
@@ -220,8 +220,14 @@ class DownloadForegroundModule(
       val chooser = Intent.createChooser(shareIntent, "مشاركة ${uris.size} ملفات").apply {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
       }
-      activity.startActivity(chooser)
-      promise.resolve(true)
+      activity.runOnUiThread {
+        try {
+          activity.startActivity(chooser)
+          promise.resolve(true)
+        } catch (error: Exception) {
+          promise.reject("E_SHARE_MULTIPLE_FAILED", error.message ?: "تعذّرت مشاركة الملفات", error)
+        }
+      }
     } catch (error: Exception) {
       promise.reject("E_SHARE_MULTIPLE_FAILED", error.message ?: "تعذّرت مشاركة الملفات", error)
     }
