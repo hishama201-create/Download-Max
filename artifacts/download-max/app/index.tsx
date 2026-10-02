@@ -212,18 +212,9 @@ function formatBytes(value?: number) {
 }
 
 function percentLabel(item: DownloadItem) {
-  // (v2.0.12) النسبة تظهر دائماً — وبغياب الحجم الكلي نعرضها كمقياس تقدّم محلي:
-  // لا نعرف الإجمالي من الخادم، فيمثل المترجم (1MB→1%) حتى لا يبدو التقدم متجمداً.
-  if (!item.totalBytes && (item.bytesWritten ?? 0) > 0) {
-    const mb = Math.floor((item.bytesWritten ?? 0) / (1024 * 1024));
-    return `${Math.min(Math.max(mb, 1), 99)}%+`;
-  }
-  const percent = Math.min(Math.floor(item.progress * 100), 99);
-  if (percent > 0) return `${percent}%`;
-  // النسبة مجهولة (الخادم لم يعطِ الحجم الكلي) — نعرض الحجم المنزّل بدل 0% الميتة.
-  const bytes = item.bytesWritten ?? 0;
-  if (bytes > 0) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return '0%';
+  // لا نحسب نسبة تقريبية من عدد الميغابايت؛ لا تعرض نسبة إلا عند معرفة الحجم الكلي.
+  if (!item.totalBytes || item.totalBytes <= 0) return '—%';
+  return Math.min(Math.floor(Math.max(item.progress, 0) * 100), 99) + '%';
 }
 
 /** يحوّل مسار ملف داخلي إلى content:// يفهمه FileProvider لمشاركة سليمة على أندرويد. */

@@ -329,6 +329,15 @@ class DownloadForegroundService : Service() {
   private fun currentItem(): BackgroundDownload? =
     downloads.values.firstOrNull { !it.paused } ?: downloads.values.firstOrNull()
 
+  private fun formatBytes(bytes: Long): String {
+    val safeBytes = bytes.coerceAtLeast(0L)
+    return when {
+      safeBytes < 1024L -> safeBytes.toString() + " B"
+      safeBytes < 1024L * 1024L -> (safeBytes / 1024L).toString() + " KB"
+      else -> String.format(java.util.Locale.US, "%.1f MB", safeBytes / (1024.0 * 1024.0))
+    }
+  }
+
   private fun updateNotifications() {
     val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     val item = currentItem() ?: return
@@ -339,7 +348,12 @@ class DownloadForegroundService : Service() {
     } else 0
     val stateText = if (item.paused) "متوقف مؤقتاً" else "جارٍ التنزيل"
     val title = if (downloads.size > 1) "Download Max · ${downloads.size} تنزيلات" else item.title
-    val text = if (totalKnown) "$stateText · $progress%" else stateText
+    val progressDetail = if (totalKnown) {
+      progress.toString() + "% · " + formatBytes(item.bytesWritten) + " / " + formatBytes(item.totalBytes)
+    } else if (item.bytesWritten > 0L) {
+      formatBytes(item.bytesWritten)
+    } else null
+    val text = if (progressDetail != null) stateText + " · " + progressDetail else stateText
     val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
       flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
     }
@@ -360,7 +374,7 @@ class DownloadForegroundService : Service() {
       .setContentIntent(
         launchIntent?.let { PendingIntent.getActivity(this, 26026, it, pendingIntentFlags()) },
       )
-      .setProgress(100, progress, !totalKnown)
+      .setProgress(100, progress, !totalKnown && !item.paused)
 
     if (activeCount > 0) {
       builder.addAction(

@@ -1342,8 +1342,6 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const maxTasksCellularRef = useRef<MaxTasks>(2);
   const allowMobileDataRef = useRef(true);
   const isCellularRef = useRef(false);
-  /** طول الملف من فحص HEAD — مرجع احتياطي لحساب النسبة حين يحجب الخادم الطول أثناء البث. */
-  const remoteLengthRef = useRef<number | null>(null);
   const downloadDirRef = useRef<string | null>(null);
   const canDownloadRef = useRef(true);
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
@@ -1511,8 +1509,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       // (v2.0.12) نحفظ الرابط المباشر فور استخراجه — إيقاف مؤقت لاحق سيستأنف منه بلا استخراج جديد.
       directUrlRef.current.set(id, mediaUrl);
       const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
-      // يوتيوب غالباً يبث بدون ترويسة طول أثناء التنزيل نفسه — نستخدم طول HEAD كمرجع للنسبة.
-      remoteLengthRef.current = remoteInfo.length ?? null;
+      // الحجم معروف لكل مهمة على حدة حتى لا تختلط النسب عند تنزيل ملفات متزامنة.
+      const expectedRemoteBytes = remoteInfo.length ?? item.totalBytes ?? 0;
       const remoteCandidate = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
       // (إصلاح v2.0.11) اسم الخادم يُعتمد فقط إذا كان بشرياً — لا بصمات هاش مكان العناوين.
       const remoteName = remoteCandidate && looksLikeHumanName(remoteCandidate.replace(/\.[^.]+$/, '')) ? remoteCandidate : null;
@@ -1527,7 +1525,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         await patchItem(id, { title: resolvedTitle, format: resolvedFormat });
       }
       const foregroundItem = { ...item, title: resolvedTitle };
-      updateForegroundDownload(foregroundItem, target, remoteInfo.length ?? item.totalBytes ?? 0, false);
+      updateForegroundDownload(foregroundItem, target, expectedRemoteBytes, false);
       const notificationPaused = () =>
         pauseRequestedRef.current.has(id) ||
         itemsRef.current.find((candidate) => candidate.id === id)?.status === 'paused';
@@ -1544,7 +1542,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           try {
             const stat = await FileSystem.getInfoAsync(target);
             if (!('size' in stat) || typeof stat.size !== 'number' || stat.size <= 0) return;
-            const expected = remoteLengthRef.current ?? item.totalBytes ?? 0;
+            const expected = expectedRemoteBytes;
             const now = Date.now();
             if (now - lastAt < 300) return;
             lastAt = now;
@@ -1568,7 +1566,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const onProgress = (progress: { totalBytesWritten: number; totalBytesExpectedToWrite: number }) => {
         const expected = progress.totalBytesExpectedToWrite > 0
           ? progress.totalBytesExpectedToWrite
-          : remoteLengthRef.current ?? 0;
+          : expectedRemoteBytes;
         const nextProgress = expected > 0 ? progress.totalBytesWritten / expected : 0;
         if (nextProgress <= 0 || nextProgress >= 1) return;
         const now = Date.now();
@@ -1587,31 +1585,47 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       // استئناف من نقطة توقف محفوظة (إن وُجدت) بدل البدء من الصفر.
       let resumable: FileSystem.DownloadResumable | null = null;
       let resumedFromPause = false;
+      let resumeStateUnavailable = false;
       try {
         const savedRaw = await AsyncStorage.getItem(RESUME_KEY_PREFIX + id);
         if (savedRaw) {
           const saved = JSON.parse(savedRaw) as { url?: string; fileUri?: string; resumeData?: string; __directUrl?: string };
-          // (v2.0.12) الاستئناف الحقيقي: الرابط المباشر المحفوظ يُعتمد مباشرة حتى لو
-          // تغيّر mediaUrl المستخرج حديثاً (يوتيوب يغيّر روابطه في كل استخراج).
-          if (saved?.__directUrl && saved.fileUri) {
-            const partial = await FileSystem.getInfoAsync(saved.fileUri);
-            if (partial.exists) {
-              mediaUrl = saved.__directUrl;
-              target = saved.fileUri;
-              resumable = FileSystem.createDownloadResumable(saved.__directUrl, saved.fileUri, {}, onProgress, saved.resumeData);
-              resumedFromPause = true;
-            }
-          } else if (saved?.url === mediaUrl && saved.fileUri) {
+          // لا نعلن الاستئناف إلا إذا كانت بياناته الأصلية محفوظة والملف الجزئي موجوداً.
+          if (saved?.fileUri) {
             const partial = await FileSystem.getInfoAsync(saved.fileUri);
             if (partial.exists) {
               target = saved.fileUri;
-              resumable = FileSystem.createDownloadResumable(saved.url, saved.fileUri, {}, onProgress, saved.resumeData);
-              resumedFromPause = true;
+              const hasResumeData = typeof saved.resumeData === 'string' && saved.resumeData.length > 0;
+              if (hasResumeData && saved.__directUrl) {
+                // الرابط المباشر المحفوظ يتجاوز تغيّر روابط YouTube عند إعادة الاستخراج.
+                mediaUrl = saved.__directUrl;
+                resumable = FileSystem.createDownloadResumable(saved.__directUrl, saved.fileUri, {}, onProgress, saved.resumeData);
+                resumedFromPause = true;
+              } else if (hasResumeData && saved.url === mediaUrl) {
+                resumable = FileSystem.createDownloadResumable(saved.url, saved.fileUri, {}, onProgress, saved.resumeData);
+                resumedFromPause = true;
+              } else {
+                resumeStateUnavailable = true;
+              }
             }
           }
-          if (!resumedFromPause) await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id);
+          if (!resumedFromPause && !resumeStateUnavailable) await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id);
         }
-      } catch { /* حالة الاستئناف غير صالحة — بدء عادي */ }
+      } catch { /* لا نتلف الملف الجزئي إذا تعذرت قراءة بيانات الاستئناف */ }
+
+      if (resumeStateUnavailable) {
+        const partial = await FileSystem.getInfoAsync(target).catch(() => null);
+        const partialBytes = partial && partial.exists && 'size' in partial && typeof partial.size === 'number' ? partial.size : 0;
+        if (partialBytes > 0) {
+          const totalBytes = expectedRemoteBytes > 0 ? expectedRemoteBytes : undefined;
+          bytesRef.current.set(id, { bytesWritten: partialBytes, totalBytes });
+          await patchItem(id, { bytesWritten: partialBytes, totalBytes, progress: totalBytes ? Math.min(partialBytes / totalBytes, 0.99) : 0 });
+          watchStopped = true;
+          clearInterval(progressWatcher);
+          throw new Error('تعذر استكمال التنزيل المحفوظ؛ أبقيت الجزء المحمّل كما هو ولم أبدأ من الصفر. اضغط «إعادة المحاولة» لبدء تنزيل جديد.');
+        }
+        await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
+      }
 
       if (pauseRequestedRef.current.has(id)) {
         pauseRequestedRef.current.delete(id);
@@ -1630,7 +1644,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
         resumable = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
       }
-      updateForegroundDownload(foregroundItem, target, remoteInfo.length ?? item.totalBytes ?? 0, false);
+      updateForegroundDownload(foregroundItem, target, expectedRemoteBytes, false);
       resumablesRef.current.set(id, resumable);
 
       // الحفاظ على البايتات المحمّلة سابقاً عند الاستئناف (قد لا يصل حدث تقدم جديد قبل الاكتمال).
@@ -1642,21 +1656,22 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       let result: FileSystem.FileSystemDownloadResult | undefined;
       try {
         result = resumedFromPause ? await resumable.resumeAsync() : await resumable.downloadAsync();
-      } catch (resumeError) {
-        if (!resumedFromPause) throw resumeError;
-        // الخادم لا يدعم الاستئناف من نقطة التوقف — نمسح الجزء المحمّل ونعيد من الصفر.
-        await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
-        directUrlRef.current.delete(id);
-        try {
-          const partial = await FileSystem.getInfoAsync(target);
-          if (partial.exists) await FileSystem.deleteAsync(target, { idempotent: true });
-        } catch { /* تجاهل */ }
-        progressRef.current.delete(id);
-        bytesRef.current.delete(id);
-        patchItem(id, { progress: 0 });
-        const fresh = FileSystem.createDownloadResumable(mediaUrl, target, {}, onProgress);
-        resumablesRef.current.set(id, fresh);
-        result = await fresh.downloadAsync();
+      } catch {
+        if (!resumedFromPause) throw;
+        // لا نحذف الملف ولا نعيد نقله من الصفر تلقائياً إذا رفض الخادم طلب الاستئناف.
+        const partial = await FileSystem.getInfoAsync(target).catch(() => null);
+        const existingBytes = itemsRef.current.find((candidate) => candidate.id === id)?.bytesWritten ?? 0;
+        const partialBytes = partial && partial.exists && 'size' in partial && typeof partial.size === 'number'
+          ? partial.size
+          : existingBytes;
+        if (partialBytes > 0) {
+          const totalBytes = expectedRemoteBytes > 0 ? expectedRemoteBytes : undefined;
+          bytesRef.current.set(id, { bytesWritten: partialBytes, totalBytes });
+          await patchItem(id, { bytesWritten: partialBytes, totalBytes, progress: totalBytes ? Math.min(partialBytes / totalBytes, 0.99) : 0 });
+        }
+        watchStopped = true;
+        clearInterval(progressWatcher);
+        throw new Error('تعذر استئناف التنزيل من نقطة التوقف. الجزء المحمّل محفوظ؛ اضغط «إعادة المحاولة» لبدء تنزيل جديد.');
       }
       // ننظف حالة الاستئناف فقط عند انتهاء حقيقي — الإيقاف المؤقت يحتاجها للاستئناف لاحقاً.
       if (result) await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
@@ -1950,12 +1965,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!/^https?:\/\//i.test(input.url)) return null;
       if (input.type === 'image') {
         const info = await fetchRemoteFileInfo(input.url);
-        return null; // الأحجام تُجلب لكل صورة على حدة في الواجهة
+        return info.length;
       }
       const options = requestOptionsFor(input.type, input.format);
       const [mediaUrl] = await resolveMediaUrls(input.url, options);
       const info = await fetchRemoteFileInfo(mediaUrl);
-      return null;
+      return info.length;
     } catch {
       return null;
     }
@@ -2111,18 +2126,26 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item) return;
     if (item.status === 'downloading' || item.status === 'queued') return;
+    // «إعادة المحاولة» تعني البدء من جديد: نظّف الجزء وبيانات الاستئناف المحفوظة هنا فقط.
+    const savedRaw = await AsyncStorage.getItem(RESUME_KEY_PREFIX + id).catch(() => null);
+    if (savedRaw) {
+      try {
+        const saved = JSON.parse(savedRaw) as { fileUri?: string };
+        if (saved.fileUri) await FileSystem.deleteAsync(saved.fileUri, { idempotent: true });
+      } catch { /* الجزء غير موجود أو بياناته غير صالحة */ }
+      await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
+    }
     directUrlRef.current.delete(id);
-    patchItem(id, { status: 'queued', progress: 0, error: undefined });
+    patchItem(id, { status: 'queued', progress: 0, bytesWritten: undefined, error: undefined });
     enqueue(id);
   }, [patchItem, enqueue]);
 
-  /** إيقاف مؤقت لتنزيل جارٍ أو منتظر مع حفظ الجزء المحمّل لاستئنافه لاحقاً. */
+  /** إيقاف مؤقت لتنزيل جارٍ أو منتظر مع حفظ نقطة استئناف قابلة للاستخدام. */
   const pauseDownload = useCallback(async (id: string) => {
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item || item.status === 'completed' || item.status === 'failed' || item.status === 'paused') return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     if (item.status === 'queued') {
-      // لم يبدأ بعد — نخرجه من الطابور ونضعه في حالة إيقاف.
       queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
       patchItem(id, { status: 'paused', error: undefined });
       return;
@@ -2130,31 +2153,42 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const resumable = resumablesRef.current.get(id);
     pauseRequestedRef.current.add(id);
     if (!resumable) {
-      // لا يوجد ملف جزئي بعد (مثلاً أثناء تحليل الرابط)؛ أوقف المهمة قبل أن
-      // تبدأ النقل الفعلي، ثم اتركها قابلة للاستئناف من الواجهة أو الإشعار.
       patchItem(id, { status: 'paused', error: undefined });
       updateForegroundDownload(item, '', item.totalBytes ?? 0, true);
       return;
     }
+    let state: { fileUri?: string; resumeData?: string } | undefined;
     try {
-      // (v2.0.15) بعض الأجهزة لا تعيد حالة الاستئناف من الوحدة الأصلية؛
-      // كتابة قيمة فارغة كانت تُسقط التطبيق — نتخطّىها بدل ذلك.
-      const state = (await resumable.pauseAsync().catch(() => undefined)) as { fileUri?: string } | undefined;
-      // (v2.0.12) نحفظ الرابط المباشر مع الحالة — الاستئناف سيستخدمه مباشرة بلا استخراج جديد.
-      const directUrl = directUrlRef.current.get(id);
-      if (state?.fileUri) {
+      state = (await resumable.pauseAsync()) as { fileUri?: string; resumeData?: string } | undefined;
+    } catch {
+      pauseRequestedRef.current.delete(id);
+      return; // فشل الإيقاف؛ اترك التنزيل الجاري يكمل بدلاً من تسجيل إيقاف زائف.
+    }
+    const directUrl = directUrlRef.current.get(id);
+    if (state?.fileUri) {
+      try {
         await AsyncStorage.setItem(
           RESUME_KEY_PREFIX + id,
           JSON.stringify(directUrl ? { ...state, __directUrl: directUrl } : state),
         );
+      } catch {
+        pauseRequestedRef.current.delete(id);
+        await patchItem(id, { status: 'failed', error: 'تعذر حفظ نقطة الاستئناف؛ اضغط «إعادة المحاولة» لبدء تنزيل جديد.' });
+        return;
       }
-      patchItem(id, { status: 'paused', error: undefined });
-      updateForegroundDownload(item, state?.fileUri ?? '', item.totalBytes ?? 0, true);
-      void upsertHistoryEntry(historyEntryOf({ ...item, status: 'paused' }));
-    } catch {
-      pauseRequestedRef.current.delete(id);
-      // تعذر الإيقاف — يكمل التنزيل تلقائياً.
     }
+    if (!state?.fileUri || typeof state.resumeData !== 'string' || state.resumeData.length === 0) {
+      pauseRequestedRef.current.delete(id);
+      await patchItem(id, {
+        status: 'failed',
+        error: 'تعذر حفظ بيانات الاستئناف؛ لم أعد بدء التنزيل من الصفر. اضغط «إعادة المحاولة» لبدء تنزيل جديد.',
+      });
+      updateForegroundDownload(item, state?.fileUri ?? '', item.totalBytes ?? 0, true);
+      return;
+    }
+    await patchItem(id, { status: 'paused', error: undefined });
+    updateForegroundDownload(item, state.fileUri, item.totalBytes ?? 0, true);
+    void upsertHistoryEntry(historyEntryOf({ ...item, status: 'paused' }));
   }, [patchItem]);
 
   /** استئناف تنزيل متوقف من نفس النقطة (أو من الصفر إن رفض الخادم الاستئناف). */
