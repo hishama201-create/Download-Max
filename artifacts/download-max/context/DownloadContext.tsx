@@ -1656,8 +1656,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       let result: FileSystem.FileSystemDownloadResult | undefined;
       try {
         result = resumedFromPause ? await resumable.resumeAsync() : await resumable.downloadAsync();
-      } catch {
-        if (!resumedFromPause) throw;
+      } catch (resumeError) {
+        if (!resumedFromPause) throw resumeError;
         // لا نحذف الملف ولا نعيد نقله من الصفر تلقائياً إذا رفض الخادم طلب الاستئناف.
         const partial = await FileSystem.getInfoAsync(target).catch(() => null);
         const existingBytes = itemsRef.current.find((candidate) => candidate.id === id)?.bytesWritten ?? 0;
