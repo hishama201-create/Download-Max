@@ -47,7 +47,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.27';
+const APP_VERSION = '2.0.29';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -101,6 +101,29 @@ function qualityChoices(type: MediaType) {
     ];
   }
   return formats.image.map((entry) => ({ format: entry.format, label: entry.label, detail: entry.detail }));
+}
+
+type FormatBadgeTone = 'low' | 'slow' | 'quality' | 'mobile';
+
+function formatBadges(type: MediaType, format: string): { label: string; tone: FormatBadgeTone }[] {
+  if (type === 'video') {
+    const quality = Number(format.split('-')[1] ?? 0);
+    return [
+      ...(quality > 0 && quality <= 480 ? [{ label: 'حجم منخفض', tone: 'low' as const }] : []),
+      ...(quality >= 1080 ? [{ label: 'جودة عالية', tone: 'quality' as const }, { label: 'بطيء', tone: 'slow' as const }] : []),
+      ...(quality === 720 ? [{ label: 'الأفضل للجوال', tone: 'mobile' as const }] : []),
+    ];
+  }
+  if (type === 'audio') {
+    const bitrate = Number(format.split('-')[1] ?? 0);
+    return [
+      ...(bitrate > 0 && bitrate <= 70 ? [{ label: 'حجم منخفض', tone: 'low' as const }] : []),
+      ...(bitrate >= 256 ? [{ label: 'جودة عالية', tone: 'quality' as const }] : []),
+      ...(bitrate === 320 ? [{ label: 'بطيء', tone: 'slow' as const }] : []),
+      ...(bitrate === 128 ? [{ label: 'الأفضل للجوال', tone: 'mobile' as const }] : []),
+    ];
+  }
+  return [];
 }
 
 const typeLabels: Record<MediaType, string> = { video: 'فيديو', audio: 'صوت', image: 'صورة' };
@@ -1324,6 +1347,7 @@ export default function HomeScreen() {
   const [selectedFormat, setSelectedFormat] = useState('mp4');
   const [showFormatSheet, setShowFormatSheet] = useState(false);
   const [rememberFormat, setRememberFormat] = useState(false);
+  const formatProbeGenerationRef = useRef(0);
   // (v2.0.20) إذا فشلت كل مسارات الحفظ العام: نطلب اختيار مجلد مرة واحدة — بلا رسائل حمراء.
   const deviceFolderPromptedRef = useRef(false);
   useEffect(() => {
@@ -1356,9 +1380,9 @@ export default function HomeScreen() {
   }, []);
 
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
-  // (v2.0.18) نتيجة فحص الرابط: العنوان الحقيقي + الصيغ الفعلية المتاحة لهذا الرابط.
+  // (v2.0.29) الصيغ الفعلية وأحجامها لكل من الفيديو والموسيقى.
   const [probedTitle, setProbedTitle] = useState<string | null>(null);
-  const [liveFormats, setLiveFormats] = useState<ProbedFormat[] | null>(null);
+  const [liveFormats, setLiveFormats] = useState<Partial<Record<MediaType, ProbedFormat[] | null>>>({});
   const [probing, setProbing] = useState(false);
   const [panel, setPanel] = useState<'menu' | 'settings' | 'about' | 'vault' | 'trash' | null>(null);
   const [playingInBackground, setPlayingInBackground] = useState(false);
@@ -1500,6 +1524,13 @@ export default function HomeScreen() {
   const url = extractUrl(input);
   const hasValidUrl = /^https?:\/\/\S+$/i.test(url);
   const selectedOption = qualityChoices(mediaType).find((option) => option.format === selectedFormat) ?? qualityChoices(mediaType)[0];
+  const formatGroups = mediaType === 'image'
+    ? [{ type: 'image' as const, heading: '🖼️ صور', icon: 'image' as const, options: liveFormats.image ?? qualityChoices('image') }]
+    : [
+        { type: 'audio' as const, heading: '🎵 موسيقى', icon: 'headphones' as const, options: liveFormats.audio ?? qualityChoices('audio') },
+        { type: 'video' as const, heading: '🎬 فيديو', icon: 'video' as const, options: liveFormats.video ?? qualityChoices('video') },
+      ];
+  const hasLiveFormats = Object.values(liveFormats).some((entries) => !!entries?.length);
   const downloadItems = useMemo(() => [...items].sort((a, b) => b.createdAt - a.createdAt), [items]);
   const visibleItems = useMemo(() => downloadItems.filter((item) => !item.inVault && !item.deletedAt), [downloadItems]);
   const vaultItems = useMemo(() => downloadItems.filter((item) => item.inVault && !item.deletedAt && item.status === 'completed'), [downloadItems]);
@@ -1536,21 +1567,31 @@ export default function HomeScreen() {
     if (!rememberFormat) {
       setPendingUrl(url);
       setShowFormatSheet(true);
-      // (v2.0.18) فحص الرابط في الخلفية: العنوان الحقيقي + الصيغ المتوفرة فعلاً.
-      const probedType = mediaType;
+      // افحص الصوت والفيديو بالتوازي، وأضف كل صيغة إلى النافذة فور معرفة حجمها.
+      const generation = ++formatProbeGenerationRef.current;
+      const probedTypes: MediaType[] = mediaType === 'image' ? ['image'] : ['video', 'audio'];
       setProbedTitle(null);
-      setLiveFormats(null);
+      setLiveFormats({});
       setProbing(true);
-      probeMediaSource(url, probedType)
-        .then((result) => {
-          setProbedTitle(result.title);
-          setLiveFormats(result.formats.length > 0 ? result.formats : null);
-        })
-        .catch(() => {
-          setProbedTitle(null);
-          setLiveFormats(null);
-        })
-        .finally(() => setProbing(false));
+      void Promise.all(probedTypes.map(async (type) => {
+        const result = await probeMediaSource(url, type, (format) => {
+          if (generation !== formatProbeGenerationRef.current) return;
+          setLiveFormats((current) => {
+            if (generation !== formatProbeGenerationRef.current) return current;
+            const next = [...(current[type] ?? [])];
+            if (!next.some((entry) => entry.format === format.format)) next.push(format);
+            return { ...current, [type]: next };
+          });
+        }).catch(() => null);
+        if (generation !== formatProbeGenerationRef.current) return;
+        if (type === 'video') setProbedTitle(result?.title ?? null);
+        setLiveFormats((current) => ({
+          ...current,
+          [type]: result?.formats.length ? result.formats : null,
+        }));
+      })).finally(() => {
+        if (generation === formatProbeGenerationRef.current) setProbing(false);
+      });
       return;
     }
     await startDownload(url);
@@ -2119,28 +2160,72 @@ export default function HomeScreen() {
               {probedTitle ?? 'المزيد من الصيغ'}
             </Text>
             {probing ? (
-              <Text style={[styles.optionDetail, { color: colors.mutedForeground, marginBottom: 8 }]}>جارٍ فحص الرابط وجلب الصيغ المتوفرة…</Text>
-            ) : liveFormats ? (
+              <Text style={[styles.optionDetail, { color: colors.mutedForeground, marginBottom: 8 }]}>جارٍ فحص الصيغ وقياس الأحجام الفعلية…</Text>
+            ) : hasLiveFormats ? (
               <Text style={[styles.optionDetail, { color: colors.mutedForeground, marginBottom: 8 }]}>الصيغ المتوفرة لهذا الرابط — اختر واحدة</Text>
             ) : null}
-            <FlatList
-              data={liveFormats ?? qualityChoices(mediaType)}
-              keyExtractor={(entry) => entry.format}
-              style={{ flexGrow: 0 }}
-              renderItem={({ item: option }) => {
-                const selected = option.format === selectedFormat;
-                return <TouchableOpacity key={option.format} testID={`format-${option.format}`} onPress={() => { setSelectedFormat(option.format); }} style={[styles.optionRow, { borderColor: selected ? colors.primary : colors.border }]}>
-                  <View style={[styles.optionRadio, { borderColor: selected ? colors.primary : colors.input }]}>{selected ? <View style={[styles.optionRadioInner, { backgroundColor: colors.primary }]} /> : null}</View>
-                  <View style={styles.optionCopy}><Text style={[styles.optionTitle, { color: colors.foreground }]}>{option.label}</Text><Text style={[styles.optionDetail, { color: colors.mutedForeground }]}>{option.detail}</Text></View>
-                  {selected ? <Feather name="check" size={19} color={colors.primary} /> : null}
-                </TouchableOpacity>;
-              }}
-            />
+            <ScrollView style={styles.formatOptionsScroll} contentContainerStyle={styles.formatOptionsContent} showsVerticalScrollIndicator={false}>
+              {formatGroups.map((group) => (
+                <View key={group.type} style={styles.formatGroup}>
+                  <View style={styles.formatGroupHeader}>
+                    <Feather name={group.icon} size={16} color={colors.primary} />
+                    <Text style={[styles.formatGroupTitle, { color: colors.foreground }]}>{group.heading}</Text>
+                    {probing && !liveFormats[group.type] ? <ActivityIndicator size="small" color={colors.primary} /> : null}
+                  </View>
+                  {group.options.map((option) => {
+                    const selected = mediaType === group.type && option.format === selectedFormat;
+                    const badges = formatBadges(group.type, option.format);
+                    const sizeBytes = 'sizeBytes' in option ? option.sizeBytes : undefined;
+                    const sizeText = typeof sizeBytes === 'number'
+                      ? `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+                      : probing && pendingUrl
+                        ? 'جارٍ القياس…'
+                        : pendingUrl
+                          ? 'الحجم غير متاح'
+                          : 'أدخل رابطاً لقياس الحجم';
+                    const badgeColors = (tone: FormatBadgeTone) => {
+                      if (tone === 'low') return { backgroundColor: colors.secondary, color: colors.secondaryForeground };
+                      if (tone === 'slow') return { backgroundColor: `${colors.destructive}18`, color: colors.destructive };
+                      if (tone === 'quality') return { backgroundColor: `${colors.primary}18`, color: colors.primary };
+                      return { backgroundColor: colors.accent, color: colors.accentForeground };
+                    };
+                    return (
+                      <TouchableOpacity
+                        key={`${group.type}-${option.format}`}
+                        testID={`format-${group.type}-${option.format}`}
+                        onPress={() => { setMediaType(group.type); setSelectedFormat(option.format); void Haptics.selectionAsync(); }}
+                        style={[styles.optionRow, { borderColor: selected ? colors.primary : colors.border }]}
+                      >
+                        <View style={[styles.formatOptionIcon, { backgroundColor: selected ? `${colors.primary}18` : colors.muted }]}>
+                          <Feather name={group.type === 'audio' ? 'headphones' : group.type === 'video' ? 'video' : 'image'} size={16} color={selected ? colors.primary : colors.mutedForeground} />
+                        </View>
+                        <View style={styles.optionCopy}>
+                          <View style={styles.formatOptionTop}>
+                            <Text style={[styles.optionTitle, { color: colors.foreground }]} numberOfLines={1}>{option.label}</Text>
+                            <Text style={[styles.formatSize, { color: typeof sizeBytes === 'number' ? colors.accentForeground : colors.mutedForeground }]}>{sizeText}</Text>
+                          </View>
+                          <Text style={[styles.optionDetail, { color: colors.mutedForeground }]}>{option.detail}</Text>
+                          {badges.length > 0 ? (
+                            <View style={styles.formatBadgeRow}>
+                              {badges.map((badge) => {
+                                const tone = badgeColors(badge.tone);
+                                return <View key={badge.label} style={[styles.formatBadge, { backgroundColor: tone.backgroundColor }]}><Text style={[styles.formatBadgeText, { color: tone.color }]}>{badge.label}</Text></View>;
+                              })}
+                            </View>
+                          ) : null}
+                        </View>
+                        {selected ? <Feather name="check" size={19} color={colors.primary} /> : <View style={[styles.optionRadio, { borderColor: colors.input }]} />}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              ))}
+            </ScrollView>
             <Pressable onPress={() => setRememberFormat((value) => !value)} style={styles.rememberRow}>
               <Switch value={rememberFormat} onValueChange={(value) => setRememberFormat(value)} trackColor={{ true: colors.primary, false: colors.muted }} thumbColor="#fff" />
               <Text style={[styles.rememberText, { color: colors.foreground }]}>تذكر اختياري — تحميل مباشر بدون هذه النافذة</Text>
             </Pressable>
-            <Pressable testID="confirm-format" onPress={() => { setShowFormatSheet(false); if (pendingUrl) { const target = pendingUrl; const realTitle = probedTitle; setPendingUrl(null); setLiveFormats(null); setProbedTitle(null); void startDownload(target, realTitle ? { type: mediaType, format: selectedFormat, title: realTitle } : undefined); } }} style={[styles.sheetConfirm, { backgroundColor: colors.primary }]}>
+            <Pressable testID="confirm-format" onPress={() => { setShowFormatSheet(false); if (pendingUrl) { const target = pendingUrl; const realTitle = probedTitle; setPendingUrl(null); setLiveFormats({}); setProbedTitle(null); void startDownload(target, realTitle ? { type: mediaType, format: selectedFormat, title: realTitle } : undefined); } }} style={[styles.sheetConfirm, { backgroundColor: colors.primary }]}>
               <Text style={[styles.sheetConfirmText, { color: colors.primaryForeground }]}>تحميل الآن</Text>
             </Pressable>
           </Pressable>
@@ -2564,12 +2649,23 @@ const styles = StyleSheet.create({
   sheet: { borderTopLeftRadius: 26, borderTopRightRadius: 26, padding: 21, paddingBottom: 32 },
   sheetHandle: { width: 38, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 18 },
   sheetTitle: { fontSize: 20, fontWeight: '800', marginBottom: 8 },
-  optionRow: { minHeight: 66, borderBottomWidth: 1, flexDirection: 'row', alignItems: 'center', gap: 13 },
+  optionRow: { minHeight: 76, borderBottomWidth: 1, flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 9 },
   optionRadio: { width: 21, height: 21, borderRadius: 11, borderWidth: 2, justifyContent: 'center', alignItems: 'center' },
   optionRadioInner: { width: 11, height: 11, borderRadius: 6 },
   optionCopy: { flex: 1 },
   optionTitle: { fontSize: 14, fontWeight: '700' },
   optionDetail: { fontSize: 11, marginTop: 3 },
+  formatOptionsScroll: { maxHeight: 420, flexGrow: 0 },
+  formatOptionsContent: { paddingBottom: 5 },
+  formatGroup: { marginTop: 5 },
+  formatGroupHeader: { minHeight: 34, flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 2 },
+  formatGroupTitle: { fontSize: 14, fontWeight: '800', flex: 1 },
+  formatOptionIcon: { width: 34, height: 34, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  formatOptionTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  formatSize: { fontSize: 11, fontWeight: '800', flexShrink: 0 },
+  formatBadgeRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 5, marginTop: 6 },
+  formatBadge: { borderRadius: 999, paddingHorizontal: 7, paddingVertical: 3 },
+  formatBadgeText: { fontSize: 9, fontWeight: '800' },
   panelRoot: { flex: 1, flexDirection: 'row' },
   panelBackdropLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(5, 15, 28, 0.52)' },
   drawer: { width: '84%', minHeight: '100%', paddingTop: 58, paddingHorizontal: 21, borderTopRightRadius: 25, borderBottomRightRadius: 25 },

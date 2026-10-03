@@ -31,12 +31,15 @@ import java.util.LinkedHashMap
 
 private const val CHANNEL_ID = "download-max-active-downloads"
 private const val CHANNEL_NAME = "التنزيلات النشطة"
+private const val COMPLETED_CHANNEL_ID = "download-max-completed-downloads"
+private const val COMPLETED_CHANNEL_NAME = "اكتملت التنزيلات"
 private const val FOREGROUND_NOTIFICATION_ID = 26026
 private const val PREFS_NAME = "download_max_background"
 private const val PENDING_ACTIONS_KEY = "pending_download_actions"
 private const val ACTION_UPSERT = "com.anonymous.downloadmax.UPSERT"
 private const val ACTION_REMOVE = "com.anonymous.downloadmax.REMOVE"
 private const val ACTION_CONTROL = "com.anonymous.downloadmax.CONTROL"
+private const val ACTION_COMPLETED = "com.anonymous.downloadmax.COMPLETED"
 private const val EVENT_NAME = "DownloadForegroundAction"
 
 private data class BackgroundDownload(
@@ -168,6 +171,20 @@ class DownloadForegroundModule(
   }
 
   @ReactMethod
+  fun showCompletedNotification(id: String, title: String) {
+    val intent = Intent(appContext, DownloadForegroundService::class.java).apply {
+      action = ACTION_COMPLETED
+      putExtra("id", id)
+      putExtra("title", title)
+    }
+    try {
+      appContext.startService(intent)
+    } catch (_: Exception) {
+      // Notifications are best-effort and must not affect the completed file.
+    }
+  }
+
+  @ReactMethod
   fun consumePendingActions(promise: Promise) {
     promise.resolve(DownloadForegroundBridge.consume(appContext))
   }
@@ -273,6 +290,10 @@ class DownloadForegroundService : Service() {
         intent.getStringExtra("id")?.let { downloads.remove(it) }
       }
       ACTION_CONTROL -> handleNotificationAction(intent)
+      ACTION_COMPLETED -> {
+        val id = intent.getStringExtra("id") ?: return START_NOT_STICKY
+        showCompletedNotification(id, intent.getStringExtra("title").orEmpty())
+      }
     }
 
     if (downloads.isEmpty()) {
@@ -403,6 +424,37 @@ class DownloadForegroundService : Service() {
     }
   }
 
+  private fun showCompletedNotification(id: String, title: String) {
+    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+      flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+      data = Uri.parse("download-max:///?openDownload=${Uri.encode(id)}")
+    }
+    val requestCode = 50_000 + (id.hashCode() and 0x3fff)
+    val openPendingIntent = launchIntent?.let {
+      PendingIntent.getActivity(this, requestCode, it, pendingIntentFlags())
+    }
+    val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      Notification.Builder(this, COMPLETED_CHANNEL_ID)
+    } else {
+      @Suppress("DEPRECATION")
+      Notification.Builder(this)
+    }
+      .setSmallIcon(android.R.drawable.stat_sys_download_done)
+      .setContentTitle(title.ifBlank { "اكتمل التنزيل" })
+      .setContentText("اكتمل التنزيل — انقر للتشغيل")
+      .setCategory(Notification.CATEGORY_STATUS)
+      .setAutoCancel(true)
+      .setOngoing(false)
+      .setOnlyAlertOnce(true)
+
+    if (openPendingIntent != null) {
+      builder.setContentIntent(openPendingIntent)
+      builder.addAction(android.R.drawable.ic_media_play, "انقر للتشغيل", openPendingIntent)
+    }
+    manager.notify(50_000 + (id.hashCode() and 0x3fff), builder.build())
+  }
+
   private fun controlIntent(id: String, command: String): PendingIntent {
     val intent = Intent(this, DownloadForegroundService::class.java).apply {
       action = ACTION_CONTROL
@@ -430,6 +482,16 @@ class DownloadForegroundService : Service() {
     }
     (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
       .createNotificationChannel(channel)
+    val completedChannel = NotificationChannel(
+      COMPLETED_CHANNEL_ID,
+      COMPLETED_CHANNEL_NAME,
+      NotificationManager.IMPORTANCE_DEFAULT,
+    ).apply {
+      description = "إشعار باسم الملف المكتمل وزر لفتحه"
+      setShowBadge(true)
+    }
+    (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+      .createNotificationChannel(completedChannel)
   }
 
   override fun onDestroy() {

@@ -28,6 +28,7 @@ type ForegroundDownloadBridge = {
   upsertDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
   updateDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
   removeDownload: (id: string) => void;
+  showCompletedNotification: (id: string, title: string) => void;
   consumePendingActions: () => Promise<{ id: string; action: string }[]>;
 };
 
@@ -67,6 +68,15 @@ function removeForegroundDownload(id: string) {
     foregroundDownloadBridge?.removeDownload(id);
   } catch {
     // لا يؤثر فشل تنظيف الإشعار في سجل التنزيل.
+  }
+}
+
+function showCompletedNotification(id: string, title: string) {
+  if (Platform.OS !== 'android') return;
+  try {
+    foregroundDownloadBridge?.showCompletedNotification(id, title);
+  } catch {
+    // A completion notification must never turn a successful download into a failure.
   }
 }
 
@@ -1253,7 +1263,7 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
   return [data.url as string];
 }
 
-export type ProbedFormat = { format: string; label: string; detail: string };
+export type ProbedFormat = { format: string; label: string; detail: string; sizeBytes?: number | null };
 export type MediaProbeResult = {
   title: string | null;
   type: MediaType;
@@ -1266,16 +1276,46 @@ const VIDEO_QUALITY_LABELS: Record<string, string> = {
   '480': '480p', '360': '360p', '240': '240p', '144': '144p',
 };
 
+/** Reuse the same HEAD/range size check for a source that has already been resolved. */
+async function measureFormatSize(
+  sourceUrl: string,
+  type: MediaType,
+  format: string,
+  resolvedMediaUrl?: string,
+): Promise<number | null> {
+  try {
+    if (!/^https?:\/\//i.test(sourceUrl)) return null;
+    if (type === 'image') {
+      const info = await fetchRemoteFileInfo(resolvedMediaUrl ?? sourceUrl);
+      return info.length;
+    }
+    let mediaUrl = resolvedMediaUrl;
+    if (!mediaUrl) {
+      const [resolved] = await resolveMediaUrls(sourceUrl, requestOptionsFor(type, format));
+      mediaUrl = resolved;
+    }
+    if (!mediaUrl || !isUsableMediaUrl(mediaUrl)) return null;
+    const info = await fetchRemoteFileInfo(mediaUrl);
+    return info.length;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * (v2.0.18) فحص الرابط قبل التنزيل: يجلب العنوان الحقيقي ويجرّب الصيغ فعلياً لدى
  * خدمة الاستخراج، فيعرض على المستخدم قائمة حية بما هو متوفر لهذا الرابط تحديداً
  * بدل قائمة ثابتة مكتوبة يدوياً. الفحص لكل صيغة طلب واحد سريع؛ نجرّب الجودات
  * الشائعة فقط حتى لا يتأخر ظهور النافذة، والفشل الفردي يُتجاهل بصمت.
  */
-export async function probeMediaSource(sourceUrl: string, type: MediaType): Promise<MediaProbeResult> {
+export async function probeMediaSource(
+  sourceUrl: string,
+  type: MediaType,
+  onFormatReady?: (format: ProbedFormat) => void,
+): Promise<MediaProbeResult> {
   // العنوان الحقيقي أولاً (يوتيوب عبر oEmbed — بلا تكلفة).
   let title: string | null = null;
-  if (isYoutubeUrl(sourceUrl)) {
+  if (type === 'video' && isYoutubeUrl(sourceUrl)) {
     title = await fetchYoutubeTitle(sourceUrl).catch(() => null);
   }
   const formats: ProbedFormat[] = [];
@@ -1306,14 +1346,22 @@ export async function probeMediaSource(sourceUrl: string, type: MediaType): Prom
     candidates.map(async (candidate) => {
       try {
         const urls = await resolveMediaUrls(sourceUrl, candidate.options);
-        return urls.length > 0 && isUsableMediaUrl(urls[0]) ? candidate : null;
+        if (urls.length === 0 || !isUsableMediaUrl(urls[0])) return null;
+        const format: ProbedFormat = {
+          format: candidate.format,
+          label: candidate.label,
+          detail: candidate.detail,
+          sizeBytes: await measureFormatSize(sourceUrl, type, candidate.format, urls[0]),
+        };
+        onFormatReady?.(format);
+        return format;
       } catch {
         return null;
       }
     }),
   );
   for (const found of results) {
-    if (found) formats.push({ format: found.format, label: found.label, detail: found.detail });
+    if (found) formats.push(found);
   }
   return { title, type, formats };
 }
@@ -1336,6 +1384,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
   // مراجع تعمل خارج دورة الرسم لإدارة الطابور بأمان.
   const itemsRef = useRef<DownloadItem[]>([]);
+  const pendingNotificationOpenRef = useRef<string | null>(null);
+  const lastNotificationOpenRef = useRef<{ id: string; at: number } | null>(null);
   const queueRef = useRef<string[]>([]);
   const activeIdsRef = useRef<Set<string>>(new Set());
   const maxTasksRef = useRef<MaxTasks>(3);
@@ -1469,6 +1519,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           fileUri: target,
           deviceSaved: deviceSaved || undefined,
         });
+        showCompletedNotification(id, item.title);
         void upsertHistoryEntry(historyEntryOf({ ...item, status: 'completed', progress: 1, bytesWritten: size, totalBytes: size, fileUri: target }));
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         if (item.type === 'video') {
@@ -1753,6 +1804,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           format: finalFormat,
           deviceSaved: deviceSaved || undefined,
         });
+        showCompletedNotification(id, resolvedTitle);
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalBytes?.bytesWritten, totalBytes: finalBytes?.totalBytes, fileUri: target }));
         // توليد صورة مصغّرة للفيديو في الخلفية — فشلها لا يؤثر على اكتمال الملف.
@@ -1982,19 +2034,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
   /** يجلب حجم الملف لجودة/معدل محدد عبر طلب استخراج حقيقي ثم ترويسة الحجم. */
   const probeFileSize = useCallback(async (input: { url: string; type: MediaType; format: string }) => {
-    try {
-      if (!/^https?:\/\//i.test(input.url)) return null;
-      if (input.type === 'image') {
-        const info = await fetchRemoteFileInfo(input.url);
-        return info.length;
-      }
-      const options = requestOptionsFor(input.type, input.format);
-      const [mediaUrl] = await resolveMediaUrls(input.url, options);
-      const info = await fetchRemoteFileInfo(mediaUrl);
-      return info.length;
-    } catch {
-      return null;
-    }
+    return measureFormatSize(input.url, input.type, input.format);
   }, []);
 
   /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. يوتيوب يجلب اسمه الحقيقي فوراً. */
@@ -2315,6 +2355,58 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     await openWithViewer(item);
   }, []);
+
+  const handleCompletedDownloadLink = useCallback((url: string | null) => {
+    if (!url) return;
+    let id: string | null = null;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'download-max:') return;
+      id = parsed.searchParams.get('openDownload');
+    } catch {
+      return;
+    }
+    if (!id) return;
+    const previous = lastNotificationOpenRef.current;
+    if (previous?.id === id && Date.now() - previous.at < 2000) return;
+    lastNotificationOpenRef.current = { id, at: Date.now() };
+    pendingNotificationOpenRef.current = id;
+    const item = itemsRef.current.find((candidate) => candidate.id === id);
+    if (!item) return;
+    if (item.status === 'failed') {
+      pendingNotificationOpenRef.current = null;
+      return;
+    }
+    if (item.status !== 'completed' || !item.fileUri) return;
+    pendingNotificationOpenRef.current = null;
+    void openFile(item);
+  }, [openFile]);
+
+  useEffect(() => {
+    let active = true;
+    void Linking.getInitialURL()
+      .then((url) => { if (active) handleCompletedDownloadLink(url); })
+      .catch(() => undefined);
+    const subscription = Linking.addEventListener('url', ({ url }) => handleCompletedDownloadLink(url));
+    return () => {
+      active = false;
+      subscription.remove();
+    };
+  }, [handleCompletedDownloadLink]);
+
+  useEffect(() => {
+    const id = pendingNotificationOpenRef.current;
+    if (!id) return;
+    const item = items.find((candidate) => candidate.id === id);
+    if (!item) return;
+    if (item.status === 'failed') {
+      pendingNotificationOpenRef.current = null;
+      return;
+    }
+    if (item.status !== 'completed' || !item.fileUri) return;
+    pendingNotificationOpenRef.current = null;
+    void openFile(item);
+  }, [items, openFile]);
 
   const shareFile = useCallback(async (item: DownloadItem) => {
     if (item.status !== 'completed' || !item.fileUri) return;
