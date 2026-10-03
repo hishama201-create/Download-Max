@@ -41,13 +41,8 @@ import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDow
 import type { ProbedFormat } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
-/** رقم الإصدار يُقرأ من app.json ( expo.version ) حتى لا يُكتب يدوياً في أكثر من مكان. */
-/**
- * رقم الإصدار المعروض في «حول التطبيق» وتذييل القائمة الجانبية.
- * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
- * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
- */
-const APP_VERSION = '2.0.29';
+/** الإصدار المعروض يُقرأ من app.json عبر expo-constants، مع قيمة احتياطية للإصدار الحالي. */
+const APP_VERSION = Constants.expoConfig?.version ?? '2.0.31';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -240,13 +235,10 @@ function percentLabel(item: DownloadItem) {
   return Math.min(Math.floor(Math.max(item.progress, 0) * 100), 99) + '%';
 }
 
-/** يحوّل مسار ملف داخلي إلى content:// يفهمه FileProvider لمشاركة سليمة على أندرويد. */
+/** يستخدم Expo FileSystem لإنشاء content:// صالحاً لمشاركة ملفات التطبيق على Android. */
 async function toShareableUri(fileUri: string): Promise<string> {
-  const filesDir = FileSystem.documentDirectory;
-  const applicationId = Constants.expoConfig?.android?.package;
-  if (!filesDir || !applicationId || !fileUri.startsWith(filesDir)) return fileUri;
-  const relative = fileUri.slice(filesDir.length).split('/').map(encodeURIComponent).join('/');
-  return `content://${applicationId}.SharingFileProvider/expo_files/${relative}`;
+  if (Platform.OS !== 'android' || !fileUri.startsWith('file://')) return fileUri;
+  return FileSystem.getContentUriAsync(fileUri);
 }
 
 /** يعرض اسم مجلد التنزيل المختار بصيغة مقروءة من SAF URI. */
@@ -1884,28 +1876,36 @@ export default function HomeScreen() {
       return;
     }
     const targets = selectedItems.filter((item) => !!item.fileUri);
-    const available = await Sharing.isAvailableAsync();
-    if (!available) {
+    if (Platform.OS !== 'android' && !(await Sharing.isAvailableAsync())) {
       setNotice('المشاركة غير مدعومة على هذا الجهاز');
       return;
     }
     try {
-      if (targets.length > 1 && Platform.OS === 'android') {
-        const shareMultipleFiles = NativeModules.DownloadForeground?.shareMultipleFiles;
-        if (typeof shareMultipleFiles !== 'function') {
-          setNotice('مشاركة عدة ملفات غير متاحة في هذه النسخة — حدّث التطبيق');
-          return;
-        }
+      if (Platform.OS === 'android') {
+        const bridge = NativeModules.DownloadForeground;
         const shareUris = await Promise.all(targets.map((item) => toShareableUri(item.fileUri!)));
-        const mimeTypes = [...new Set(targets.map((item) => item.type === 'image' ? 'image/*' : item.type === 'video' ? 'video/*' : 'audio/*'))];
-        await shareMultipleFiles(shareUris, mimeTypes);
+        if (targets.length === 1) {
+          const shareSingleFile = bridge?.shareSingleFile;
+          if (typeof shareSingleFile !== 'function') {
+            setNotice('مشاركة الملفات غير متاحة في هذه النسخة — حدّث التطبيق');
+            return;
+          }
+          await shareSingleFile(shareUris[0], mimeFromFile(targets[0].fileUri!));
+        } else {
+          const shareMultipleFiles = bridge?.shareMultipleFiles;
+          if (typeof shareMultipleFiles !== 'function') {
+            setNotice('مشاركة عدة ملفات غير متاحة في هذه النسخة — حدّث التطبيق');
+            return;
+          }
+          const mimeTypes = [...new Set(targets.map((item) => item.type === 'image' ? 'image/*' : item.type === 'video' ? 'video/*' : 'audio/*'))];
+          await shareMultipleFiles(shareUris, mimeTypes);
+        }
       } else if (targets.length > 1) {
         setNotice('مشاركة عدة ملفات دفعة واحدة متاحة حالياً على Android فقط');
         return;
       } else {
         const first = targets[0].fileUri!;
-        const shareUri = await toShareableUri(first);
-        await Sharing.shareAsync(shareUri, { mimeType: mimeFromFile(first), dialogTitle: 'مشاركة الملف' });
+        await Sharing.shareAsync(first, { mimeType: mimeFromFile(first), dialogTitle: 'مشاركة الملف' });
       }
       setSelectedIds(new Set());
     } catch {

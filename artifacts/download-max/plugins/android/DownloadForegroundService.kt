@@ -199,6 +199,45 @@ class DownloadForegroundModule(
     // Required by NativeEventEmitter's native-module contract.
   }
 
+  /** Share one downloaded item through Android's sharesheet. */
+  @ReactMethod
+  fun shareSingleFile(fileUri: String, mimeType: String, promise: Promise) {
+    val activity = appContext.currentActivity
+    if (activity == null) {
+      promise.reject("E_SHARE_NO_ACTIVITY", "لا توجد نافذة نشطة لفتح لوحة المشاركة")
+      return
+    }
+
+    val uri = Uri.parse(fileUri.trim())
+    if (fileUri.isBlank() || uri.scheme != "content") {
+      promise.reject("E_SHARE_INVALID_URI", "رابط الملف غير صالح للمشاركة")
+      return
+    }
+
+    val safeMimeType = mimeType.trim().takeIf { it.contains('/') } ?: "*/*"
+    try {
+      val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = safeMimeType
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        clipData = ClipData.newUri(appContext.contentResolver, "Download Max", uri)
+      }
+      val chooser = Intent.createChooser(sendIntent, "مشاركة الملف").apply {
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      activity.runOnUiThread {
+        try {
+          activity.startActivity(chooser)
+          promise.resolve(true)
+        } catch (error: Exception) {
+          promise.reject("E_SHARE_SINGLE_FAILED", error.message ?: "تعذّرت مشاركة الملف", error)
+        }
+      }
+    } catch (error: Exception) {
+      promise.reject("E_SHARE_SINGLE_FAILED", error.message ?: "تعذّرت مشاركة الملف", error)
+    }
+  }
+
   /** Share all selected media in one Android sharesheet intent. */
   @ReactMethod
   fun shareMultipleFiles(fileUris: ReadableArray, mimeTypes: ReadableArray, promise: Promise) {

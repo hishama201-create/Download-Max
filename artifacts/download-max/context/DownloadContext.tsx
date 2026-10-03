@@ -1141,26 +1141,27 @@ function mimeFor(filename: string) {
  * يفتح الملف الذي تم تنزيله عبر لوحة مشاركة أندرويد (ACTION_SEND)،
  * للتطبيقات والخصائص التي تقبل مشاركة الملفات.
  */
-/**
- * مسار الملف الذي يفهمه FileProvider (content://…SharingFileProvider/…).
- * على أندرويد، expo-sharing يفشل صامتاً مع مسارات file:// الخام — نحوّلها أولاً
- * (نفس التحويل المستخدم في «فتح»)، وإذا تعذر التحويل نمرر المسار كما هو.
- */
+/** يستخدم Expo FileSystem لإنشاء content:// صالحاً لمشاركة ملفات التطبيق على Android. */
 async function shareableUri(fileUri: string): Promise<string> {
-  const applicationId = Constants.expoConfig?.android?.package;
-  const filesDir = FileSystem.documentDirectory;
-  if (!applicationId || !filesDir || !fileUri.startsWith(filesDir)) return fileUri;
-  const relative = fileUri.slice(filesDir.length).split('/').map(encodeURIComponent).join('/');
-  return `content://${applicationId}.SharingFileProvider/expo_files/${relative}`;
+  if (Platform.OS !== 'android' || !fileUri.startsWith('file://')) return fileUri;
+  return FileSystem.getContentUriAsync(fileUri);
 }
 
 async function shareDownloadedFile(item: DownloadItem): Promise<{ ok: boolean; message?: string }> {
   if (Platform.OS === 'web' || !item.fileUri) return { ok: false, message: 'الملف غير متاح للمشاركة' };
   try {
+    if (Platform.OS === 'android') {
+      const shareSingleFile = NativeModules.DownloadForeground?.shareSingleFile;
+      if (typeof shareSingleFile !== 'function') {
+        return { ok: false, message: 'مشاركة الملفات غير متاحة في هذه النسخة — حدّث التطبيق' };
+      }
+      const uri = await shareableUri(item.fileUri);
+      await shareSingleFile(uri, mimeFor(item.fileUri));
+      return { ok: true };
+    }
     const available = await Sharing.isAvailableAsync();
     if (!available) return { ok: false, message: 'المشاركة غير مدعومة على هذا الجهاز' };
-    const uri = await shareableUri(item.fileUri);
-    await Sharing.shareAsync(uri, {
+    await Sharing.shareAsync(item.fileUri, {
       mimeType: mimeFor(item.fileUri),
       dialogTitle: 'مشاركة الملف',
     });
