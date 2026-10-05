@@ -76,6 +76,41 @@ function removeForegroundDownload(id: string) {
  */
 const EXTRACTOR_API_URL =
   process.env.EXPO_PUBLIC_EXTRACTOR_URL?.trim() || 'https://api-production-85a7.up.railway.app/';
+const NETWORK_REQUEST_TIMEOUT_MS = 20_000;
+
+/** يمنع فحوص الروابط أو تنزيلاتها من البقاء معلّقة بلا نهاية على اتصال بطيء. */
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), NETWORK_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error('انتهت مهلة الاتصال بالخدمة. تحقق من الإنترنت وحاول مجدداً.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/** يبقي المهلة فعالة حتى قراءة JSON كاملة، لا حتى وصول ترويسات الاستجابة فقط. */
+async function fetchJsonWithTimeout(url: string, init: RequestInit = {}): Promise<{ response: Response; data: any }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), NETWORK_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const data = await response.json();
+    return { response, data };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error('انتهت مهلة الاتصال بالخدمة. تحقق من الإنترنت وحاول مجدداً.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed';
 export type MediaType = 'video' | 'audio' | 'image';
@@ -238,7 +273,14 @@ type DownloadContextValue = {
   waitingForWifi: boolean;
   addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<boolean>;
   /** يضيف تنزيلاً ذكياً: يكشف كاروسيل الصور وينشئ مهمة لكل صورة. يعيد عدد المهام. */
-  addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
+  addSmartDownload: (input: {
+    url: string;
+    title?: string;
+    type: MediaType;
+    format: string;
+    quality: string;
+    skipCarouselProbe?: boolean;
+  }) => Promise<number>;
   /** يضيف صور كاروسيل مختارة مسبقاً (روابط مباشرة) كمهام تنزيل. يعيد عددها. */
   addCarouselImages: (input: { urls: string[]; title?: string }) => Promise<number>;
   /** يحاول جلب رابط فيديو حقيقي لمنشور مختلط (فيديو مدمج بالكاروسيل أو نسخة عرض مولّدة). يعيد null إن لم تتوفر نسخة. */
@@ -389,7 +431,7 @@ function looksLikeHumanName(name: string): boolean {
 /** يجلب اسم الملف الحقيقي ونوعه من ترويسات الخادم قبل التنزيل. */
 async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string | null; mime: string | null; length: number | null }> {
   try {
-    let response = await fetch(mediaUrl, { method: 'HEAD' });
+    let response = await fetchWithTimeout(mediaUrl, { method: 'HEAD' });
     const disposition = response.headers.get('content-disposition');
     const mime = response.headers.get('content-type')?.split(';')[0]?.trim() ?? null;
     const lengthHeader = response.headers.get('content-length');
@@ -398,7 +440,7 @@ async function fetchRemoteFileInfo(mediaUrl: string): Promise<{ filename: string
     // لكنها ترجعه في ترويسة Content-Range لأول نطاق بايتات — فنستخرج الحجم الكلي منها.
     if (!length || length <= 0) {
       try {
-        const range = await fetch(mediaUrl, { method: 'GET', headers: { Range: 'bytes=0-1' } });
+        const range = await fetchWithTimeout(mediaUrl, { method: 'GET', headers: { Range: 'bytes=0-1' } });
         const contentRange = range.headers.get('content-range');
         const total = contentRange?.match(/\/(\d+)\s*$/);
         if (total) length = Number(total[1]);
@@ -1218,16 +1260,19 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
   } else if (options?.mode === 'video' && options.videoQuality) {
     body.videoQuality = options.videoQuality;
   }
-  const response = await fetch(EXTRACTOR_API_URL, {
+  const { response, data } = await fetchJsonWithTimeout(EXTRACTOR_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
   });
   if (!response.ok) {
+    if (response.status === 429) {
+      throw new Error('خدمة الاستخراج مشغولة الآن. انتظر قليلاً ثم حاول مجدداً.');
+    }
     // نعرض سبب الخطأ الحقيقي من الخدمة بدل رسالة عامة (رابط ناقص / خاص / غير مدعوم...).
     let reason = '';
     try {
-      const errData = await response.json();
+      const errData = data;
       const code: string = errData?.error?.code ?? '';
       if (code.includes('youtube.login')) reason = 'فيديوهات يوتيوب المقيدة تحتاج معالجة إضافية — أعد المحاولة أو استخدم جودة أخرى.';
       else if (code.includes('fetch.fail')) reason = 'الرابط غير مكتمل أو المحتوى غير متاح — تأكد من نسخ الرابط كاملاً من زر المشاركة.';
@@ -1240,7 +1285,6 @@ async function resolveMediaUrls(sourceUrl: string, options?: MediaRequestOptions
     } catch { /* لا تفاصيل إضافية */ }
     throw new Error(reason || 'تعذر الوصول إلى خدمة الاستخراج.');
   }
-  const data = await response.json();
   if (Array.isArray(data?.picker) && data.picker.length > 0) {
     const urls = data.picker
       .map((entry: { url?: unknown }) => (typeof entry?.url === 'string' ? entry.url : null))
@@ -1962,7 +2006,15 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   /** تنزيل ذكي: يستدعي خدمة الاستخراج مسبقاً؛ إن كان الرابط كاروسيل صور تُنشأ مهمة لكل صورة. يوتيوب يجلب اسمه الحقيقي فوراً. */
-  const addSmartDownload = useCallback(async (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => {
+  const addSmartDownload = useCallback(async (input: {
+    url: string;
+    title?: string;
+    type: MediaType;
+    format: string;
+    quality: string;
+    /** يُستخدم بعد فحص المحتوى في الواجهة لتجنب طلب فحص مكرر إلى خدمة الاستخراج. */
+    skipCarouselProbe?: boolean;
+  }) => {
     if (hasActiveDuplicate(itemsRef.current, input.url)) return 0;
     let title = input.title;
     if ((!title || /^(watch|shorts|\d+)$/i.test(title)) && isYoutubeUrl(input.url)) {
@@ -1971,14 +2023,16 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
     let mediaUrls: string[] = [input.url];
     let carousel = false;
-    try {
-      const resolved = await resolveMediaUrls(input.url);
-      if (resolved.length > 1) {
-        mediaUrls = resolved;
-        carousel = true;
+    if (!input.skipCarouselProbe) {
+      try {
+        const resolved = await resolveMediaUrls(input.url);
+        if (resolved.length > 1) {
+          mediaUrls = resolved;
+          carousel = true;
+        }
+      } catch {
+        // تعذر التحليل المسبق — تُضاف المهمة كالمعتاد ويعرض الخطأ داخلها عند التنفيذ.
       }
-    } catch {
-      // تعذر التحليل المسبق — تُضاف المهمة كالمعتاد ويعرض الخطأ داخلها عند التنفيذ.
     }
     if (!carousel) {
       const added = await addDownload({
@@ -2046,13 +2100,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (!/^https?:\/\//i.test(sourceUrl)) return null;
     // 1) خدمة الاستخراج الأساسية: قد تعيد فيديو حقيقياً (tunnel) أو عنصر فيديو داخل قائمة الكاروسيل.
     try {
-      const response = await fetch(EXTRACTOR_API_URL, {
+      const { response, data } = await fetchJsonWithTimeout(EXTRACTOR_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ url: sourceUrl, videoQuality }),
       });
       if (response.ok) {
-        const data = await response.json();
         if ((data?.status === 'tunnel' || data?.status === 'stream') && typeof data?.url === 'string' && data.url) return data.url as string;
         if (Array.isArray(data?.picker)) {
           const videoEntry = data.picker.find((entry: { type?: unknown; url?: unknown }) => entry?.type === 'video' && typeof entry?.url === 'string' && entry.url);
@@ -2065,9 +2118,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     // 2) خدمة احتياطية لنسخة العرض المولّدة (قابلة للتبديل عبر متغير البيئة).
     try {
       const fallbackBase = process.env.EXPO_PUBLIC_SLIDESHOW_FALLBACK_URL?.trim() || 'https://tikwm.com/api/';
-      const response = await fetch(`${fallbackBase}?url=${encodeURIComponent(sourceUrl)}&hd=1`);
+      const { response, data: payload } = await fetchJsonWithTimeout(`${fallbackBase}?url=${encodeURIComponent(sourceUrl)}&hd=1`);
       if (response.ok) {
-        const payload = await response.json();
         const play = payload?.data?.play;
         const duration = Number(payload?.data?.duration ?? 0);
         if (typeof play === 'string' && play && duration > 0) {

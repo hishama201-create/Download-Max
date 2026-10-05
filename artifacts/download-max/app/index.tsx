@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.26';
+const APP_VERSION = '2.0.27';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -121,7 +121,7 @@ function extractUrl(value: string) {
     return fixed;
   }
   // 2) نطاق بلا بروتوكول (youtu.be/xxx، tiktok.com/...): نلتقطه ونعيد بناءه.
-  const bare = cleaned.match(/((?:www\.|m\.)?(?:youtube\.com|youtu\.be|tiktok\.com|instagram\.com|facebook\.com|soundcloud\.com|twitter\.com|x\.com)\/[^\s]+)/i)?.[1];
+  const bare = cleaned.match(/((?:(?:www|m|t|story)\.)?(?:youtube\.com|youtu\.be|tiktok\.com|instagram\.com|snapchat\.com|snap\.com|facebook\.com|soundcloud\.com|twitter\.com|x\.com)\/[^\s]+)/i)?.[1];
   if (bare) {
     const candidate = bare.replace(/[,);.!]+$/, '');
     const fixed = fixIncompleteYoutubeUrl(`https://${candidate}`) ?? `https://${candidate}`;
@@ -178,10 +178,16 @@ function guessMediaTypeFromUrl(url: string): MediaType | null {
     const parsed = new URL(url);
     path = parsed.pathname.toLowerCase();
     const host = parsed.hostname.replace(/^www\./, '');
-    // نطاقات معروفة بنوعها بغض النظر عن الامتداد (إنستغرام/بينترست صور عادةً، ويوتيوب وتيك توك فيديو...).
+    // روابط Instagram posts قد تكون صورة أو فيديو أو كاروسيل؛ نحدد Reels الواضحة فقط.
+    if (/(^|\.)instagram\.com$/.test(host)) {
+      return /(?:^|\/)(?:reel|reels|tv|live|stories)\/[^/]+/i.test(path) ? 'video' : null;
+    }
+    // Snapchat يشارك روابط فيديو؛ نعامل النطاق الرئيسي وروابطه الفرعية كفيديو.
+    if (/(^|\.)(snapchat\.com|snap\.com)$/.test(host)) return 'video';
+    // نطاقات معروفة بنوعها بغض النظر عن الامتداد.
     if (/(^|\.)(youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|dai\.ly|tiktok\.com|twitter\.com|x\.com|twitch\.tv|facebook\.com|fb\.watch)$/.test(host)) return 'video';
     if (/(^|\.)(soundcloud\.com|spotify\.com|audiomack\.com|anchor\.fm)$/.test(host)) return 'audio';
-    if (/(^|\.)(imgur\.com|flickr\.com|pinterest\.com|pin\.it|unsplash\.com|500px\.com|instagram\.com)$/.test(host)) return 'image';
+    if (/(^|\.)(imgur\.com|flickr\.com|pinterest\.com|pin\.it|unsplash\.com|500px\.com)$/.test(host)) return 'image';
   } catch {
     return null;
   }
@@ -1423,7 +1429,9 @@ export default function HomeScreen() {
       });
     }), []);
   // نافذة المحتوى المختلط: منشور يحتوي صوراً ونسخة فيديو قصير معاً — نسأل المستخدم أيهما يريد.
-  const [mixedPrompt, setMixedPrompt] = useState<{ url: string; imageCount: number } | null>(null);
+  const [mixedPrompt, setMixedPrompt] = useState<{ url: string; imageCount: number; imageUrls: string[] } | null>(null);
+  // رابط مشارَك لا يكفي مساره لتحديد إن كان صورة أو فيديو — نطلب النوع بدل إسقاط الرابط.
+  const [sharedTypePrompt, setSharedTypePrompt] = useState<string | null>(null);
 
   // مزامنة إعدادات الطابور (المهام المتزامنة + بيانات الجوال) مع سياق التنزيل.
   useEffect(() => {
@@ -1455,6 +1463,10 @@ export default function HomeScreen() {
     const value = shared.value ?? '';
     const extracted = extractUrl(value);
     if (extracted) {
+      if (!/^https?:\/\/\S+$/i.test(extracted)) {
+        setNotice('المشاركة لا تحتوي على رابط صالح للتنزيل.');
+        return;
+      }
       setInput(extracted);
       setActiveTab('home');
       // مسار الروابط الاجتماعية: يطبّق التعرف من اسم الموقع ثم يفتح خيارات الصيغ (أو يحمل مع تذكر الاختيار).
@@ -1470,7 +1482,7 @@ export default function HomeScreen() {
           }
           return;
         }
-        setNotice('تم استلام الرابط من المشاركة');
+        setSharedTypePrompt(extracted);
       };
       // رابط يوتيوب بمعرّف ناقص (المشاركة قصّته) — رسالة واضحة بدل فشل الاستخراج الغامض.
       if (isIncompleteYoutubeUrl(extracted)) {
@@ -1490,7 +1502,7 @@ export default function HomeScreen() {
         setNotice(null);
         if (gallery.length > 1) {
           changeType('video');
-          setMixedPrompt({ url: extracted, imageCount: gallery.length });
+          setMixedPrompt({ url: extracted, imageCount: gallery.length, imageUrls: gallery });
           return;
         }
         applyGuessedShareFlow(true);
@@ -1569,6 +1581,7 @@ export default function HomeScreen() {
         type,
         format,
         quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
+        skipCarouselProbe: true,
       });
       setNotice(count === 0 ? 'هذا الرابط موجود بالفعل في قائمة التنزيل.' : count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
       setActiveTab('downloads');
@@ -1585,7 +1598,7 @@ export default function HomeScreen() {
           setCarouselGallery({ urls: gallery, selected: gallery.map(() => true), title: guessedTitle(targetUrl) });
           return;
         }
-        setMixedPrompt({ url: targetUrl, imageCount: gallery.length });
+        setMixedPrompt({ url: targetUrl, imageCount: gallery.length, imageUrls: gallery });
         return;
       }
     } catch {
@@ -1600,9 +1613,20 @@ export default function HomeScreen() {
       type,
       format,
       quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
+      skipCarouselProbe: true,
     });
     setNotice(count === 0 ? 'هذا الرابط موجود بالفعل في قائمة التنزيل.' : count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
     setActiveTab('downloads');
+  }
+
+  function chooseSharedMediaType(type: MediaType) {
+    if (!sharedTypePrompt) return;
+    const target = sharedTypePrompt;
+    const format = qualityChoices(type)[0].format;
+    setSharedTypePrompt(null);
+    changeType(type);
+    // الرابط فُحص للتو عند استلام المشاركة؛ لا نكرر فحص الكاروسيل قبل وضعه في الطابور.
+    void startDownload(target, { type, format, skipMixedCheck: true });
   }
 
   /** اختيار المستخدم في نافذة المحتوى المختلط: نسخة الفيديو القصير (بجودته المختارة) أو كل صور الألبوم. */
@@ -1611,21 +1635,8 @@ export default function HomeScreen() {
     const target = mixedPrompt.url;
     setMixedPrompt(null);
     if (choice === 'image') {
-      setNotice('جارٍ تحضير صور المنشور...');
-      try {
-        const gallery = await previewCarouselImages(target);
-        setNotice(null);
-        if (gallery.length > 0) {
-          setCarouselGallery({ urls: gallery, selected: gallery.map(() => true), title: guessedTitle(target) });
-          return;
-        }
-      } catch {
-        setNotice(null);
-      }
-      // تعذر جلب الصور — نضيف المهمة كصورة عادية.
-      const count = await addSmartDownload({ url: target, title: guessedTitle(target), type: 'image', format: 'jpg', quality: 'صورة' });
-      setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.');
-      setActiveTab('downloads');
+      // نستخدم الصور التي جلبها فحص المشاركة نفسه بدلاً من تكرار طلب المستخرج.
+      setCarouselGallery({ urls: mixedPrompt.imageUrls, selected: mixedPrompt.imageUrls.map(() => true), title: guessedTitle(target) });
       return;
     }
     // فيديو: نحاول جلب نسخة الفيديو الحقيقية للمنشور المختلط (من أي منصة).
@@ -2061,7 +2072,7 @@ export default function HomeScreen() {
             والشاشة ما تفكّك، فيرجع المستخدم للفيديو من حيث توقّف. الإخفاء بـ display يحافظ
             على حالة المكوّن ويمنع لمس الطبقات المخفية. */}
         <View style={activeTab === 'youtube' ? styles.tabLayer : styles.tabLayerHidden} pointerEvents={activeTab === 'youtube' ? 'auto' : 'none'}>
-          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.'); setActiveTab('downloads'); }); }} />
+          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي', skipCarouselProbe: true }).then((count) => { setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.'); setActiveTab('downloads'); }); }} />
         </View>
       </View>
 
@@ -2127,6 +2138,35 @@ export default function HomeScreen() {
             </Pressable>
             <Pressable testID="confirm-format" onPress={() => { setShowFormatSheet(false); if (pendingUrl) { const target = pendingUrl; const realTitle = probedTitle; setPendingUrl(null); setLiveFormats(null); setProbedTitle(null); void startDownload(target, realTitle ? { type: mediaType, format: selectedFormat, title: realTitle } : undefined); } }} style={[styles.sheetConfirm, { backgroundColor: colors.primary }]}>
               <Text style={[styles.sheetConfirmText, { color: colors.primaryForeground }]}>تحميل الآن</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <Modal visible={sharedTypePrompt !== null} transparent animationType="fade" onRequestClose={() => setSharedTypePrompt(null)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setSharedTypePrompt(null)}>
+          <Pressable style={[styles.dialogCard, { backgroundColor: colors.card }]} onPress={(event) => event.stopPropagation()}>
+            <View style={[styles.dialogIcon, { backgroundColor: `${colors.primary}14` }]}>
+              <Feather name="help-circle" size={26} color={colors.primary} />
+            </View>
+            <Text style={[styles.dialogTitle, { color: colors.foreground }]}>ما نوع المحتوى الذي تريد تنزيله؟</Text>
+            <Text style={[styles.dialogBody, { color: colors.mutedForeground }]}>
+              تعذر تحديد النوع من الرابط وحده. اختر النوع للمتابعة.
+            </Text>
+            <Pressable testID="shared-type-video" onPress={() => chooseSharedMediaType('video')} style={[styles.dialogButton, { backgroundColor: colors.primary }]}>
+              <Feather name="film" size={17} color={colors.primaryForeground} />
+              <Text style={[styles.dialogButtonText, { color: colors.primaryForeground }]}>فيديو</Text>
+            </Pressable>
+            <Pressable testID="shared-type-image" onPress={() => chooseSharedMediaType('image')} style={[styles.dialogButton, { backgroundColor: `${colors.primary}16` }]}>
+              <Feather name="image" size={17} color={colors.primary} />
+              <Text style={[styles.dialogButtonText, { color: colors.primary }]}>صورة</Text>
+            </Pressable>
+            <Pressable testID="shared-type-audio" onPress={() => chooseSharedMediaType('audio')} style={[styles.dialogButton, { backgroundColor: `${colors.primary}16` }]}>
+              <Feather name="music" size={17} color={colors.primary} />
+              <Text style={[styles.dialogButtonText, { color: colors.primary }]}>صوت</Text>
+            </Pressable>
+            <Pressable onPress={() => setSharedTypePrompt(null)} style={styles.dialogCancel}>
+              <Text style={[styles.dialogCancelText, { color: colors.mutedForeground }]}>إلغاء</Text>
             </Pressable>
           </Pressable>
         </Pressable>
