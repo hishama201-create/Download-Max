@@ -31,11 +31,11 @@ import {
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import { useVideoPlayer, VideoView } from 'expo-video';
+import { useVideoPlayer, VideoView, type VideoView as VideoViewType } from 'expo-video';
 import { resolveStreamUrl } from '@/context/DownloadContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
-import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess } from '@/context/DownloadContext';
+import { DownloadItem, MediaType, useDownloads, previewCarouselImages, ensureDownloadFolders, probeMediaSource, hasStorageAccess, openAllFilesAccessSettings } from '@/context/DownloadContext';
 import type { ProbedFormat } from '@/context/DownloadContext';
 import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '@/context/SettingsContext';
 
@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.26';
+const APP_VERSION = '2.0.28';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -367,6 +367,15 @@ function YoutubeResultCard({ video, wide, downloading, onDownload, onPress, colo
   );
 }
 
+/** (v2.0.28) تنسيق ثوانٍ إلى شكل الوقت 0:09 / 13:40 مثل عدّاد يوتيوب. */
+function formatSeekTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const total = Math.floor(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
 /** صفحة مشاهدة يوتيوب: مشغل مثبت أعلى + عنوان + مقترحات تشبه الفيديو + سحب لانهائي. */
 function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenVideo, onPlayingChange }: {
   colors: Palette;
@@ -386,13 +395,45 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   const [streamTitle, setStreamTitle] = useState<string | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(true);
+  // (v2.0.28) ميزات المشغّل الجديدة: عدّاد الوقت، بانر ±10 لضغطات التقديم، وPiP.
+  const [timeLabel, setTimeLabel] = useState('0:00 / 0:00');
+  const [seekBanner, setSeekBanner] = useState<{ side: 'left' | 'right'; amount: number; at: number } | null>(null);
+  const seekBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const videoViewRef = useRef<VideoViewType>(null);
+  const lastSeekAtRef = useRef(0);
 
   // مشغّل أصلي بدل WebView: يوتيوب يمنع تشغيل الفيديو داخل WebView غير مسجّل (خطأ 153).
   // نجلب رابط البث من نفس خدمة الاستخراج المستخدمة في التنزيل، ثم نشغّله بـ expo-video.
   const player = useVideoPlayer(streamUrl, (instance) => {
     instance.loop = false;
+    instance.timeUpdateEventInterval = 0.5;
     instance.play();
   });
+
+  // (v2.0.28) عدّاد الوقت «0:09 / 13:40» — يُحدّث من حدث timeUpdate (خصائص player لا تُحدث رسم React).
+  useEffect(() => {
+    const subscription = player.addListener('timeUpdate', ({ currentTime }) => {
+      const duration = player.duration;
+      setTimeLabel(duration > 0 ? `${formatSeekTime(currentTime)} / ${formatSeekTime(duration)}` : formatSeekTime(currentTime));
+    });
+    return () => subscription.remove();
+  }, [player]);
+
+  // (v2.0.28) النقر المزدوج للتقديم/الترجيع مثل يوتيوب: ±10 ثوانٍ وكل ضغط إضافية تتراكب (+20، +30…).
+  const handleDoubleTapSeek = useCallback((side: 'left' | 'right') => {
+    const now = Date.now();
+    if (now - lastSeekAtRef.current > 800) {
+      setSeekBanner({ side, amount: 10, at: now });
+    } else if (seekBanner) {
+      setSeekBanner({ side, amount: seekBanner.amount + 10, at: now });
+    } else {
+      setSeekBanner({ side, amount: 10, at: now });
+    }
+    lastSeekAtRef.current = now;
+    player.seekBy(side === 'right' ? 10 : -10);
+    if (seekBannerTimerRef.current) clearTimeout(seekBannerTimerRef.current);
+    seekBannerTimerRef.current = setTimeout(() => setSeekBanner(null), 700);
+  }, [player, seekBanner]);
 
   useEffect(() => {
     let cancelled = false;
@@ -491,13 +532,47 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
             <Text style={styles.ytPlayerStatusText}>جارٍ تجهيز الفيديو…</Text>
           </View>
         ) : streamUrl && !playerError ? (
-          <VideoView
-            style={styles.ytPlayer}
-            player={player}
-            nativeControls
-            contentFit="contain"
-            allowsPictureInPicture
-          />
+          <>
+            <VideoView
+              ref={videoViewRef}
+              style={styles.ytPlayer}
+              player={player}
+              nativeControls
+              contentFit="contain"
+              allowsPictureInPicture
+              startsPictureInPictureAutomatically
+            />
+            {/* (v2.0.28) مناطق الضغط المزدوج يمين/يسار — مثل يوتيوب: ±10 ثوانٍ متراكمة */}
+            <Pressable
+              accessibilityLabel="رجوع 10 ثوانٍ"
+              onPress={() => handleDoubleTapSeek('left')}
+              style={styles.seekZoneLeft}
+              pointerEvents="box-only"
+            />
+            <Pressable
+              accessibilityLabel="تقديم 10 ثوانٍ"
+              onPress={() => handleDoubleTapSeek('right')}
+              style={styles.seekZoneRight}
+              pointerEvents="box-only"
+            />
+            {/* بانر +10/−10 يظهر فوق الفيديو عند كل ضغطة */}
+            {seekBanner ? (
+              <View pointerEvents="none" style={[styles.seekBanner, seekBanner.side === 'left' ? styles.seekBannerLeft : styles.seekBannerRight]}>
+                <Text style={styles.seekBannerText}>{seekBanner.side === 'right' ? '+' : '-'}{seekBanner.amount}</Text>
+              </View>
+            ) : null}
+            {/* عدّاد الوقت «0:09 / 13:40» أسفل يسار المشغّل — زر PiP بجانبه */}
+            <View pointerEvents="box-none" style={styles.timeOverlayRow}>
+              <Text style={styles.timeOverlayText}>{timeLabel}</Text>
+              <Pressable
+                accessibilityLabel="تشغيل بنمط الصورة داخل الصورة — يكمل الفيديو فوق التطبيقات الأخرى"
+                onPress={() => { void videoViewRef.current?.startPictureInPicture().catch(() => undefined); }}
+                style={styles.pipButton}
+              >
+                <Feather name="minimize-2" size={14} color="#fff" />
+              </Pressable>
+            </View>
+          </>
         ) : null}
         {playerError ? (
           <View style={styles.ytPlayerError}>
@@ -855,6 +930,8 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
   // (v2.0.16) من Astraر لازم: زر فتح إعدادات الصلاحية العام مباشرة.
   return (
     <Pressable
+      onLongPress={onSelect}
+      delayLongPress={350}
       onPress={selected ? onSelect : item.status === 'completed' && item.fileUri ? onOpen : undefined}
       style={[styles.downloadRow, { backgroundColor: colors.card, borderColor: selected ? colors.primary : colors.border, borderWidth: selected ? 1.6 : 1 }]}
     >
@@ -1054,9 +1131,6 @@ function VaultPanel({ colors, pin, setPin, vaultItems, onBack, onOpen, onMoveOut
           <Text style={[styles.vaultTitle, { color: colors.foreground }]}>{pin ? 'أدخل الرمز السري' : 'اختر رمزاً سرياً'}</Text>
           <Text style={[styles.vaultSubtitle, { color: colors.mutedForeground }]}>
             {pin ? 'رمز من 4 أرقام لفتح ملفاتك الخاصة' : stage === 'confirm' ? 'أعد إدخال الرمز للتأكيد' : 'احتفظ بملفاتك الخاصة هنا · لن تظهر في التشغيل أو التنزيلات'}
-          </Text>
-          <Text style={[styles.vaultSubtitle, { color: colors.mutedForeground }]}>
-            الخزنة تخفي الملفات داخل التطبيق، لكنها لا تشفّر محتواها.
           </Text>
           {error ? <Text style={[styles.vaultError, { color: colors.destructive }]}>رمز خاطئ، حاول مرة أخرى</Text> : null}
           <PinPad draft={draft} colors={colors} onDigit={pressDigit} onDelete={() => setDraft((current) => current.slice(0, -1))} />
@@ -1307,10 +1381,6 @@ export default function HomeScreen() {
   const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
   const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
   const listScrollRef = useRef<number>(0);
-  const downloadRowRefs = useRef(new Map<string, View>());
-  const dragVisitedIds = useRef(new Set<string>());
-  const dragSelecting = useRef(false);
-  const dragJustFinished = useRef(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialog, setDeleteDialog] = useState<{ mode: 'selection' | 'single'; id?: string } | null>(null);
   /** الملف المفتوح قائمته السياقية (زر النقاط ⋮) — للتحويل إلى صوت. */
@@ -1369,37 +1439,6 @@ export default function HomeScreen() {
   const [notice, setNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
-  const selectRowAtScreenY = useCallback((screenY: number) => {
-    if (!dragSelecting.current) return;
-    for (const [id, row] of downloadRowRefs.current) {
-      row.measureInWindow((_x, top, _width, height) => {
-        if (screenY < top || screenY > top + height || dragVisitedIds.current.has(id)) return;
-        dragVisitedIds.current.add(id);
-        setSelectedIds((current) => {
-          if (current.has(id)) return current;
-          const next = new Set(current);
-          next.add(id);
-          return next;
-        });
-        void Haptics.selectionAsync();
-      });
-    }
-  }, []);
-  const downloadSelectionGesture = useMemo(() => Gesture.Pan()
-    .activateAfterLongPress(350)
-    .runOnJS(true)
-    .onStart((event) => {
-      dragSelecting.current = true;
-      dragVisitedIds.current.clear();
-      selectRowAtScreenY(event.absoluteY);
-    })
-    .onUpdate((event) => selectRowAtScreenY(event.absoluteY))
-    .onFinalize(() => {
-      if (!dragSelecting.current) return;
-      dragSelecting.current = false;
-      dragJustFinished.current = true;
-      setTimeout(() => { dragJustFinished.current = false; }, 250);
-    }), [selectRowAtScreenY]);
   // شبكة اختيار صور الكاروسيل: الصور مصغّرة مع صح/بدون صح ثم تنزيل المحدد فقط.
   const [carouselGallery, setCarouselGallery] = useState<{ urls: string[]; selected: boolean[]; title?: string } | null>(null);
   // (v2.0.12) التحديد بالسحب داخل شبكة صور الكاروسيل: ضغطة مطوّلة ثم مرور على الصور.
@@ -1570,7 +1609,7 @@ export default function HomeScreen() {
         format,
         quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
       });
-      setNotice(count === 0 ? 'هذا الرابط موجود بالفعل في قائمة التنزيل.' : count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
+      setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
       setActiveTab('downloads');
       return;
     }
@@ -1601,7 +1640,7 @@ export default function HomeScreen() {
       format,
       quality: qualityChoices(type).find((entry) => entry.format === format)?.label ?? 'المصدر الأصلي',
     });
-    setNotice(count === 0 ? 'هذا الرابط موجود بالفعل في قائمة التنزيل.' : count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
+    setNotice(count > 1 ? `كاروسيل صور: أُضيفت ${count} صور للتحميل ✓` : 'أُضيف التحميل إلى القائمة');
     setActiveTab('downloads');
   }
 
@@ -1623,8 +1662,8 @@ export default function HomeScreen() {
         setNotice(null);
       }
       // تعذر جلب الصور — نضيف المهمة كصورة عادية.
-      const count = await addSmartDownload({ url: target, title: guessedTitle(target), type: 'image', format: 'jpg', quality: 'صورة' });
-      setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.');
+      await addSmartDownload({ url: target, title: guessedTitle(target), type: 'image', format: 'jpg', quality: 'صورة' });
+      setNotice('أُضيف التحميل إلى القائمة');
       setActiveTab('downloads');
       return;
     }
@@ -1710,8 +1749,8 @@ export default function HomeScreen() {
    * جديد ينزل فيه تلقائياً بلا زر «نسخ».
    */
   async function enableAutoSave() {
-    if (Platform.OS !== 'android') {
-      setNotice('الحفظ التلقائي في مجلد الجهاز متاح على Android فقط');
+    if (Platform.OS === 'web') {
+      setNotice('الحفظ في مجلد الجهاز متاح في تطبيق أندرويد');
       return;
     }
     const result = await enableDeviceAutoSave();
@@ -1719,20 +1758,13 @@ export default function HomeScreen() {
   }
 
   // (v2.0.19) الوجهة الحقيقية: مجلد «Download Max» داخل المجلد المختار (SAF)، وإلا ألبوم المعرض.
-  const selectedSaveRoot = downloadDir ? dirLabel(downloadDir) : '';
   const deviceSavePath = downloadDir
-    ? selectedSaveRoot.toLowerCase() === 'download max'
-      ? selectedSaveRoot
-      : `${selectedSaveRoot} / Download Max`
-    : Platform.OS === 'android' && allFilesGranted
-      ? 'DownloadMax / download'
-      : 'المعرض · ألبوم Download Max';
+    ? `${dirLabel(downloadDir)} / Download Max`
+    : 'المعرض · ألبوم Download Max';
 
-  async function vaultAction(item: DownloadItem) {
-    const moved = await moveToVault(item.id);
-    setNotice(moved
-      ? 'نُقل الملف إلى الخزنة 🔒'
-      : 'أُخفي الملف في التطبيق، لكن تعذّر نقله إلى مجلد الخزنة');
+  function vaultAction(item: DownloadItem) {
+    void moveToVault(item.id);
+    setNotice('نُقل الملف إلى الخزنة 🔒');
   }
 
   /** يبدأ تحويل الفيديو المختار إلى صوت بالصيغة المحددة. */
@@ -1802,7 +1834,6 @@ export default function HomeScreen() {
 
   /** الضغط المطوّل يدخل وضع التحديد المتعدد. */
   function toggleSelection(id: string) {
-    if (dragJustFinished.current) return;
     setSelectedIds((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
@@ -1820,16 +1851,12 @@ export default function HomeScreen() {
   }
 
   /** ينقل كل الملفات المحددة إلى الخزنة دفعة واحدة. */
-  async function vaultSelected() {
+  function vaultSelected() {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
-    const outcomes: boolean[] = [];
-    for (const id of ids) outcomes.push(await moveToVault(id));
+    for (const id of ids) void moveToVault(id);
     setSelectedIds(new Set());
-    const moved = outcomes.filter(Boolean).length;
-    setNotice(moved === ids.length
-      ? `نُقل ${moved} ملف إلى الخزنة 🔒`
-      : `نُقل ${moved} من ${ids.length} ملف؛ بعض الملفات أُخفيت داخل التطبيق فقط`);
+    setNotice(`نُقل ${ids.length} ملف إلى الخزنة 🔒`);
   }
 
   /** مشاركة الملفات المحددة عبر لوحة مشاركة أندرويد (ملف واحد أو عدة ملفات). */
@@ -1892,15 +1919,19 @@ export default function HomeScreen() {
 
       <View style={styles.content}>
         {/* (v2.0.21) بوابة صلاحية «جميع الملفات»: خطوة واحدة تضمن حفظ كل تنزيل في مجلد الجهاز. */}
-        {Platform.OS === 'android' && allFilesGranted === false && !downloadDir && !storageGateDismissed ? (
+        {Platform.OS === 'android' && allFilesGranted === false && !storageGateDismissed ? (
           <View style={[styles.storageGate, { backgroundColor: `${colors.primary}12`, borderColor: `${colors.primary}44` }]}>
             <Feather name="shield" size={18} color={colors.primary} />
             <View style={styles.storageGateCopy}>
               <Text style={[styles.storageGateTitle, { color: colors.foreground }]}>مكّن حفظ الملفات في جهازك</Text>
-              <Text style={[styles.storageGateBody, { color: colors.mutedForeground }]} numberOfLines={2}>اختر مجلد الحفظ مرة واحدة عبر منتقي Android الرسمي؛ لا تحتاج إلى صلاحية الوصول لجميع الملفات.</Text>
+              <Text style={[styles.storageGateBody, { color: colors.mutedForeground }]} numberOfLines={2}>خطوة واحدة: اسمح بالوصول لجميع الملفات ليُحفظ كل تنزيل تلقائياً في مجلد «Download» — مثل تطبيقات التنزيل الأخرى.</Text>
+              {/* (v2.0.23) باب بديل: بعض أجهزة سامسونج لا تفتح شاشة المفتاح مباشرة — إعدادات التطبيق فيها نفس المفتاح باسم «الملفات والوسائط». */}
+              <Pressable onPress={() => { void Linking.openSettings(); }} hitSlop={6}>
+                <Text style={[styles.storageGateAlt, { color: colors.primary }]}>لا يظهر المفتاح؟ افتح إعدادات التطبيق ←</Text>
+              </Pressable>
             </View>
-            <Pressable testID="choose-download-folder" accessibilityLabel="اختيار مجلد الحفظ" onPress={() => { void enableAutoSave(); }} style={[styles.storageGateBtn, { backgroundColor: colors.primary }]}>
-              <Text style={[styles.storageGateBtnText, { color: colors.primaryForeground }]}>اختيار مجلد</Text>
+            <Pressable testID="grant-all-files" accessibilityLabel="منح صلاحية جميع الملفات" onPress={() => { void openAllFilesAccessSettings(); }} style={[styles.storageGateBtn, { backgroundColor: colors.primary }]}>
+              <Text style={[styles.storageGateBtnText, { color: colors.primaryForeground }]}>منح الآن</Text>
             </Pressable>
             <Pressable accessibilityLabel="إخفاء التنبيه مؤقتاً" onPress={() => setStorageGateDismissed(true)} hitSlop={8}>
               <Feather name="x" size={15} color={colors.mutedForeground} />
@@ -1995,7 +2026,6 @@ export default function HomeScreen() {
           <GoogleScreen colors={colors} googleRef={googleRef} onHistoryChange={setGoogleCanGoBack} />
         ) : activeTab === 'downloads' ? (
           <View style={{ flex: 1 }}>
-          <GestureDetector gesture={downloadSelectionGesture}>
           <FlatList
             ref={listFlatRef}
             data={filteredItems}
@@ -2043,17 +2073,9 @@ export default function HomeScreen() {
             }
             ListHeaderComponentStyle={styles.listHeader}
             ListEmptyComponent={<View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}><View style={[styles.emptyIcon, { backgroundColor: `${colors.primary}14` }]}><Feather name="download-cloud" size={28} color={colors.primary} /></View><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{downloadItems.length ? 'لا توجد ملفات من هذا النوع' : 'لا توجد تنزيلات بعد'}</Text><Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{downloadItems.length ? 'اختر تصنيفاً آخر لمشاهدة ملفاتك.' : 'ألصق رابطاً من الشاشة الرئيسية وابدأ أول تنزيل لك.'}</Text><Pressable onPress={() => setActiveTab('home')} style={[styles.emptyButton, { backgroundColor: colors.primary }]}><Text style={{ color: colors.primaryForeground, fontWeight: '700' }}>إضافة رابط</Text></Pressable></View>}
-            renderItem={({ item }) => (
-              <View ref={(node) => {
-                if (node) downloadRowRefs.current.set(item.id, node);
-                else downloadRowRefs.current.delete(item.id);
-              }}>
-                <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => { if (!dragJustFinished.current) showOpen(item); }} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />
-              </View>
-            )}
+            renderItem={({ item }) => <DownloadRow item={item} selected={selectedIds.has(item.id)} onSelect={() => toggleSelection(item.id)} onRetry={() => void retryDownload(item.id)} onPause={() => void pauseDownload(item.id)} onResume={() => void resumeDownload(item.id)} onRemove={() => { setDeleteDialog({ mode: 'single', id: item.id }); }} onShare={() => showShare(item)} onOpen={() => showOpen(item)} onVault={() => vaultAction(item)} onMore={() => setMoreMenu(item)} />}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
           />
-          </GestureDetector>
           </View>
         ) : null}
 
@@ -2061,7 +2083,7 @@ export default function HomeScreen() {
             والشاشة ما تفكّك، فيرجع المستخدم للفيديو من حيث توقّف. الإخفاء بـ display يحافظ
             على حالة المكوّن ويمنع لمس الطبقات المخفية. */}
         <View style={activeTab === 'youtube' ? styles.tabLayer : styles.tabLayerHidden} pointerEvents={activeTab === 'youtube' ? 'auto' : 'none'}>
-          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then((count) => { setNotice(count ? 'أُضيف التحميل إلى القائمة' : 'هذا الرابط موجود بالفعل في قائمة التنزيل.'); setActiveTab('downloads'); }); }} />
+          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then(() => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
         </View>
       </View>
 
@@ -2200,7 +2222,7 @@ export default function HomeScreen() {
                 const picked = carouselGallery.urls.filter((_, index) => carouselGallery.selected[index]);
                 setCarouselGallery(null);
                 void addCarouselImages({ urls: picked, title: carouselGallery.title }).then((count) => {
-                  setNotice(count ? `تمت إضافة ${count} صور للتحميل ✓` : 'الصور المحددة موجودة بالفعل في قائمة التنزيل.');
+                  setNotice(`تمت إضافة ${count} صور للتحميل ✓`);
                   setActiveTab('downloads');
                 });
               }}
@@ -2722,4 +2744,14 @@ const styles = StyleSheet.create({
   rememberText: { flex: 1, fontSize: 13, fontWeight: '700', lineHeight: 19 },
   sheetConfirm: { borderRadius: 15, paddingVertical: 15, alignItems: 'center', marginTop: 6 },
   sheetConfirmText: { fontSize: 15, fontWeight: '800' },
+  // — (v2.0.28) ميزات المشغّل: مناطق ±10، بانر التقديم، عدّاد الوقت وزر PiP —
+  seekZoneLeft: { position: 'absolute', top: 0, bottom: 0, left: 0, width: '28%' },
+  seekZoneRight: { position: 'absolute', top: 0, bottom: 0, right: 0, width: '28%' },
+  seekBanner: { position: 'absolute', top: 12, borderRadius: 999, backgroundColor: 'rgba(0,0,0,0.62)', paddingHorizontal: 13, paddingVertical: 6 },
+  seekBannerLeft: { left: 12 },
+  seekBannerRight: { right: 12 },
+  seekBannerText: { color: '#fff', fontSize: 14, fontWeight: '800' },
+  timeOverlayRow: { position: 'absolute', bottom: 8, left: 10, right: 10, flexDirection: 'row', alignItems: 'center' },
+  timeOverlayText: { color: '#fff', fontSize: 12, fontWeight: '700', textShadowColor: 'rgba(0,0,0,0.85)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
+  pipButton: { marginLeft: 'auto', width: 30, height: 30, borderRadius: 15, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
 });

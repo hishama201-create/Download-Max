@@ -2,7 +2,7 @@
   "expo": {
     "name": "Download Max",
     "slug": "download-max",
-    "version": "2.0.26",
+    "version": "2.0.28",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "download-max",
@@ -11,7 +11,6 @@
       "supportsTablet": false
     },
     "android": {
-      "versionCode": 26,
       "intentFilters": [
         {
           "action": "SEND",
@@ -50,6 +49,7 @@
     },
     "plugins": [
       "expo-router",
+      "@kesha-antonov/react-native-background-downloader",
       [
         "expo-video",
         {
@@ -62,8 +62,7 @@
           "savePhotosPermission": "يحتاج التطبيق إذن حفظ الوسائط لعرض ملفاتك في الاستوديو والمعرض.",
           "isAccessMediaLocationEnabled": false
         }
-      ],
-      "./plugins/with-download-foreground-service"
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
