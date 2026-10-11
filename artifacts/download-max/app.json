@@ -50,6 +50,7 @@
     "plugins": [
       "expo-router",
       "@kesha-antonov/react-native-background-downloader",
+      "./plugins/with-download-foreground-service",
       [
         "expo-video",
         {

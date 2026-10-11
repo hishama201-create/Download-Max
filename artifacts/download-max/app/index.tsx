@@ -395,6 +395,11 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   const [streamTitle, setStreamTitle] = useState<string | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(true);
+  // (v2.0.29) مرجع العنوان الفعلي المعروض — تقرأه الشاشة الابressة عند التصغير.
+  const streamTitleRef = useRef<string | null>(null);
+  useEffect(() => {
+    streamTitleRef.current = (streamTitle ?? video.title) as string | null;
+  }, [streamTitle, video.title]);
   // (v2.0.28) ميزات المشغّل الجديدة: عدّاد الوقت، بانر ±10 لضغطات التقديم، وPiP.
   const [timeLabel, setTimeLabel] = useState('0:00 / 0:00');
   const [seekBanner, setSeekBanner] = useState<{ side: 'left' | 'right'; amount: number; at: number } | null>(null);
@@ -420,6 +425,8 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   }, [player]);
 
   // (v2.0.28) النقر المزدوج للتقديم/الترجيع مثل يوتيوب: ±10 ثوانٍ وكل ضغط إضافية تتراكب (+20، +30…).
+  // (v2.0.29) اللمسة الوسطية لا تُظهر شيئاً عشوائياً: العدّاد ظاهر دائماً بموضعه الثابت
+  // (يسار المشغّل) وبانر ±10 يظهر في نصف الشاشة المقصود ويشتّل تلقائياً بعد 700ms.
   const handleDoubleTapSeek = useCallback((side: 'left' | 'right') => {
     const now = Date.now();
     if (now - lastSeekAtRef.current > 800) {
@@ -701,10 +708,11 @@ function GoogleScreen({ colors, googleRef, onHistoryChange }: {
 }
 
 /** شاشة يوتيوب بملء الشاشة: بحث ببطاقات Material 3 + Top Result + شرائح فلترة، وصفحة مشاهدة كاملة. */
-function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
+function YoutubeScreen({ colors, onDownload, onPlayingChange, minimized }: {
   colors: Palette;
   onDownload: (videoUrl: string) => void;
   onPlayingChange?: (playing: boolean) => void;
+  minimized?: { value: boolean; close: () => void; setBar: (entry: { videoId: string; title: string; thumbnail: string | null } | null) => void };
 }) {
   const apiKey = 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
   const [query, setQuery] = useState('');
@@ -715,12 +723,15 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
   const [ytFilter, setYtFilter] = useState<'all' | 'video' | 'channel'>('all');
   // صفحة المشاهدة: الفيديو المفتوح (Sticky Player + مقترحات)
   const [watching, setWatching] = useState<YoutubeVideo | null>(null);
+  // (v2.0.29) Mini player: الرجوع من شاشة المشاهدة يصغّر الفيديو لشريط أسفل — لا يغلق —
+  // تبقى بيانات الفيديو (ID/عنوان/صورة) وحالة التشغيل تعود من bridge الالقوق.
+  const streamTitleRef = useRef<string | null>(null);
 
-  // داخل شاشة المشاهدة زر الرجوع يرجع لقائمة النتائج بدل الخروج من التطبيق.
+  // داخل شاشة المشاهدة زر الرجوع يصغّر الفيديو بدل إغلاقه — سلوك YouTube.
   useEffect(() => {
     if (!watching) return;
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
-      setWatching(null);
+      handleMinimize();
       return true;
     });
     return () => subscription.remove();
@@ -758,6 +769,20 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
     }, 2500);
   }
 
+  // (v2.0.29) تصغير الفيديو: نرسل بيانات الشريط المصغّر للأب ثم نغلق صفحة المشاهدة.
+  function handleMinimize() {
+    if (!watching) return;
+    minimized?.setBar({ videoId: watching.id, title: streamTitleRef.current ?? watching.title, thumbnail: watching.thumbnail });
+    minimized?.close();
+    setWatching(null);
+  }
+
+  /** فتح فيديو مع تحديث مرجع عنوانه لشريط المصغّر لاحقاً. */
+  function openVideo(video: YoutubeVideo) {
+    streamTitleRef.current = video.title;
+    setWatching(video);
+  }
+
   if (watching) {
     return (
       <YoutubeWatchScreen
@@ -765,8 +790,8 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
         video={watching}
         apiKey={apiKey}
         onDownload={(video) => handleDownload(video)}
-        onBack={() => setWatching(null)}
-        onOpenVideo={(video) => setWatching(video)}
+        onBack={handleMinimize}
+        onOpenVideo={(video) => openVideo(video)}
         onPlayingChange={onPlayingChange}
       />
     );
@@ -825,7 +850,7 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
                       <Text style={[styles.ytTopBadgeText, { color: colors.primary }]}>الأفضل — من تنظيم YouTube</Text>
                     </View>
                   </View>
-                  <YoutubeResultCard video={topResult} wide downloading={downloadingIds.has(topResult.id)} onDownload={() => handleDownload(topResult)} onPress={() => setWatching(topResult)} colors={colors} />
+                  <YoutubeResultCard video={topResult} wide downloading={downloadingIds.has(topResult.id)} onDownload={() => handleDownload(topResult)} onPress={() => openVideo(topResult)} colors={colors} />
                 </View>
               ) : null}
             </View>
@@ -840,7 +865,7 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
             ) : null
           }
           renderItem={({ item }) => (
-            <YoutubeResultCard video={item} downloading={downloadingIds.has(item.id)} onDownload={() => handleDownload(item)} onPress={() => setWatching(item)} colors={colors} />
+            <YoutubeResultCard video={item} downloading={downloadingIds.has(item.id)} onDownload={() => handleDownload(item)} onPress={() => openVideo(item)} colors={colors} />
           )}
           ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
         />
@@ -1379,6 +1404,8 @@ export default function HomeScreen() {
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
   const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
+  // (v2.0.29) Mini player الحالة والدول الصاعدة: يعرضه هذا المستوى حتى يبقى فوق كل التبويبات.
+  const [miniPlayer, setMiniPlayer] = useState<{ videoId: string; title: string; thumbnail: string | null } | null>(null);
   const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
   const listScrollRef = useRef<number>(0);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -2083,7 +2110,12 @@ export default function HomeScreen() {
             والشاشة ما تفكّك، فيرجع المستخدم للفيديو من حيث توقّف. الإخفاء بـ display يحافظ
             على حالة المكوّن ويمنع لمس الطبقات المخفية. */}
         <View style={activeTab === 'youtube' ? styles.tabLayer : styles.tabLayerHidden} pointerEvents={activeTab === 'youtube' ? 'auto' : 'none'}>
-          <YoutubeScreen onPlayingChange={setPlayingInBackground} colors={colors} onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then(() => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }} />
+          <YoutubeScreen
+            colors={colors}
+            minimized={{ value: playingInBackground, close: () => setPlayingInBackground(false), setBar: (entry) => setMiniPlayer(entry) }}
+            onPlayingChange={setPlayingInBackground}
+            onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then(() => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }}
+          />
         </View>
       </View>
 
@@ -2096,6 +2128,28 @@ export default function HomeScreen() {
         >
           <Feather name="play-circle" size={16} color={colors.destructive} />
           <Text style={[styles.playingHintText, { color: colors.foreground }]}>فيديو يعمل — اضغط للعودة</Text>
+        </Pressable>
+      ) : null}
+
+      {/* (v2.0.29) Mini player: شريط مصغّر فوق شريط التبويبات يفتح الفيديو بنقرة ويعود لتبويب يوتيوب — التشغيل مستمر داخل YoutubeScreen المركب دائماً. */}
+      {miniPlayer ? (
+        <Pressable
+          accessibilityLabel="فتح الفيديو المصغّر"
+          onPress={() => { setActiveTab('youtube'); setMiniPlayer(null); }}
+          style={[styles.miniPlayerBar, { backgroundColor: colors.card, borderTopColor: colors.border }]}
+        >
+          <Feather name="youtube" size={20} color={colors.destructive} />
+          <View style={styles.miniPlayerCopy}>
+            <Text style={[styles.miniPlayerTitle, { color: colors.foreground }]} numberOfLines={1}>{miniPlayer.title}</Text>
+            <Text style={[styles.miniPlayerHint, { color: colors.mutedForeground }]}>يشتغل — اضغط للفتح</Text>
+          </View>
+          <Pressable
+            accessibilityLabel="إغلاق شريط الفيديو المصغّر"
+            onPress={() => setMiniPlayer(null)}
+            style={styles.miniPlayerClose}
+          >
+            <Feather name="x" size={19} color={colors.mutedForeground} />
+          </Pressable>
         </Pressable>
       ) : null}
 
@@ -2751,7 +2805,14 @@ const styles = StyleSheet.create({
   seekBannerLeft: { left: 12 },
   seekBannerRight: { right: 12 },
   seekBannerText: { color: '#fff', fontSize: 14, fontWeight: '800' },
-  timeOverlayRow: { position: 'absolute', bottom: 8, left: 10, right: 10, flexDirection: 'row', alignItems: 'center' },
+  // (v2.0.29) العدّاد بموضع ثابت يسار المشغّل (مستقل عن RTL) + ترس nativeControls مخفي.
+  timeOverlayRow: { position: 'absolute', bottom: 8, left: 10, right: 10, flexDirection: 'row-reverse', alignItems: 'center' },
   timeOverlayText: { color: '#fff', fontSize: 12, fontWeight: '700', textShadowColor: 'rgba(0,0,0,0.85)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
   pipButton: { marginLeft: 'auto', width: 30, height: 30, borderRadius: 15, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
+  // — (v2.0.29) شريط المصغّر Mini player —
+  miniPlayerBar: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 14, paddingVertical: 10, borderTopWidth: 1 },
+  miniPlayerCopy: { flex: 1, gap: 2 },
+  miniPlayerTitle: { fontSize: 13, fontWeight: '800' },
+  miniPlayerHint: { fontSize: 10.5 },
+  miniPlayerClose: { width: 32, height: 32, borderRadius: 16, justifyContent: 'center', alignItems: 'center' },
 });

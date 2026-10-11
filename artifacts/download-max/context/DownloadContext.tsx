@@ -10,7 +10,7 @@ import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
 import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, Linking, Platform } from 'react-native';
+import { AppState, Linking, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 import { setPublicRootProvider, syncHistorySnapshot, upsertHistoryEntry, deleteHistoryEntry } from '@/context/historyDb';
 import { extractAudioFromVideo } from '@/context/audio';
@@ -27,6 +27,53 @@ const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 /** (v2.0.28) الرابط المباشر المحفوظ لكل مهمة خلفية — يعاد ربطه بعد إغلاق التطبيق كلياً. */
 const BG_TASK_KEY_PREFIX = '@download-max/bg-task/';
 
+// — (v2.0.29) جسر الخدمة الأمامية من v2.0.26: يرفع أولوية التطبيق أثناء التنزيل —
+// بحيث لا يجمد أندرويد (Doze) الشبكة خلف تطبيقات أخرى أو شاشة مقفلة.
+type ForegroundDownloadBridge = {
+  upsertDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
+  updateDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
+  removeDownload: (id: string) => void;
+  consumePendingActions: () => Promise<{ id: string; action: string }[]>;
+};
+
+const foregroundDownloadBridge = NativeModules.DownloadForeground as ForegroundDownloadBridge | undefined;
+let notificationPermissionRequested = false;
+
+async function requestDownloadNotificationPermission(): Promise<boolean> {
+  if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return true;
+  try {
+    const permission = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
+    if (await PermissionsAndroid.check(permission)) return true;
+    if (notificationPermissionRequested) return false;
+    notificationPermissionRequested = true;
+    return (await PermissionsAndroid.request(permission, {
+      title: 'إشعارات التنزيلات',
+      message: 'اسمح بالإشعارات لمتابعة تقدم التنزيل والتحكم به عند استخدام تطبيقات أخرى.',
+      buttonPositive: 'السماح',
+      buttonNegative: 'ليس الآن',
+    })) === PermissionsAndroid.RESULTS.GRANTED;
+  } catch {
+    return false;
+  }
+}
+
+function updateForegroundDownload(item: DownloadItem, fileUri = '', totalBytes = item.totalBytes ?? 0, paused = false) {
+  if (Platform.OS !== 'android') return;
+  try {
+    foregroundDownloadBridge?.updateDownload(item.id, item.title, fileUri, totalBytes, paused);
+  } catch {
+    // الإشعار واجهة مساعدة؛ لا نوقف التنزيل إن تعذر تحديثه.
+  }
+}
+
+function removeForegroundDownload(id: string) {
+  if (Platform.OS !== 'android') return;
+  try {
+    foregroundDownloadBridge?.removeDownload(id);
+  } catch {
+    // لا يؤثر فشل تنظيف الإشعار في سجل التنزيل.
+  }
+}
 /**
  * خدمة تحويل روابط الصفحات إلى روابط وسائط مباشرة.
  * يمكن تغييرها لكل بيئة عبر EXPO_PUBLIC_EXTRACTOR_URL (تُثبَّت وقت البناء).
@@ -1617,6 +1664,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             progressRef.current.set(id, { progress: nextProgress, at: now });
             bytesRef.current.set(id, { bytesWritten, totalBytes: expected });
             patchItem(id, { progress: nextProgress, bytesWritten, totalBytes: expected });
+            updateForegroundDownload({ ...item, title: resolvedTitle }, target, expected, false);
           },
           onDone: async (location) => {
             // اكتمال حقيقي في الخلفية: ننقل الجزء إلى الاسم النهائي ثم نكمل سلسلة الحفظ.
@@ -1668,6 +1716,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
                 await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
                 await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id).catch(() => undefined);
                 directUrlRef.current.delete(id);
+                removeForegroundDownload(id);
               }
             } catch (completionError) {
               patchItem(id, { status: 'failed', error: completionError instanceof Error ? completionError.message : 'تعذر إتمام حفظ الملف بعد اكتمال التنزيل.' });
@@ -1689,6 +1738,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // التنزيل الآن خارج خيط JS بالكامل — لكن يبقى مسجلاً في الطابور حتى يعامل جاكماً.
         watchStopped = true;
         clearInterval(progressWatcher);
+        // (v2.0.29) رفع الخدمة الأمامية: يمنع أندرويد من تجميد الشبكة للتنزيلات. 
+        void requestDownloadNotificationPermission();
+        updateForegroundDownload({ ...item, title: resolvedTitle }, target, remoteLengthRef.current ?? item.totalBytes ?? 0, false);
         // نحفظ بيانات المهمة الخلفية لاستعادتها عند إغلاق التطبيق كلياً.
         try {
           await AsyncStorage.setItem(BG_TASK_KEY_PREFIX + id, JSON.stringify({
