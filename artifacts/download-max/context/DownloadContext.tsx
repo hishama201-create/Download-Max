@@ -1916,25 +1916,38 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     if (Platform.OS === 'web') return;
     const subscription = AppState.addEventListener('change', (state: string) => {
       if (state !== 'background' && state !== 'inactive') return;
-      for (const id of Array.from(activeIdsRef.current)) {
-        // المهام على المحرك الخلفي أصلن خارج JS — نكتفي بحفظ حالة المهمة للعودة.
-        if (AsyncStorage.getItem(BG_TASK_KEY_PREFIX + id) !== null) continue;
-        const resumable = resumablesRef.current.get(id);
-        if (!resumable) continue;
-        void (async () => {
-          try {
-            const directUrl = directUrlRef.current.get(id);
-            const state = (await resumable.pauseAsync().catch(() => undefined)) as { fileUri?: string } | undefined;
-            if (state?.fileUri) {
-              await AsyncStorage.setItem(
-                RESUME_KEY_PREFIX + id,
-                JSON.stringify(directUrl ? { ...state, __directUrl: directUrl } : state),
-              );
-              patchItem(id, { status: 'paused' });
-            }
-          } catch { /* الحفظ فشل — المهمة تكمل سلوكها العادي عند العودة */ }
-        })();
-      }
+      // (v2.0.31) إصلاح علة حرجة: كان التحقق «งAsyncStorage.getItem(... ) !== null» يُقارن
+      // Promise نفسه وليس نتيجته — فكان دائماً صحيحاً وتتخطى الحلقة كل المهمّات،
+      // ولا تُحفظ حالة أي مهمة قديمة المحرك عند الخروج للخلفية وضاع التقدم.
+      void (async () => {
+        const bgTaskIds = new Set<string>();
+        try {
+          for (const id of Array.from(activeIdsRef.current)) {
+            const record = await AsyncStorage.getItem(BG_TASK_KEY_PREFIX + id).catch(() => null);
+            if (record === null) continue;
+            bgTaskIds.add(id);
+          }
+        } catch { /* فشل الفحص — نعامل الكل كمهام غير خلفية لتفعيل شبكة الأمان */ }
+        for (const id of Array.from(activeIdsRef.current)) {
+          // المهام على المحرك الخلفي أصلًا خارج JS — نكتفي بحفظ حالة المهمة للعودة.
+          if (bgTaskIds.has(id)) continue;
+          const resumable = resumablesRef.current.get(id);
+          if (!resumable) continue;
+          void (async () => {
+            try {
+              const directUrl = directUrlRef.current.get(id);
+              const state = (await resumable.pauseAsync().catch(() => undefined)) as { fileUri?: string } | undefined;
+              if (state?.fileUri) {
+                await AsyncStorage.setItem(
+                  RESUME_KEY_PREFIX + id,
+                  JSON.stringify(directUrl ? { ...state, __directUrl: directUrl } : state),
+                );
+                patchItem(id, { status: 'paused' });
+              }
+            } catch { /* الحفظ فشل — المهمة تكمل سلوكها العادي عند العودة */ }
+          })();
+        }
+      })();
     });
     return () => subscription.remove();
   }, [patchItem]);
