@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.32';
+const APP_VERSION = '2.0.33';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -484,6 +484,29 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
     };
   }, [player, onPlayingChange]);
 
+  // (v2.0.33) السابق/التالي بنمط YouTube: نتابع ترتيب الفيديوهات التي شغّلها
+  // المستخدم — «السابق» يعود لآخر واحد شغّله، و«التالي» ينطلق لأول مقترح لم يُشغّل بعد.
+  const visitedIdsRef = useRef<string[]>([]);
+  const videoIdForVisited = video.id;
+  useEffect(() => {
+    visitedIdsRef.current.push(videoIdForVisited);
+  }, [videoIdForVisited]);
+  function handleSkip(direction: 'prev' | 'next') {
+    if (direction === 'next') {
+      const visited = new Set(visitedIdsRef.current);
+      const target = related.find((entry) => !visited.has(entry.id));
+      if (target) onOpenVideo(target);
+      return;
+    }
+    // prev: نعود لآخر فيديو شُغّل قبل الحالي — إن كان لا يزال في القائمة.
+    const visited = visitedIdsRef.current;
+    if (visited.length < 2) return;
+    const previousId = visited[visited.length - 2];
+    visitedIdsRef.current = visited.slice(0, -1);
+    const target = related.find((entry) => entry.id === previousId);
+    if (target && target.id !== videoIdForVisited) onOpenVideo(target);
+  }
+
   // جلب المقترحات: نفس عنوان الفيديو (نتائج مشابهة) — وكل سحب لأسفل يجلب صفحة جديدة
   useEffect(() => {
     let cancelled = false;
@@ -578,9 +601,28 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
                 <Text style={styles.seekBannerText}>{seekBanner.side === 'right' ? '+' : '-'}{seekBanner.amount}</Text>
               </View>
             ) : null}
-            {/* عدّاد الوقت «0:09 / 13:40» أسفل يسار المشغّل — زر PiP بجانبه */}
+            {/* عدّاد الوقت «0:09 / 13:40» أسفل يسار المشغّل — زرا السابق/التالي وزر PiP بجانبه */}
             <View pointerEvents="box-none" style={styles.timeOverlayRow}>
               <Text style={styles.timeOverlayText}>{timeLabel}</Text>
+              {/* (v2.0.33) السابق/التالي: تنقل بين المقترحات — تتظهر فقط مع وجود مقترحات */}
+              {related.length > 0 ? (
+                <>
+                  <Pressable
+                    accessibilityLabel="الفيديو السابق"
+                    onPress={() => handleSkip('prev')}
+                    style={styles.skipButton}
+                  >
+                    <Feather name="skip-forward" size={15} color="#fff" />
+                  </Pressable>
+                  <Pressable
+                    accessibilityLabel="الفيديو التالي"
+                    onPress={() => handleSkip('next')}
+                    style={styles.skipButton}
+                  >
+                    <Feather name="skip-back" size={15} color="#fff" />
+                  </Pressable>
+                </>
+              ) : null}
               <Pressable
                 accessibilityLabel="تشغيل بنمط الصورة داخل الصورة — يكمل الفيديو فوق التطبيقات الأخرى"
                 onPress={() => { void videoViewRef.current?.startPictureInPicture().catch(() => undefined); }}
@@ -2789,4 +2831,6 @@ const styles = StyleSheet.create({
   timeOverlayRow: { position: 'absolute', bottom: 8, left: 10, right: 10, flexDirection: 'row-reverse', alignItems: 'center' },
   timeOverlayText: { color: '#fff', fontSize: 12, fontWeight: '700', textShadowColor: 'rgba(0,0,0,0.85)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
   pipButton: { marginLeft: 'auto', width: 30, height: 30, borderRadius: 15, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
+  // (v2.0.33) أزرار السابق/التالي الصغيرة في صف العدّاد
+  skipButton: { width: 28, height: 28, marginLeft: 8, borderRadius: 14, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
 });
