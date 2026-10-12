@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.28';
+const APP_VERSION = '2.0.30';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -395,17 +395,27 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
   const [streamTitle, setStreamTitle] = useState<string | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(true);
-  // (v2.0.29) مرجع العنوان الفعلي المعروض — تقرأه الشاشة الابressة عند التصغير.
-  const streamTitleRef = useRef<string | null>(null);
-  useEffect(() => {
-    streamTitleRef.current = (streamTitle ?? video.title) as string | null;
-  }, [streamTitle, video.title]);
   // (v2.0.28) ميزات المشغّل الجديدة: عدّاد الوقت، بانر ±10 لضغطات التقديم، وPiP.
   const [timeLabel, setTimeLabel] = useState('0:00 / 0:00');
   const [seekBanner, setSeekBanner] = useState<{ side: 'left' | 'right'; amount: number; at: number } | null>(null);
   const seekBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const videoViewRef = useRef<VideoViewType>(null);
   const lastSeekAtRef = useRef(0);
+
+  // (v2.0.30) الرجوع (زر الشريط أو زر الهاتف) يدخل الصورة داخل الصورة PiP:
+  // الفيديو يتحول لنافذة عائمة نظامية تستمر حتى فوق التطبيقات الأخرى،
+  // وصفحة المشاهدة تُغلق فيعود المستخدم لقائمة يوتيوب.
+  const handleBackWithPip = useCallback(() => {
+    videoViewRef.current?.startPictureInPicture().catch(() => undefined);
+    onBack();
+  }, [onBack]);
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      handleBackWithPip();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [handleBackWithPip]);
 
   // مشغّل أصلي بدل WebView: يوتيوب يمنع تشغيل الفيديو داخل WebView غير مسجّل (خطأ 153).
   // نجلب رابط البث من نفس خدمة الاستخراج المستخدمة في التنزيل، ثم نشغّله بـ expo-video.
@@ -598,7 +608,7 @@ function YoutubeWatchScreen({ colors, video, apiKey, onDownload, onBack, onOpenV
       </View>
       {/* شريط عنوان المشاهدة مع زر رجوع */}
       <View style={[styles.ytWatchBar, { backgroundColor: colors.card, borderBottomColor: colors.border }]}>
-        <Pressable onPress={onBack} accessibilityLabel="رجوع" style={[styles.ytWatchBack, { backgroundColor: `${colors.mutedForeground}14` }]}>
+        <Pressable onPress={handleBackWithPip} accessibilityLabel="رجوع — يكمل الفيديو بنافذة عائمة" style={[styles.ytWatchBack, { backgroundColor: `${colors.mutedForeground}14` }]}>
           <Feather name="arrow-right" size={18} color={colors.foreground} />
         </Pressable>
         <View style={styles.ytWatchBarCopy}>
@@ -708,11 +718,10 @@ function GoogleScreen({ colors, googleRef, onHistoryChange }: {
 }
 
 /** شاشة يوتيوب بملء الشاشة: بحث ببطاقات Material 3 + Top Result + شرائح فلترة، وصفحة مشاهدة كاملة. */
-function YoutubeScreen({ colors, onDownload, onPlayingChange, minimized }: {
+function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
   colors: Palette;
   onDownload: (videoUrl: string) => void;
   onPlayingChange?: (playing: boolean) => void;
-  minimized?: { value: boolean; close: () => void; setBar: (entry: { videoId: string; title: string; thumbnail: string | null } | null) => void };
 }) {
   const apiKey = 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
   const [query, setQuery] = useState('');
@@ -723,19 +732,6 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange, minimized }: {
   const [ytFilter, setYtFilter] = useState<'all' | 'video' | 'channel'>('all');
   // صفحة المشاهدة: الفيديو المفتوح (Sticky Player + مقترحات)
   const [watching, setWatching] = useState<YoutubeVideo | null>(null);
-  // (v2.0.29) Mini player: الرجوع من شاشة المشاهدة يصغّر الفيديو لشريط أسفل — لا يغلق —
-  // تبقى بيانات الفيديو (ID/عنوان/صورة) وحالة التشغيل تعود من bridge الالقوق.
-  const streamTitleRef = useRef<string | null>(null);
-
-  // داخل شاشة المشاهدة زر الرجوع يصغّر الفيديو بدل إغلاقه — سلوك YouTube.
-  useEffect(() => {
-    if (!watching) return;
-    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
-      handleMinimize();
-      return true;
-    });
-    return () => subscription.remove();
-  }, [watching]);
   // شريط البحث القابل للطي: يطوي رأس الصفحة تلقائياً عند السحب لأعلى
   const scrollY = useRef(new Animated.Value(0)).current;
   const headerCollapse = scrollY.interpolate({ inputRange: [0, 92], outputRange: [92, 0], extrapolate: 'clamp' });
@@ -769,17 +765,14 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange, minimized }: {
     }, 2500);
   }
 
-  // (v2.0.29) تصغير الفيديو: نرسل بيانات الشريط المصغّر للأب ثم نغلق صفحة المشاهدة.
-  function handleMinimize() {
-    if (!watching) return;
-    minimized?.setBar({ videoId: watching.id, title: streamTitleRef.current ?? watching.title, thumbnail: watching.thumbnail });
-    minimized?.close();
+  // (v2.0.30) الرجوع من شاشة المشاهدة: نظّف حالة المشاهدة فقط —
+  // الفيديو أصلًا تحوّل لنافذة PiP النظامية من داخله (handleBackWithPip).
+  function handleBack() {
     setWatching(null);
   }
 
   /** فتح فيديو مع تحديث مرجع عنوانه لشريط المصغّر لاحقاً. */
   function openVideo(video: YoutubeVideo) {
-    streamTitleRef.current = video.title;
     setWatching(video);
   }
 
@@ -790,7 +783,7 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange, minimized }: {
         video={watching}
         apiKey={apiKey}
         onDownload={(video) => handleDownload(video)}
-        onBack={handleMinimize}
+        onBack={handleBack}
         onOpenVideo={(video) => openVideo(video)}
         onPlayingChange={onPlayingChange}
       />
@@ -1404,8 +1397,6 @@ export default function HomeScreen() {
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
   const [activeTab, setActiveTab] = useState<'home' | 'youtube' | 'google' | 'downloads'>('home');
-  // (v2.0.29) Mini player الحالة والدول الصاعدة: يعرضه هذا المستوى حتى يبقى فوق كل التبويبات.
-  const [miniPlayer, setMiniPlayer] = useState<{ videoId: string; title: string; thumbnail: string | null } | null>(null);
   const listFlatRef = useRef<FlatList<DownloadItem> | null>(null);
   const listScrollRef = useRef<number>(0);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -2112,7 +2103,6 @@ export default function HomeScreen() {
         <View style={activeTab === 'youtube' ? styles.tabLayer : styles.tabLayerHidden} pointerEvents={activeTab === 'youtube' ? 'auto' : 'none'}>
           <YoutubeScreen
             colors={colors}
-            minimized={{ value: playingInBackground, close: () => setPlayingInBackground(false), setBar: (entry) => setMiniPlayer(entry) }}
             onPlayingChange={setPlayingInBackground}
             onDownload={(videoUrl: string) => { void addSmartDownload({ url: videoUrl, type: 'video', format: 'mp4', quality: 'المصدر الأصلي' }).then(() => { setNotice('أُضيف التحميل إلى القائمة'); setActiveTab('downloads'); }); }}
           />
@@ -2131,27 +2121,7 @@ export default function HomeScreen() {
         </Pressable>
       ) : null}
 
-      {/* (v2.0.29) Mini player: شريط مصغّر فوق شريط التبويبات يفتح الفيديو بنقرة ويعود لتبويب يوتيوب — التشغيل مستمر داخل YoutubeScreen المركب دائماً. */}
-      {miniPlayer ? (
-        <Pressable
-          accessibilityLabel="فتح الفيديو المصغّر"
-          onPress={() => { setActiveTab('youtube'); setMiniPlayer(null); }}
-          style={[styles.miniPlayerBar, { backgroundColor: colors.card, borderTopColor: colors.border }]}
-        >
-          <Feather name="youtube" size={20} color={colors.destructive} />
-          <View style={styles.miniPlayerCopy}>
-            <Text style={[styles.miniPlayerTitle, { color: colors.foreground }]} numberOfLines={1}>{miniPlayer.title}</Text>
-            <Text style={[styles.miniPlayerHint, { color: colors.mutedForeground }]}>يشتغل — اضغط للفتح</Text>
-          </View>
-          <Pressable
-            accessibilityLabel="إغلاق شريط الفيديو المصغّر"
-            onPress={() => setMiniPlayer(null)}
-            style={styles.miniPlayerClose}
-          >
-            <Feather name="x" size={19} color={colors.mutedForeground} />
-          </Pressable>
-        </Pressable>
-      ) : null}
+      {/* (v2.0.30) حُذف شريط Mini player المخصص — بدله PiP النظامي الذي يظل مرئياً حتى خارج التطبيق. */}
 
       <View style={[styles.bottomNav, { backgroundColor: colors.card, borderTopColor: colors.border, paddingBottom: Platform.OS === 'web' ? 34 : Math.max(insets.bottom, 10) }]}>
         <Pressable testID="tab-home" accessibilityLabel="الرئيسية" onPress={() => setActiveTab('home')} style={styles.navItem}>
@@ -2809,10 +2779,4 @@ const styles = StyleSheet.create({
   timeOverlayRow: { position: 'absolute', bottom: 8, left: 10, right: 10, flexDirection: 'row-reverse', alignItems: 'center' },
   timeOverlayText: { color: '#fff', fontSize: 12, fontWeight: '700', textShadowColor: 'rgba(0,0,0,0.85)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
   pipButton: { marginLeft: 'auto', width: 30, height: 30, borderRadius: 15, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
-  // — (v2.0.29) شريط المصغّر Mini player —
-  miniPlayerBar: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 14, paddingVertical: 10, borderTopWidth: 1 },
-  miniPlayerCopy: { flex: 1, gap: 2 },
-  miniPlayerTitle: { fontSize: 13, fontWeight: '800' },
-  miniPlayerHint: { fontSize: 10.5 },
-  miniPlayerClose: { width: 32, height: 32, borderRadius: 16, justifyContent: 'center', alignItems: 'center' },
 });
