@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.31';
+const APP_VERSION = '2.0.32';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -2276,6 +2276,16 @@ export default function HomeScreen() {
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>مكتبتي</Text>
               <Pressable onPress={() => setPanel('vault')} testID="menu-vault" style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.accentForeground}14` }]}><Feather name="lock" size={16} color={colors.accentForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الخزنة</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.accentForeground}16` }]}><Text style={[styles.menuBadgeText, { color: colors.accentForeground }]}>{vaultItems.length}</Text></View></Pressable>
               <Pressable onPress={() => setPanel('trash')} testID="menu-trash" style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="trash-2" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>سلة المحذوفات</Text><View style={[styles.menuBadge, { backgroundColor: `${colors.destructive}16` }]}><Text style={[styles.menuBadgeText, { color: colors.destructive }]}>{trashItems.length}</Text></View></Pressable>
+              {/* (v2.0.32) فحص مكتبة الجهاز: يقرأ ملفات الوسائط من مجلدات التطبيق/الجهاز
+                  ويعيد تسجيلها في القائمة — استعادة المكتبة بعد إعادة تثبيت التطبيق. */}
+              <Pressable
+                onPress={() => { void (async () => { setPanel(null); const restored = await refreshFromDevice(); setNotice(restored > 0 ? `طُرجق استعادة ${restored} ملف من جهازك ✓` : 'لا توجد ملفات جديدة للاستعادة'); })(); }}
+                testID="menu-restore-library"
+                style={styles.menuItem}
+              >
+                <View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="refresh-ccw" size={16} color={colors.primary} /></View>
+                <Text style={[styles.menuItemText, { color: colors.foreground }]}>استعادة مكتبة الجهاز</Text>
+              </Pressable>
               <Text style={[styles.drawerSection, { color: colors.mutedForeground }]}>أدوات</Text>
               <Pressable onPress={() => setPanel('settings')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.mutedForeground}12` }]}><Feather name="sliders" size={16} color={colors.mutedForeground} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>الإعدادات</Text></Pressable>
               <Pressable onPress={() => setPanel('about')} style={styles.menuItem}><View style={[styles.menuItemIcon, { backgroundColor: `${colors.primary}12` }]}><Feather name="info" size={16} color={colors.primary} /></View><Text style={[styles.menuItemText, { color: colors.foreground }]}>حول التطبيق</Text></Pressable>
