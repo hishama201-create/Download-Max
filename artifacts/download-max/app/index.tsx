@@ -983,6 +983,12 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
           : 'في الانتظار';
   // (v2.0.16) الصور: ملفها داخل التطبيق نفسه هو الصورة المصغّرة — بلا توليد إضافي.
   const thumbSource = item.thumbnailUri ?? (item.type === 'image' && item.fileUri ? item.fileUri : null);
+  const needsDeviceFolder = item.status === 'completed'
+    && !!item.error
+    && item.error.includes('لم يتم اختيار مجلد حفظ في الجهاز');
+  const rowError = needsDeviceFolder
+    ? 'اكتمل التنزيل داخل التطبيق؛ اختر مجلداً من خيارات الملف لنسخه إلى جهازك.'
+    : item.error;
   // (v2.0.16) من Astraر لازم: زر فتح إعدادات الصلاحية العام مباشرة.
   return (
     <Pressable
@@ -1035,8 +1041,8 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
               </Text>
             ) : null}
           </View>
-        ) : item.error ? (
-          <Text style={[styles.errorText, { color: colors.destructive }]} numberOfLines={2}>{item.error}</Text>
+        ) : rowError ? (
+          <Text style={[styles.errorText, { color: needsDeviceFolder ? colors.mutedForeground : colors.destructive }]} numberOfLines={2}>{rowError}</Text>
         ) : null}
       </View>
       <View style={styles.rowActions}>
