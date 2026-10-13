@@ -210,12 +210,8 @@ function formatBytes(value?: number) {
 }
 
 function percentLabel(item: DownloadItem) {
-  // (v2.0.12) النسبة تظهر دائماً — وبغياب الحجم الكلي نعرضها كمقياس تقدّم محلي:
-  // لا نعرف الإجمالي من الخادم، فيمثل المترجم (1MB→1%) حتى لا يبدو التقدم متجمداً.
-  if (!item.totalBytes && (item.bytesWritten ?? 0) > 0) {
-    const mb = Math.floor((item.bytesWritten ?? 0) / (1024 * 1024));
-    return `${Math.min(Math.max(mb, 1), 99)}%+`;
-  }
+  // لا نخمن نسبة مئوية عندما لا يرسل الخادم الحجم الكامل.
+  if (!item.totalBytes) return (item.bytesWritten ?? 0) > 0 ? '—' : '…';
   const percent = Math.min(Math.floor(item.progress * 100), 99);
   if (percent > 0) return `${percent}%`;
   // النسبة مجهولة (الخادم لم يعطِ الحجم الكلي) — نعرض الحجم المنزّل بدل 0% الميتة.
@@ -1025,8 +1021,6 @@ function RowInner({ item, onRetry, onPause, onResume, onRemove, onShare, onOpen,
         <Text style={[styles.rowTitle, { color: colors.cardForeground }]} numberOfLines={1}>{item.title}</Text>
         <Text style={[styles.rowMeta, { color: colors.mutedForeground }]}>
           {typeLabels[item.type]} · {ltr(item.format.toUpperCase())} · {statusLabel}
-          {(isActive || isPaused) && item.bytesWritten ? ` · ${ltr(formatBytes(item.bytesWritten))}` : ''}
-          {item.totalBytes ? ` / ${ltr(formatBytes(item.totalBytes))}` : ''}
         </Text>
         {isActive || isPaused ? (
           <View style={styles.progressLine}>
@@ -1817,10 +1811,12 @@ export default function HomeScreen() {
     setNotice(result.message);
   }
 
-  // (v2.0.19) الوجهة الحقيقية: مجلد «Download Max» داخل المجلد المختار (SAF)، وإلا ألبوم المعرض.
+  // المسار يتبع وجهة الحفظ الفعلية: SAF المختار أو مجلد Download العام أو المعرض.
   const deviceSavePath = downloadDir
-    ? `${dirLabel(downloadDir)} / Download Max`
-    : 'المعرض · ألبوم Download Max';
+    ? `${dirLabel(downloadDir)} / Download Max / Video · Audio · Images`
+    : allFilesGranted
+      ? 'Download / Download Max / Video · Audio · Images'
+      : 'المعرض · ألبوم Download Max';
 
   function vaultAction(item: DownloadItem) {
     void moveToVault(item.id);

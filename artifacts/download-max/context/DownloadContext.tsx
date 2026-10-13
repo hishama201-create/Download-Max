@@ -10,7 +10,7 @@ import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
 import * as MediaLibrary from 'expo-media-library';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, Linking, NativeModules, PermissionsAndroid, Platform } from 'react-native';
+import { AppState, Linking, NativeEventEmitter, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
 import { setPublicRootProvider, syncHistorySnapshot, upsertHistoryEntry, deleteHistoryEntry } from '@/context/historyDb';
 import { extractAudioFromVideo } from '@/context/audio';
@@ -26,6 +26,10 @@ const RESUME_KEY_PREFIX = '@download-max/resume/';
 const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 /** (v2.0.28) الرابط المباشر المحفوظ لكل مهمة خلفية — يعاد ربطه بعد إغلاق التطبيق كلياً. */
 const BG_TASK_KEY_PREFIX = '@download-max/bg-task/';
+type BackgroundTask = ReturnType<typeof RNBackgroundDownloader.createDownloadTask>;
+/** مرجع حقيقي لمهام المحرك الأصلي، لا لكائن expo-file-system الاحتياطي. */
+const backgroundTasks = new Map<string, BackgroundTask>();
+const cancelBackgroundTasks = new Map<string, () => void>();
 
 // — (v2.0.29) جسر الخدمة الأمامية من v2.0.26: يرفع أولوية التطبيق أثناء التنزيل —
 // بحيث لا يجمد أندرويد (Doze) الشبكة خلف تطبيقات أخرى أو شاشة مقفلة.
@@ -36,7 +40,8 @@ type ForegroundDownloadBridge = {
   consumePendingActions: () => Promise<{ id: string; action: string }[]>;
 };
 
-const foregroundDownloadBridge = NativeModules.DownloadForeground as ForegroundDownloadBridge | undefined;
+const foregroundDownloadNativeModule = NativeModules.DownloadForeground;
+const foregroundDownloadBridge = foregroundDownloadNativeModule as ForegroundDownloadBridge | undefined;
 let notificationPermissionRequested = false;
 
 async function requestDownloadNotificationPermission(): Promise<boolean> {
@@ -63,6 +68,15 @@ function updateForegroundDownload(item: DownloadItem, fileUri = '', totalBytes =
     foregroundDownloadBridge?.updateDownload(item.id, item.title, fileUri, totalBytes, paused);
   } catch {
     // الإشعار واجهة مساعدة؛ لا نوقف التنزيل إن تعذر تحديثه.
+  }
+}
+
+function upsertForegroundDownload(item: DownloadItem, fileUri = '', totalBytes = item.totalBytes ?? 0, paused = false) {
+  if (Platform.OS !== 'android') return;
+  try {
+    foregroundDownloadBridge?.upsertDownload(item.id, item.title, fileUri, totalBytes, paused);
+  } catch {
+    // الإشعار واجهة مساعدة؛ لا نوقف التنزيل إن تعذر تشغيله.
   }
 }
 
@@ -428,9 +442,9 @@ function typeFromMime(mimeType: string | null): MediaType {
 /** يفصل امتداد الملف من اسمه الأصلي أو من نوع MIME، مع بدائل صالحة دائماً. */
 /** اسم المجلد الفرعي حسب نوع الوسيط (تنظيم على طريقة مجلدات التنزيل المعروفة). */
 function subfolderFor(type: MediaType): string {
-  if (type === 'video') return 'video';
-  if (type === 'audio') return 'voice';
-  return 'image';
+  if (type === 'video') return 'Video';
+  if (type === 'audio') return 'Audio';
+  return 'Images';
 }
 
 /** اسم مجلد التنزيلات الافتراضي. */
@@ -476,8 +490,7 @@ function isSafAppRootUri(uri: string): boolean {
 /** الجذر العام للتخزين الداخلي في أندرويد — يحتاج صلاحية «الوصول لجميع الملفات». */
 const PUBLIC_ROOT = '/storage/emulated/0/';
 /**
- * (v2.0.12) جذر هيكل Snaptube العام: «/storage/emulated/0/DownloadMax/».
- * يعمل فقط مع صلاحية All Files Access — وهو المسار الأساسي للحفظ الآن.
+ * جذر أرشيف السجل القديم، يُبقى للتوافق مع قاعدة البيانات والملفات السابقة فقط.
  */
 function publicStorageRoot(): string {
   return `${PUBLIC_ROOT}${SNAPTUBE_ROOT_NAME}/`;
@@ -601,7 +614,7 @@ async function publicDownloadRoot(): Promise<string> {
     const info = await FileSystem.getInfoAsync(dir);
     if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
   } catch {
-    return PUBLIC_DOWNLOAD_DIR;
+    return '';
   }
   return dir;
 }
@@ -642,29 +655,16 @@ async function safAppRoot(pickedDirUri: string): Promise<string> {
 }
 
 /**
- * (v2.0.19) سلسلة الحفظ في جهاز المستخدم بالترتيب المضمون — كل مسار صامت عند فشله:
- * 1) «الوصول لجميع الملفات» متاح؟ نسخة في هيكل DownloadMax/download/… (الأفضل — ملف حقيقي).
- * 2) المستخدم اختار مجلداً مرة واحدة (SAF)؟ نسخة في «المختار / Download Max / النوع» — مضمون
- *    لأن صلاحية الشجرة محفوظة (أثبتت نجاحها بإنشائها المجلدات).
- * 3) وإلا ألبوم «Download Max» عبر MediaStore (المعرض) بصلاحية وسائط عادية.
- * 4) أخيراً المسار العام «Download/Download Max» إن سارت الصلاحية المباشرة.
+ * 1) مجلد SAF الذي اختاره المستخدم مرة واحدة.
+ * 2) Download/Download Max عند منح صلاحية الوصول لجميع الملفات.
+ * 3) ألبوم «Download Max» عبر MediaStore كمسار توافق أخير.
  * الأصل يبقى دائماً في مساحة التطبيق (fileUri يشير إليه) — والفشل الكلي لا يعرض أي خطأ.
  */
 async function mirrorToDeviceDownloads(localUri: string, filename: string, type: MediaType, safDir: string | null): Promise<boolean> {
   // (v2.0.21) صفّر سجل الأسباب قبل بدء السلسلة حتى لا يظهر سبب ملف سابق لملف جديد.
   lastDeviceSaveError = null;
   deviceSaveErrorLog = [];
-  // ١) صلاحية All Files Access: هيكل Snaptube العام.
-  if (Platform.OS === 'android' && (await hasStorageAccess())) {
-    const dir = await snaptubeTypeDir(type);
-    if (dir) {
-      try {
-        await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
-        return true;
-      } catch (error) { noteDeviceSaveError('نسخ AllFiles', error); /* نكمل للمسار التالي */ }
-    }
-  }
-  // ٢) المجلد الذي اختاره المستخدم (SAF) — أضمن مسار متاح بلا أي صلاحية خاصة.
+  // ١) المجلد الذي اختاره المستخدم — له الأولوية كي يطابق المسار الظاهر في الإعدادات.
   if (safDir) {
     const appRoot = await safAppRoot(safDir);
     const dir = await safSubfolder(appRoot, subfolderFor(type));
@@ -672,19 +672,23 @@ async function mirrorToDeviceDownloads(localUri: string, filename: string, type:
   } else {
     noteDeviceSaveError('SAF', 'لم يتم اختيار مجلد حفظ في الجهاز');
   }
-  // ٣) ألبوم «Download Max» عبر MediaStore.
-  if (await saveToPublicAlbum(localUri, filename, type)) return true;
-  deviceSaveErrorLog.push('المعرض: تعذّر الحفظ في ألبوم Download Max');
-  // ٤) المسار العام «Download/Download Max» كخيار أخير.
-  if (await hasStorageAccess()) {
+  // ٢) المسار الموحد في Download عند منح صلاحية التخزين الشاملة.
+  if (Platform.OS === 'android' && await hasStorageAccess()) {
     try {
-      const dir = `${await publicDownloadRoot()}${subfolderFor(type)}/`;
-      const info = await FileSystem.getInfoAsync(dir);
-      if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-      await FileSystem.copyAsync({ from: localUri, to: `${dir}${filename}` });
-      return true;
+      const root = await publicDownloadRoot();
+      if (root) {
+        const dir = `${root}${subfolderFor(type)}/`;
+        const info = await FileSystem.getInfoAsync(dir);
+        if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+        const safeName = await uniqueFilename(dir, filename);
+        await FileSystem.copyAsync({ from: localUri, to: `${dir}${safeName}` });
+        return true;
+      }
     } catch (error) { noteDeviceSaveError('مسار Download', error); /* المسار العام غير متاح أيضاً */ }
   }
+  // ٣) ألبوم «Download Max» عبر MediaStore كخيار توافق أخير.
+  if (await saveToPublicAlbum(localUri, filename, type)) return true;
+  deviceSaveErrorLog.push('المعرض: تعذّر الحفظ في ألبوم Download Max');
   return false;
 }
 
@@ -724,6 +728,19 @@ async function findSafChildByName(parentUri: string, name: string): Promise<stri
     }
   } catch { /* تعذّرت القراءة — نحاول الإنشاء مباشرة */ }
   return null;
+}
+
+/** ينتقي اسم ملف غير مستخدم داخل مجلد SAF من دون استبدال تنزيل سابق. */
+async function uniqueSafFilename(directoryUri: string, filename: string): Promise<string> {
+  if (!(await findSafChildByName(directoryUri, filename))) return filename;
+  const dot = filename.lastIndexOf('.');
+  const stem = dot > 0 ? filename.slice(0, dot) : filename;
+  const extension = dot > 0 ? filename.slice(dot) : '';
+  for (let suffix = 1; suffix < 10000; suffix += 1) {
+    const candidate = `${stem} (${suffix})${extension}`;
+    if (!(await findSafChildByName(directoryUri, candidate))) return candidate;
+  }
+  return `${stem}-${Date.now()}${extension}`;
 }
 
 /**
@@ -862,8 +879,18 @@ export async function openAllFilesAccessSettings(): Promise<void> {
 export async function ensureDownloadFolders(): Promise<string | null> {
   const base = await baseDownloadDir();
   if (!base) return null;
-  for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+  for (const type of ['video', 'audio', 'image'] as MediaType[]) {
     await ensureTypeDir(base, type);
+  }
+  if (Platform.OS === 'android' && await hasStorageAccess()) {
+    const publicRoot = await publicDownloadRoot();
+    if (publicRoot) {
+      for (const type of ['video', 'audio', 'image'] as MediaType[]) {
+        const dir = `${publicRoot}${subfolderFor(type)}/`;
+        const info = await FileSystem.getInfoAsync(dir).catch(() => null);
+        if (!info?.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
+      }
+    }
   }
   // (v2.0.18) الألبوم العام «Download Max» يُنشأ تلقائياً من أول تنزيل عبر MediaStore —
   // لا حاجة لإنشاء مجلدات بالكتابة المباشرة (كانت تفشل بصمت على أجهزة New Architecture).
@@ -873,7 +900,8 @@ export async function ensureDownloadFolders(): Promise<string | null> {
 /** المسار الفعلي لمجلد التنزيلات المعروض في الإعدادات. */
 export async function currentDownloadFolder(): Promise<string> {
   if (Platform.OS === 'android' && (await hasStorageAccess())) {
-    return `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/`;
+    const publicRoot = await publicDownloadRoot();
+    if (publicRoot) return publicRoot;
   }
   const base = await baseDownloadDir();
   return base ?? FileSystem.documentDirectory ?? '';
@@ -925,8 +953,8 @@ async function orphanFilesIn(dir: string): Promise<string[]> {
     const info = await FileSystem.getInfoAsync(dir);
     if (!info.exists || !info.isDirectory) return [];
     const names = await FileSystem.readDirectoryAsync(dir);
-    // نتجاهل المجلدات المعروفة (Video/Audio/Image) ونأخذ كل ما عداها كملفات مستعادة.
-    const folders = ['video', 'voice', 'image', 'Video', 'Audio', 'Image'];
+    // نتجاهل مجلدات الوسائط الحالية والقديمة عند استعادة الملفات.
+    const folders = ['video', 'audio', 'image', 'Video', 'Audio', 'Images', 'Image', 'voice'];
     return names.filter((name) => !name.startsWith('.') && !folders.includes(name));
   } catch {
     return [];
@@ -1012,42 +1040,52 @@ async function isSafFileHasContent(safFileUri: string): Promise<boolean> {
  */
 async function saveFileToSafDirectory(localUri: string, filename: string, mimeType: string, directoryUri: string): Promise<boolean> {
   try {
-    const source = new NativeFile(localUri);
     const targetDir = new NativeDirectory(directoryUri);
-    // المحاولة الأولى بلا استبدال — تحفظ أي نسخة سابقة بنفس الاسم. إن تعارض الاسم
-    // نعيد بمحاولة استبدال: تحذف القديم عبر SAF ثم تكتب في مستند طازج (آمن هنا
-    // لأن الوجهة مجلد — وليست رابط ملف ميت كما في النسخة القديمة).
-    try {
-      await source.copy(targetDir, { overwrite: false });
-    } catch (firstError) {
-      noteDeviceSaveError('نسخ SAF', firstError);
+    let destinationName = await uniqueSafFilename(directoryUri, filename);
+    const tempRoot = FileSystem.cacheDirectory ?? FileSystem.documentDirectory;
+    if (!tempRoot) throw new Error('لا يتوفر مجلد مؤقت لإعداد نسخة SAF');
+    let copied = false;
+    for (let attempt = 0; attempt < 4 && !copied; attempt += 1) {
+      let sourceUri = localUri;
+      let tempUri: string | null = null;
       try {
-        await source.copy(targetDir, { overwrite: true });
-      } catch (overwriteError) {
-        noteDeviceSaveError('استبدال SAF', overwriteError);
+        // NativeFile.copy يأخذ اسم المصدر؛ عند تصادم الاسم ننسخ مؤقتاً إلى اسم
+        // فريد حتى تصل النسخة إلى SAF بالاسم الجديد، لا فوق الملف السابق.
+        if (destinationName !== filename) {
+          const tempName = await uniqueFilename(tempRoot, `DownloadMax-${Date.now()}-${destinationName}`);
+          tempUri = `${tempRoot}${tempName}`;
+          await FileSystem.copyAsync({ from: localUri, to: tempUri });
+          sourceUri = tempUri;
+        }
+        await new NativeFile(sourceUri).copy(targetDir, { overwrite: false });
+        copied = true;
+      } catch (copyError) {
+        noteDeviceSaveError('نسخ SAF بلا استبدال', copyError);
+        const alternative = await uniqueSafFilename(directoryUri, destinationName);
+        if (alternative === destinationName) break;
+        destinationName = alternative;
+      } finally {
+        if (tempUri) await FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => undefined);
       }
     }
-    // التحقق الفعلي: الملف موجود في المجلد وفيه محتوى. قراءة الحجم مباشرة بعد
-    // الكتابة قد تخفق مع مزودات سامسونج — ننتظر قليلاً ونعيد القراءة قبل الحكم.
-    const verifyChild = async (): Promise<boolean> => {
-      const child = await findSafChildByName(directoryUri, filename);
-      if (!child) return false;
-      if (await isSafFileHasContent(child)) return true;
+    if (copied) {
+      const child = await findSafChildByName(directoryUri, destinationName);
+      if (child && await isSafFileHasContent(child)) return true;
       await new Promise((resolve) => setTimeout(resolve, 400));
-      return isSafFileHasContent(child);
-    };
-    if (await verifyChild()) return true;
+      if (child && await isSafFileHasContent(child)) return true;
+    }
     // خطة Base64 الأخيرة عبر مستند جديد طازج باسم فريد — للملفات الصغيرة فقط
     // (كتابة مستند SAF موجود غير موثوقة على سامسونج: canWrite قد ترجع false).
     const info = await FileSystem.getInfoAsync(localUri).catch(() => null);
     const size = info?.exists && 'size' in info && typeof info.size === 'number' ? info.size : 0;
     if (size > 0 && size <= SAF_BASE64_FALLBACK_LIMIT) {
       try {
-        const baseName = filename.replace(/\.[^.]+$/, '') || 'download';
-        const ext = (filename.split('.').pop() || 'bin').toLowerCase();
+        const fallbackName = await uniqueSafFilename(directoryUri, destinationName);
+        const baseName = fallbackName.replace(/\.[^.]+$/, '') || 'download';
+        const ext = (fallbackName.split('.').pop() || 'bin').toLowerCase();
         const fallbackUri = await FileSystem.StorageAccessFramework.createFileAsync(
           directoryUri,
-          `${baseName}-${Date.now()}.${ext}`,
+          `${baseName}.${ext}`,
           mimeType,
         );
         const data = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
@@ -1329,6 +1367,7 @@ async function runBackgroundDownload(
   id: string,
   url: string,
   destination: string,
+  record: { title: string; format: string },
   handlers: {
     onProgress: (bytesWritten: number, totalBytes: number) => void;
     onDone: (location: string) => void | Promise<void>;
@@ -1342,10 +1381,26 @@ async function runBackgroundDownload(
     destination,
     isAllowedOverMetered: true,
     isAllowedOverRoaming: true,
-    metadata: { id },
+    metadata: { id, ...record },
   });
   let settled = false;
+  try {
+    // يحفظ سجل الاستعادة قبل تسليم المهمة للنظام؛ لا توجد نافذة يبدأ فيها التنزيل
+    // ثم يُغلق التطبيق قبل تسجيله.
+    await AsyncStorage.setItem(BG_TASK_KEY_PREFIX + id, JSON.stringify({ destination, directUrl: url, ...record }));
+    backgroundTasks.set(id, task);
+  } catch {
+    return false;
+  }
   return await new Promise<boolean>((resolve) => {
+    const finish = (success: boolean) => {
+      if (settled) return false;
+      settled = true;
+      cancelBackgroundTasks.delete(id);
+      resolve(success);
+      return true;
+    };
+    cancelBackgroundTasks.set(id, () => { finish(false); });
     try {
       task
         .progress(({ bytesDownloaded, bytesTotal }) => {
@@ -1354,18 +1409,30 @@ async function runBackgroundDownload(
         .done(({ location }) => {
           if (settled) return;
           settled = true;
-          resolve(true);
-          void Promise.resolve(handlers.onDone(location)).catch(() => undefined);
+          cancelBackgroundTasks.delete(id);
+          void Promise.resolve(handlers.onDone(location))
+            .then(() => {
+              backgroundTasks.delete(id);
+              resolve(true);
+            })
+            .catch((error) => {
+              backgroundTasks.delete(id);
+              handlers.onError(error instanceof Error ? error.message : 'تعذر إتمام حفظ التنزيل الخلفي.');
+              resolve(false);
+            });
         })
         .error(({ error }) => {
-          if (settled) return;
-          settled = true;
-          resolve(false);
+          if (!finish(false)) return;
+          backgroundTasks.delete(id);
+          void AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id);
           handlers.onError(error || 'فشل التنزيل الخلفي.');
         });
       task.start();
     } catch {
-      resolve(false);
+      finish(false);
+      backgroundTasks.delete(id);
+      void AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id);
+      handlers.onError('تعذر بدء محرك التنزيل الخلفي.');
     }
   });
 }
@@ -1374,6 +1441,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<DownloadItem[]>([]);
   const [waitingForWifi, setWaitingForWifi] = useState(false);
   const [downloadDir, setDownloadDirState] = useState<string | null>(null);
+  const [downloadsRestored, setDownloadsRestored] = useState(false);
 
   // مراجع تعمل خارج دورة الرسم لإدارة الطابور بأمان.
   const itemsRef = useRef<DownloadItem[]>([]);
@@ -1383,8 +1451,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const maxTasksCellularRef = useRef<MaxTasks>(2);
   const allowMobileDataRef = useRef(true);
   const isCellularRef = useRef(false);
-  /** طول الملف من فحص HEAD — مرجع احتياطي لحساب النسبة حين يحجب الخادم الطول أثناء البث. */
-  const remoteLengthRef = useRef<number | null>(null);
+  /** طول الملف من فحص HEAD لكل مهمة، لا قيمة مشتركة تفسد تقدم التنزيلات المتزامنة. */
+  const remoteLengthsRef = useRef(new Map<string, number | null>());
+  const cancelledBackgroundIdsRef = useRef(new Set<string>());
+  const foregroundActionHandlerRef = useRef<(action: { id: string; action: string }) => void>(() => undefined);
+  const downloadsRestoredRef = useRef(false);
+  const pendingForegroundActionsRef = useRef<Array<{ id: string; action: string }>>([]);
+  const pendingActionsConsumedRef = useRef(false);
   const downloadDirRef = useRef<string | null>(null);
   const canDownloadRef = useRef(true);
   const resumablesRef = useRef(new Map<string, FileSystem.DownloadResumable>());
@@ -1457,6 +1530,38 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       activeIdsRef.current.delete(id);
       pumpRef.current();
       return;
+    }
+
+    // إذا كانت هذه مهمة Android محفوظة وحية، فاستئنافها لا يحتاج استخراج الرابط
+    // ولا إنشاء مهمة ثانية بالمعرّف نفسه.
+    const existingBackgroundTask = backgroundTasks.get(id);
+    if (existingBackgroundTask) {
+      try {
+        if (existingBackgroundTask.state === 'PAUSED') {
+          await existingBackgroundTask.resume();
+        } else if (existingBackgroundTask.state !== 'DOWNLOADING' && existingBackgroundTask.state !== 'PENDING') {
+          throw new Error('مهمة Android السابقة لم تعد قابلة للاستئناف.');
+        }
+        const raw = await AsyncStorage.getItem(BG_TASK_KEY_PREFIX + id);
+        const saved = raw ? JSON.parse(raw) as { destination?: string } : {};
+        updateForegroundDownload(item, saved.destination ?? existingBackgroundTask.destination ?? '', item.totalBytes ?? 0, false);
+        return;
+      } catch {
+        const nativeRunnerActive = cancelBackgroundTasks.has(id);
+        backgroundTasks.delete(id);
+        if (nativeRunnerActive) {
+          // أعد ملكية خانة الطابور إلى runJob الأصلي؛ هو الوحيد الذي سيبدأ
+          // المحرك الاحتياطي بعد أن نوقظ انتظاره، فلا ننشئ تنزيلين متوازيين.
+          activeIdsRef.current.add(id);
+          removeForegroundDownload(id);
+          cancelBackgroundTasks.get(id)?.();
+          return;
+        }
+        cancelBackgroundTasks.delete(id);
+        await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id).catch(() => undefined);
+        removeForegroundDownload(id);
+        // لا يوجد مستمع قديم يملك المهمة (استعادة بعد إقلاع)، فنكمل بمحرك Expo.
+      }
     }
 
     try {
@@ -1542,7 +1647,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       directUrlRef.current.set(id, mediaUrl);
       const remoteInfo = await fetchRemoteFileInfo(mediaUrl);
       // يوتيوب غالباً يبث بدون ترويسة طول أثناء التنزيل نفسه — نستخدم طول HEAD كمرجع للنسبة.
-      remoteLengthRef.current = remoteInfo.length ?? null;
+      remoteLengthsRef.current.set(id, remoteInfo.length ?? null);
+      if (remoteInfo.length && remoteInfo.length > 0) {
+        await patchItem(id, { totalBytes: remoteInfo.length });
+      }
       const remoteCandidate = remoteInfo.filename ?? prettyNameFromUrl(mediaUrl);
       // (إصلاح v2.0.11) اسم الخادم يُعتمد فقط إذا كان بشرياً — لا بصمات هاش مكان العناوين.
       const remoteName = remoteCandidate && looksLikeHumanName(remoteCandidate.replace(/\.[^.]+$/, '')) ? remoteCandidate : null;
@@ -1568,7 +1676,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           try {
             const stat = await FileSystem.getInfoAsync(target);
             if (!('size' in stat) || typeof stat.size !== 'number' || stat.size <= 0) return;
-            const expected = remoteLengthRef.current ?? item.totalBytes ?? 0;
+            const expected = remoteLengthsRef.current.get(id) ?? item.totalBytes ?? 0;
             const now = Date.now();
             if (now - lastAt < 300) return;
             lastAt = now;
@@ -1588,16 +1696,22 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const onProgress = (progress: { totalBytesWritten: number; totalBytesExpectedToWrite: number }) => {
         const expected = progress.totalBytesExpectedToWrite > 0
           ? progress.totalBytesExpectedToWrite
-          : remoteLengthRef.current ?? 0;
-        const nextProgress = expected > 0 ? progress.totalBytesWritten / expected : 0;
-        if (nextProgress <= 0 || nextProgress >= 1) return;
+          : remoteLengthsRef.current.get(id) ?? 0;
+        const nextProgress = expected > 0
+          ? Math.min(Math.max(progress.totalBytesWritten / expected, 0.001), 0.999)
+          : 0.001;
+        if (expected > 0 && progress.totalBytesWritten <= 0) return;
         const now = Date.now();
         // تحديث لحظي كل ربع ثانية بغض النظر عن حجم القفزة — حتى لا يبدو التقدم متجمداً في الملفات الكبيرة.
         if (now - lastAt < 250) return;
         lastAt = now;
         progressRef.current.set(id, { progress: nextProgress, at: now });
         bytesRef.current.set(id, { bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
-        patchItem(id, { progress: nextProgress, bytesWritten: progress.totalBytesWritten, totalBytes: expected > 0 ? expected : undefined });
+        patchItem(id, {
+          progress: nextProgress,
+          bytesWritten: progress.totalBytesWritten,
+          totalBytes: expected > 0 ? expected : undefined,
+        });
       };
 
       // استئناف من نقطة توقف محفوظة (إن وُجدت) بدل البدء من الصفر.
@@ -1650,21 +1764,30 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       const bgDestination = `${target.replace(/[\\/]+$/, '')}.part`;
       let bgUsed = false;
       try {
+        const expectedSize = remoteLengthsRef.current.get(id) ?? item.totalBytes ?? 0;
+        await requestDownloadNotificationPermission();
+        // الإشعار يراقب الملف المؤقت الحقيقي، لا الاسم النهائي الذي لا يظهر إلا عند اكتمال النقل.
+        upsertForegroundDownload({ ...item, title: resolvedTitle }, bgDestination, expectedSize, false);
         bgUsed = await runBackgroundDownload(id, mediaUrl, bgDestination, {
+          title: resolvedTitle,
+          format: resolvedFormat,
+        }, {
           onProgress: (bytesWritten, totalBytes) => {
-            const expected = totalBytes > 0 ? totalBytes : remoteLengthRef.current ?? 0;
-            if (expected <= 0) {
-              patchItem(id, { bytesWritten });
-              return;
-            }
-            const nextProgress = Math.min(Math.max(bytesWritten / expected, 0.001), 0.999);
+            const expected = totalBytes > 0 ? totalBytes : remoteLengthsRef.current.get(id) ?? item.totalBytes ?? 0;
             const now = Date.now();
             if (now - lastAt < 250) return;
             lastAt = now;
+            const nextProgress = expected > 0
+              ? Math.min(Math.max(bytesWritten / expected, 0.001), 0.999)
+              : 0.001;
             progressRef.current.set(id, { progress: nextProgress, at: now });
-            bytesRef.current.set(id, { bytesWritten, totalBytes: expected });
-            patchItem(id, { progress: nextProgress, bytesWritten, totalBytes: expected });
-            updateForegroundDownload({ ...item, title: resolvedTitle }, target, expected, false);
+            bytesRef.current.set(id, { bytesWritten, totalBytes: expected > 0 ? expected : undefined });
+            patchItem(id, {
+              progress: nextProgress,
+              bytesWritten,
+              totalBytes: expected > 0 ? expected : undefined,
+            });
+            updateForegroundDownload({ ...item, title: resolvedTitle }, bgDestination, expected, false);
           },
           onDone: async (location) => {
             // اكتمال حقيقي في الخلفية: ننقل الجزء إلى الاسم النهائي ثم نكمل سلسلة الحفظ.
@@ -1673,85 +1796,73 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             if (resumablesRef.current.get(id)) resumablesRef.current.delete(id);
             try {
               const info = await FileSystem.getInfoAsync(location);
-              if (info.exists) {
-                const finalPath = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, resolvedFormat))}`;
-                try {
-                  await FileSystem.moveAsync({ from: location, to: finalPath });
-                } catch {
-                  // تعذر النقل — نحاول النسخ ثم الحذف؛ وإن فشلت الكلا الأخيرة نعتمد مكان الجزء.
-                  try {
-                    await FileSystem.copyAsync({ from: location, to: finalPath });
-                    await FileSystem.deleteAsync(location, { idempotent: true });
-                  } catch {
-                    const finalUri = finalPath.replace(/[\\/]+$/, '');
-                    if (location.startsWith('file://')) {
-                      target = location;
-                      patchItem(id, { fileUri: target });
-                    }
-                    return;
-                  }
-                }
-                target = finalPath;
-                const statAfter = await FileSystem.getInfoAsync(target).catch(() => null);
-                const finalSize = statAfter && 'size' in statAfter && typeof statAfter.size === 'number' ? statAfter.size : undefined;
-                const deviceSaved = await mirrorToDeviceDownloads(target, target.split('/').pop() ?? 'file', item.type, downloadDirRef.current).catch(() => false);
-                if (!deviceSaved) setDeviceSaveNeedsFolder(true);
-                await patchItem(id, {
-                  status: 'completed',
-                  progress: 1,
-                  bytesWritten: finalSize,
-                  totalBytes: finalSize,
-                  fileUri: target,
-                  title: resolvedTitle,
-                  format: resolvedFormat,
-                  deviceSaved: deviceSaved || undefined,
-                });
-                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: resolvedFormat, status: 'completed', progress: 1, bytesWritten: finalSize, totalBytes: finalSize, fileUri: target }));
-                if (item.type === 'video') {
-                  void generateVideoThumbnail(target)
-                    .then((thumb) => { if (thumb) patchItem(id, { thumbnailUri: thumb }); })
-                    .catch(() => undefined);
-                }
-                await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
-                await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id).catch(() => undefined);
-                directUrlRef.current.delete(id);
-                removeForegroundDownload(id);
+              if (!info.exists) throw new Error('اكتمل التنزيل لكن الملف المؤقت غير موجود.');
+              const finalPath = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, resolvedFormat))}`;
+              try {
+                await FileSystem.moveAsync({ from: location, to: finalPath });
+              } catch {
+                await FileSystem.copyAsync({ from: location, to: finalPath });
+                await FileSystem.deleteAsync(location, { idempotent: true });
               }
+              target = finalPath;
+              const statAfter = await FileSystem.getInfoAsync(target).catch(() => null);
+              const finalSize = statAfter && 'size' in statAfter && typeof statAfter.size === 'number' ? statAfter.size : undefined;
+              const deviceSaved = await mirrorToDeviceDownloads(target, target.split('/').pop() ?? 'file', item.type, downloadDirRef.current).catch(() => false);
+              if (!deviceSaved) setDeviceSaveNeedsFolder(true);
+              await patchItem(id, {
+                status: 'completed',
+                progress: 1,
+                bytesWritten: finalSize,
+                totalBytes: finalSize,
+                fileUri: target,
+                title: resolvedTitle,
+                format: resolvedFormat,
+                deviceSaved: deviceSaved || undefined,
+              });
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: resolvedFormat, status: 'completed', progress: 1, bytesWritten: finalSize, totalBytes: finalSize, fileUri: target }));
+              if (item.type === 'video') {
+                void generateVideoThumbnail(target)
+                  .then((thumb) => { if (thumb) patchItem(id, { thumbnailUri: thumb }); })
+                  .catch(() => undefined);
+              }
+              await AsyncStorage.removeItem(RESUME_KEY_PREFIX + id).catch(() => undefined);
+              await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id).catch(() => undefined);
+              directUrlRef.current.delete(id);
+              removeForegroundDownload(id);
             } catch (completionError) {
-              patchItem(id, { status: 'failed', error: completionError instanceof Error ? completionError.message : 'تعذر إتمام حفظ الملف بعد اكتمال التنزيل.' });
+              const message = completionError instanceof Error ? completionError.message : 'تعذر إتمام حفظ الملف بعد اكتمال التنزيل.';
+              await patchItem(id, { status: 'failed', error: message });
+              throw completionError;
             } finally {
               activeIdsRef.current.delete(id);
               pumpRef.current();
             }
           },
           onError: async (message) => {
-            if (!bgUsed) return; // رسالة بعد الفشل فقط — لا داعي
             patchItem(id, { error: message });
+            removeForegroundDownload(id);
           },
         });
       } catch (bgError) {
         bgUsed = false;
       }
 
-      if (bgUsed) {
-        // التنزيل الآن خارج خيط JS بالكامل — لكن يبقى مسجلاً في الطابور حتى يعامل جاكماً.
+      if (cancelledBackgroundIdsRef.current.has(id)) {
         watchStopped = true;
         clearInterval(progressWatcher);
-        // (v2.0.29) رفع الخدمة الأمامية: يمنع أندرويد من تجميد الشبكة للتنزيلات. 
-        void requestDownloadNotificationPermission();
-        updateForegroundDownload({ ...item, title: resolvedTitle }, target, remoteLengthRef.current ?? item.totalBytes ?? 0, false);
-        // نحفظ بيانات المهمة الخلفية لاستعادتها عند إغلاق التطبيق كلياً.
-        try {
-          await AsyncStorage.setItem(BG_TASK_KEY_PREFIX + id, JSON.stringify({
-            destination: bgDestination,
-            directUrl: mediaUrl,
-            title: resolvedTitle,
-            format: resolvedFormat,
-          }));
-        } catch { /* فشل الحفظ غير حرج */ }
         return;
       }
+
+      if (bgUsed) {
+        // انتهت المهمة الأصلية واستُكمل حفظ الملف داخل onDone.
+        watchStopped = true;
+        clearInterval(progressWatcher);
+        return;
+      }
+
+      // لا نترك إشعار المحرك الأصلي ظاهراً إذا استُخدم مسار Expo الاحتياطي.
+      removeForegroundDownload(id);
 
       // — شبكة الأمان (شبكة A/B): المحرك القديم expo resumable — يُستخدم إذا رفض محرك الخلفية —
       try {
@@ -1849,6 +1960,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     } finally {
       activeIdsRef.current.delete(id);
+      cancelledBackgroundIdsRef.current.delete(id);
+      remoteLengthsRef.current.delete(id);
       pumpRef.current();
     }
   }, [patchItem]);
@@ -1974,7 +2087,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     AsyncStorage.getItem(STORAGE_KEY)
-      .then((stored) => {
+      .then(async (stored) => {
         if (!stored || cancelled) return;
         const parsed = JSON.parse(stored) as DownloadItem[];
         const currentIds = new Set(itemsRef.current.map((existing) => existing.id));
@@ -2010,7 +2123,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
 
         for (const item of merged) {
-          if (item.status === 'downloading' || item.status === 'queued') {
+          if (item.status === 'queued') {
             patchItem(item.id, { status: 'queued', progress: 0, error: undefined });
             enqueue(item.id);
           }
@@ -2021,65 +2134,141 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // له سجل مهمة خلفية يعاد ربطه بالمهمة الموجودة في محرك النظام (إن كانت حية) —
         // التقدم يكمل من حيث توقف حقيقي، بلا إعادة صفر ولا تكرار.
         if (Platform.OS !== 'web') {
-          void (async () => {
+          await (async () => {
             try {
               const existingTasks = await RNBackgroundDownloader.getExistingDownloadTasks();
               const taskById = new Map(existingTasks.map((task) => [task.id, task]));
               for (const item of merged.filter((entry) => entry.status === 'downloading')) {
                 const rawRecord = await AsyncStorage.getItem(BG_TASK_KEY_PREFIX + item.id);
-                if (!rawRecord) continue;
+                if (!rawRecord) {
+                  patchItem(item.id, { status: 'queued', progress: 0, bytesWritten: undefined, error: undefined });
+                  enqueue(item.id);
+                  continue;
+                }
+                const record = JSON.parse(rawRecord) as { title?: string; format?: string; destination?: string; directUrl?: string };
                 const bgTask = taskById.get(item.id);
                 if (bgTask) {
-                  // المهمة حية في محرك النظام — نعيد ربط معالجاتها ونحدث التقدم مباشرة.
-                  const record = JSON.parse(rawRecord) as { title?: string; format?: string };
+                  backgroundTasks.set(item.id, bgTask);
+                  if (record.directUrl) directUrlRef.current.set(item.id, record.directUrl);
+                  const itemTitle = record.title ?? item.title;
+                  const itemFormat = record.format ?? item.format;
+                  let recoveredFinalizing = false;
+                  const finishRecoveredTask = async (location: string) => {
+                    if (recoveredFinalizing) return;
+                    recoveredFinalizing = true;
+                    try {
+                      const base = await baseDownloadDir();
+                      if (!base) throw new Error('تعذر الوصول إلى مجلد التنزيلات.');
+                      const typeDir = await ensureTypeDir(base, item.type);
+                      const finalName = await uniqueFilename(typeDir || base, safeFilename(itemTitle, itemFormat));
+                      const finalPath = `${typeDir || base}${finalName}`;
+                      try {
+                        await FileSystem.moveAsync({ from: location, to: finalPath });
+                      } catch {
+                        await FileSystem.copyAsync({ from: location, to: finalPath });
+                        await FileSystem.deleteAsync(location, { idempotent: true });
+                      }
+                      const stat = await FileSystem.getInfoAsync(finalPath).catch(() => null);
+                      const size = stat && 'size' in stat && typeof stat.size === 'number' ? stat.size : undefined;
+                      const deviceSaved = await mirrorToDeviceDownloads(finalPath, finalName, item.type, downloadDirRef.current).catch(() => false);
+                      if (!deviceSaved) setDeviceSaveNeedsFolder(true);
+                      await patchItem(item.id, {
+                        status: 'completed',
+                        progress: 1,
+                        bytesWritten: size,
+                        totalBytes: size,
+                        fileUri: finalPath,
+                        title: itemTitle,
+                        format: itemFormat,
+                        deviceSaved: deviceSaved || undefined,
+                        error: undefined,
+                      });
+                      void upsertHistoryEntry(historyEntryOf({ ...item, title: itemTitle, format: itemFormat, status: 'completed', progress: 1, bytesWritten: size, totalBytes: size, fileUri: finalPath }));
+                      await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + item.id).catch(() => undefined);
+                      await AsyncStorage.removeItem(RESUME_KEY_PREFIX + item.id).catch(() => undefined);
+                      removeForegroundDownload(item.id);
+                    } catch {
+                      await patchItem(item.id, { status: 'failed', error: 'اكتمل التنزيل لكن تعذر حفظ الملف في مجلد الوسائط.' });
+                    } finally {
+                      backgroundTasks.delete(item.id);
+                      cancelBackgroundTasks.get(item.id)?.();
+                      cancelBackgroundTasks.delete(item.id);
+                      activeIdsRef.current.delete(item.id);
+                      removeForegroundDownload(item.id);
+                      pumpRef.current();
+                    }
+                  };
+                  const failRecoveredTask = () => {
+                    backgroundTasks.delete(item.id);
+                    cancelBackgroundTasks.get(item.id)?.();
+                    cancelBackgroundTasks.delete(item.id);
+                    void AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + item.id);
+                    void patchItem(item.id, { status: 'paused', error: 'توقف التنزيل في الخلفية — اضغط للاستئناف.' });
+                    removeForegroundDownload(item.id);
+                    activeIdsRef.current.delete(item.id);
+                    pumpRef.current();
+                  };
                   bgTask
                     .progress(({ bytesDownloaded, bytesTotal }) => {
                       const expected = bytesTotal > 0 ? bytesTotal : item.totalBytes ?? 0;
-                      if (expected <= 0) {
-                        patchItem(item.id, { bytesWritten: bytesDownloaded });
-                        return;
-                      }
-                      const ratio = Math.min(Math.max(bytesDownloaded / expected, 0.001), 0.999);
-                      patchItem(item.id, { progress: ratio, bytesWritten: bytesDownloaded, totalBytes: expected });
+                      const ratio = expected > 0
+                        ? Math.min(Math.max(bytesDownloaded / expected, 0.001), 0.999)
+                        : 0.001;
+                      patchItem(item.id, {
+                        progress: ratio,
+                        bytesWritten: bytesDownloaded,
+                        totalBytes: expected > 0 ? expected : undefined,
+                      });
+                      updateForegroundDownload({ ...item, title: itemTitle }, record.destination ?? bgTask.destination ?? '', expected, false);
                     })
-                    .done(({ location }) => {
-                      void (async () => {
-                        try {
-                          const finalPath = location;
-                          const stat = await FileSystem.getInfoAsync(finalPath).catch(() => null);
-                          const size = stat && 'size' in stat && typeof stat.size === 'number' ? stat.size : undefined;
-                          const deviceSaved = await mirrorToDeviceDownloads(finalPath, finalPath.split('/').pop() ?? 'file', item.type, downloadDirRef.current).catch(() => false);
-                          if (!deviceSaved) setDeviceSaveNeedsFolder(true);
-                          await patchItem(item.id, {
-                            status: 'completed',
-                            progress: 1,
-                            bytesWritten: size,
-                            totalBytes: size,
-                            fileUri: finalPath,
-                            title: record.title ?? item.title,
-                            format: record.format ?? item.format,
-                            deviceSaved: deviceSaved || undefined,
-                          });
-                          await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + item.id).catch(() => undefined);
-                        } catch{
-                          patchItem(item.id, { status: 'failed', error: 'تعذر إتمام حفظ الملف الخلفي بعد اكتماله.' });
-                        }
-                      })();
-                    })
-                    .error(() => {
-                      // فشلت المهمة في النظام — تعاد للقائمة كمنقوطة يبدأها المستخدم (شبكة أمان).
-                      patchItem(item.id, { status: 'paused', progress: item.progress, error: 'توقف التنزيل في الخلفية — اضغط للاستئناف.' });
-                      AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + item.id).catch(() => undefined);
-                    });
+                    .done(({ location }) => { void finishRecoveredTask(location); })
+                    .error(() => failRecoveredTask());
+                  if (bgTask.state === 'DONE') {
+                    const destination = record.destination ?? bgTask.destination;
+                    if (destination) void finishRecoveredTask(destination);
+                    else failRecoveredTask();
+                  } else if (bgTask.state === 'FAILED' || bgTask.state === 'STOPPED') {
+                    failRecoveredTask();
+                  } else if (bgTask.state === 'PAUSED') {
+                    await patchItem(item.id, { status: 'paused', title: itemTitle, format: itemFormat });
+                    updateForegroundDownload({ ...item, title: itemTitle }, record.destination ?? bgTask.destination ?? '', item.totalBytes ?? 0, true);
+                  } else {
+                    activeIdsRef.current.add(item.id);
+                    await patchItem(item.id, { status: 'downloading', title: itemTitle, format: itemFormat });
+                    upsertForegroundDownload({ ...item, title: itemTitle }, record.destination ?? bgTask.destination ?? '', item.totalBytes ?? 0, false);
+                  }
                 } else {
-                  // سجل المهمة موجود لكنها ماتت (مثلاً بعد إقلاع الجهاز) — نبابأها كموقفة مؤقتاً.
-                  patchItem(item.id, { status: 'paused', progress: item.progress, error: undefined });
+                  // المهمة اختفت مع إغلاق النظام؛ لا ننشئ مهمة مكررة تلقائياً.
+                  // نحفظ الرابط النهائي إن توفر ليبدأ زر الاستئناف من المصدر المعروف.
+                  const destination = record.destination;
+                  if (destination) await FileSystem.deleteAsync(destination, { idempotent: true }).catch(() => undefined);
+                  if (record.directUrl) {
+                    directUrlRef.current.set(item.id, record.directUrl);
+                    await patchItem(item.id, {
+                      url: record.directUrl,
+                      resolvedUrl: true,
+                      title: record.title ?? item.title,
+                      format: record.format ?? item.format,
+                      status: 'paused',
+                      progress: 0,
+                      bytesWritten: undefined,
+                      error: undefined,
+                    });
+                  } else {
+                    await patchItem(item.id, { status: 'paused', progress: 0, bytesWritten: undefined, error: undefined });
+                  }
+                  await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + item.id).catch(() => undefined);
                 }
               }
             } catch {
-              // فشل استعادة الخلفية كله — القائمة تعمل مهامها العادية.
+              // لا نعيد تشغيل التنزيل تلقائياً عند تعذر التحقق من حالة المحرك تفادياً للتكرار.
+              for (const item of merged.filter((entry) => entry.status === 'downloading' && !backgroundTasks.has(entry.id))) {
+                await patchItem(item.id, { status: 'paused', error: 'تعذر التحقق من التنزيل السابق — اضغط للاستئناف.' });
+              }
             }
           })();
+        } else {
+          setDownloadsRestored(true);
         }
       })
       .then(async () => {
@@ -2129,7 +2318,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         }
       })
       .then(() => {
-        if (!cancelled) void purgeExpiredTrash();
+        if (!cancelled) {
+          setDownloadsRestored(true);
+          void purgeExpiredTrash();
+        }
       })
       .catch(() => undefined);
     return () => {
@@ -2156,12 +2348,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (!/^https?:\/\//i.test(input.url)) return null;
       if (input.type === 'image') {
         const info = await fetchRemoteFileInfo(input.url);
-        return null; // الأحجام تُجلب لكل صورة على حدة في الواجهة
+        return info.length ?? null;
       }
       const options = requestOptionsFor(input.type, input.format);
       const [mediaUrl] = await resolveMediaUrls(input.url, options);
       const info = await fetchRemoteFileInfo(mediaUrl);
-      return null;
+      return info.length ?? null;
     } catch {
       return null;
     }
@@ -2318,6 +2510,24 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       patchItem(id, { status: 'paused', error: undefined });
       return;
     }
+    const backgroundTask = backgroundTasks.get(id);
+    if (backgroundTask) {
+      pauseRequestedRef.current.add(id);
+      try {
+        await backgroundTask.pause();
+        patchItem(id, { status: 'paused', error: undefined });
+        void upsertHistoryEntry(historyEntryOf({ ...item, status: 'paused' }));
+        const raw = await AsyncStorage.getItem(BG_TASK_KEY_PREFIX + id).catch(() => null);
+        const saved = raw ? JSON.parse(raw) as { destination?: string } : {};
+        updateForegroundDownload(item, saved.destination ?? backgroundTask.destination ?? '', item.totalBytes ?? 0, true);
+        activeIdsRef.current.delete(id);
+        pumpRef.current();
+      } catch {
+        pauseRequestedRef.current.delete(id);
+        // إذا رفض المحرك الإيقاف، لا نغيّر حالة المهمة.
+      }
+      return;
+    }
     const resumable = resumablesRef.current.get(id);
     if (!resumable) return;
     pauseRequestedRef.current.add(id);
@@ -2353,6 +2563,25 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   /** الحذف العادي ينقل الملف إلى سلة المحذوفات لمدة 30 يوماً. */
   const removeDownload = useCallback(async (id: string) => {
     queueRef.current = queueRef.current.filter((queuedId) => queuedId !== id);
+    const backgroundTask = backgroundTasks.get(id);
+    if (backgroundTask) {
+      cancelledBackgroundIdsRef.current.add(id);
+      cancelBackgroundTasks.get(id)?.();
+      cancelBackgroundTasks.delete(id);
+      backgroundTasks.delete(id);
+      try {
+        await backgroundTask.stop();
+      } catch {
+        // قد يكون المحرك أنهى المهمة بين الفحص والإلغاء.
+      }
+      const raw = await AsyncStorage.getItem(BG_TASK_KEY_PREFIX + id).catch(() => null);
+      const saved = raw ? JSON.parse(raw) as { destination?: string } : {};
+      if (saved.destination) await FileSystem.deleteAsync(saved.destination, { idempotent: true }).catch(() => undefined);
+      await AsyncStorage.removeItem(BG_TASK_KEY_PREFIX + id).catch(() => undefined);
+      removeForegroundDownload(id);
+      activeIdsRef.current.delete(id);
+      pumpRef.current();
+    }
     const resumable = resumablesRef.current.get(id);
     if (resumable) {
       resumablesRef.current.delete(id);
@@ -2367,6 +2596,40 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     directUrlRef.current.delete(id);
     patchItem(id, { deletedAt: Date.now(), status: 'completed', error: undefined, inVault: false });
   }, [patchItem]);
+
+  const handleForegroundAction = useCallback((action: { id: string; action: string }) => {
+    if (action.action === 'pause') void pauseDownload(action.id);
+    else if (action.action === 'resume') void resumeDownload(action.id);
+    else if (action.action === 'cancel') void removeDownload(action.id);
+  }, [pauseDownload, resumeDownload, removeDownload]);
+
+  useEffect(() => {
+    foregroundActionHandlerRef.current = handleForegroundAction;
+  }, [handleForegroundAction]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android' || !foregroundDownloadNativeModule) return;
+    const deliver = (action: { id: string; action: string }) => {
+      if (downloadsRestoredRef.current) foregroundActionHandlerRef.current(action);
+      else pendingForegroundActionsRef.current.push(action);
+    };
+    const emitter = new NativeEventEmitter(foregroundDownloadNativeModule);
+    const subscription = emitter.addListener('DownloadForegroundAction', deliver);
+    if (!pendingActionsConsumedRef.current) {
+      pendingActionsConsumedRef.current = true;
+      void foregroundDownloadBridge?.consumePendingActions()
+        .then((actions) => actions.forEach(deliver))
+        .catch(() => undefined);
+    }
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    downloadsRestoredRef.current = downloadsRestored;
+    if (!downloadsRestored) return;
+    const pending = pendingForegroundActionsRef.current.splice(0);
+    for (const action of pending) foregroundActionHandlerRef.current(action);
+  }, [downloadsRestored]);
 
   /** إعادة ملف من السلة إلى قائمة التنزيلات. */
   const restoreFromTrash = useCallback(async (id: string) => {
@@ -2561,7 +2824,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         // حتى لا يجد المستخدم مجلدات ناقصة أو فارغة عند أول فحص من مدير الملفات.
         try {
           const appRoot = await safAppRoot(stored);
-          for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+          for (const type of ['video', 'audio', 'image'] as MediaType[]) {
             const dir = await safSubfolder(appRoot, subfolderFor(type));
             if (dir === appRoot || !(await isSafDirAlive(dir))) {
               // الرابط المحفوظ ميت أو فشل — نمسح كاش النوع ليعاد إنشاؤه في المحاولة القادمة.
@@ -2592,7 +2855,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     // نفحص مجلد التنزيلات في الجهاز إن كانت الصلاحية متاحة، ومجلد التطبيق دائماً.
     const roots: string[] = [await baseDownloadDir()].filter(Boolean) as string[];
     if (await hasStorageAccess()) {
-      roots.unshift(await publicDownloadRoot());
+      const publicRoot = await publicDownloadRoot();
+      if (publicRoot) roots.unshift(publicRoot);
       // (v2.0.17) هيكل Snaptube: DownloadMax/download/DownloadMax Video|Music|Image
       const snaptubeRoot = `${publicStorageRoot()}${SNAPTUBE_DOWNLOAD_DIR}/`;
       const snaptubeInfo = await FileSystem.getInfoAsync(snaptubeRoot).catch(() => null);
@@ -2743,10 +3007,18 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
    *    جديد ينزل تلقائياً فيه. المستخدم لا يضغط «نسخ» أبداً بعد ذلك.
    */
   const enableDeviceAutoSave = useCallback(async (): Promise<{ ok: boolean; where: string | null; message: string }> => {
+    const selected = downloadDirRef.current;
+    if (selected) {
+      const appRoot = await safAppRoot(selected);
+      for (const type of ['video', 'audio', 'image'] as MediaType[]) {
+        await safSubfolder(appRoot, subfolderFor(type));
+      }
+      return { ok: true, where: `${safUriDisplayName(selected) ?? selected} / ${APP_DIR_NAME}`, message: 'تم — كل تنزيل جديد سيُحفظ في مجلد Download Max تلقائياً ✓' };
+    }
     if (await hasStorageAccess()) {
       const root = await publicDownloadRoot();
       if (root) {
-        for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+        for (const type of ['video', 'audio', 'image'] as MediaType[]) {
           const dir = `${root}${subfolderFor(type)}/`;
           const info = await FileSystem.getInfoAsync(dir).catch(() => null);
           if (!info?.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
@@ -2757,12 +3029,11 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     const picked = await pickDeviceDirectory();
     if (!picked) return { ok: false, where: null, message: 'لم يتم اختيار مجلد — حاول مرة أخرى' };
     if (picked !== downloadDirRef.current) await setDownloadDir(picked);
-    // (v2.0.8) المسار الأساسي: «المختار / Download Max / video · image · voice».
     const appRoot = await safAppRoot(picked);
-    for (const type of ['video', 'image', 'voice'] as MediaType[]) {
+    for (const type of ['video', 'audio', 'image'] as MediaType[]) {
       await safSubfolder(appRoot, subfolderFor(type));
     }
-    return { ok: true, where: `${picked}${APP_DIR_NAME}`, message: 'تم — كل تنزيل جديد سيُحفظ في مجلد Download Max تلقائياً ✓' };
+    return { ok: true, where: `${safUriDisplayName(picked) ?? picked} / ${APP_DIR_NAME}`, message: 'تم — كل تنزيل جديد سيُحفظ في مجلد Download Max تلقائياً ✓' };
   }, [setDownloadDir]);
 
   /**

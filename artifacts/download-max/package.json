@@ -64,5 +64,10 @@
     "typescript": "~6.0.3",
     "zod": "^3.25.76",
     "zod-validation-error": "^3.4.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "shell-quote": "1.12.0"
+    }
   }
 }
