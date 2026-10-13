@@ -8,7 +8,7 @@ import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import * as Sharing from 'expo-sharing';
 import Constants from 'expo-constants';
-import * as MediaLibrary from 'expo-media-library';
+import * as MediaLibrary from 'expo-media-library/legacy';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { AppState, Linking, NativeEventEmitter, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 import { MaxTasks } from '@/context/SettingsContext';
@@ -232,6 +232,8 @@ type DownloadContextValue = {
   items: DownloadItem[];
   activeCount: number;
   waitingForWifi: boolean;
+  downloadsRestored: boolean;
+  hasStoredDownloads: boolean | null;
   addDownload: (input: Omit<DownloadItem, 'id' | 'status' | 'progress' | 'createdAt'>) => Promise<void>;
   /** يضيف تنزيلاً ذكياً: يكشف كاروسيل الصور وينشئ مهمة لكل صورة. يعيد عدد المهام. */
   addSmartDownload: (input: { url: string; title?: string; type: MediaType; format: string; quality: string }) => Promise<number>;
@@ -1442,6 +1444,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [waitingForWifi, setWaitingForWifi] = useState(false);
   const [downloadDir, setDownloadDirState] = useState<string | null>(null);
   const [downloadsRestored, setDownloadsRestored] = useState(false);
+  const [hasStoredDownloads, setHasStoredDownloads] = useState<boolean | null>(null);
 
   // مراجع تعمل خارج دورة الرسم لإدارة الطابور بأمان.
   const itemsRef = useRef<DownloadItem[]>([]);
@@ -2088,8 +2091,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     AsyncStorage.getItem(STORAGE_KEY)
       .then(async (stored) => {
-        if (!stored || cancelled) return;
-        const parsed = JSON.parse(stored) as DownloadItem[];
+        if (cancelled) return;
+        const parsed = stored ? JSON.parse(stored) as DownloadItem[] : [];
+        setHasStoredDownloads(parsed.length > 0);
         const currentIds = new Set(itemsRef.current.map((existing) => existing.id));
         const merged = [...itemsRef.current, ...parsed.filter((existing) => !currentIds.has(existing.id))]
           .sort((a, b) => b.createdAt - a.createdAt);
@@ -2864,9 +2868,36 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
     const uris: string[] = [];
     for (const root of roots) uris.push(...(await mediaFilesIn(root)));
+    // قد تُحفظ النسخة العامة في ألبوم MediaStore بدل مجلد Download؛ افحص ألبوم
+    // التطبيق أيضاً حتى تبقى هذه الملفات قابلة للاستعادة بعد إعادة التثبيت.
+    try {
+      const album = await MediaLibrary.getAlbumAsync(ALBUM_NAME);
+      if (album) {
+        let after: string | undefined;
+        while (true) {
+          const page = await MediaLibrary.getAssetsAsync({
+            album: album.id,
+            first: 500,
+            after,
+            mediaType: [
+              MediaLibrary.MediaType.photo,
+              MediaLibrary.MediaType.video,
+              MediaLibrary.MediaType.audio,
+            ],
+          });
+          uris.push(...page.assets.map((asset) => asset.uri));
+          if (!page.hasNextPage || !page.endCursor) break;
+          after = page.endCursor;
+        }
+      }
+    } catch {
+      // الإذن أو MediaStore غير متاح — تبقى نتائج فحص مجلدات التخزين صالحة.
+    }
     const adopted: DownloadItem[] = [];
+    const seen = new Set<string>();
     for (const uri of uris) {
-      if (known.has(uri)) continue;
+      if (known.has(uri) || seen.has(uri)) continue;
+      seen.add(uri);
       const filename = uri.split('/').pop() ?? '';
       const type = mediaTypeOf(filename);
       if (!type) continue;
@@ -3056,6 +3087,8 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     items,
     activeCount: items.filter((item) => item.status === 'queued' || item.status === 'downloading').length,
     waitingForWifi,
+    downloadsRestored,
+    hasStoredDownloads,
     addDownload,
     addSmartDownload,
     addCarouselImages,
@@ -3084,7 +3117,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     deletePermanently,
     emptyTrash,
     convertVideoToAudio,
-  }), [items, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile, deviceSaveNeedsFolder, pickDeviceFolderNow,
+  }), [items, waitingForWifi, downloadsRestored, hasStoredDownloads, addDownload, addSmartDownload, addCarouselImages, resolveCarouselVideo, probeFileSize, addSharedFile, deviceSaveNeedsFolder, pickDeviceFolderNow,
     retryDownload,
     pauseDownload,
     resumeDownload,

@@ -1428,7 +1428,7 @@ export default function HomeScreen() {
   const colors = useColors();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
-  const { items, activeCount, waitingForWifi, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo, syncPendingToDevice, pickDeviceFolderNow, deviceSaveNeedsFolder } = useDownloads();
+  const { items, activeCount, waitingForWifi, downloadsRestored, hasStoredDownloads, addDownload, addSmartDownload, addCarouselImages, addSharedFile, retryDownload, pauseDownload, resumeDownload, removeDownload, openFile, shareFile, copyToDeviceDownloads, enableDeviceAutoSave, moveToVault, removeFromVault, setQueueOptions, downloadDir, setDownloadDir, refreshFromDevice, restoreFromTrash, deletePermanently, emptyTrash, convertVideoToAudio, resolveCarouselVideo, syncPendingToDevice, pickDeviceFolderNow, deviceSaveNeedsFolder } = useDownloads();
   const { themeMode, accent, hasSeenOnboarding, maxTasks, maxTasksCellular, allowMobileData, vaultPin, setThemeMode, setAccent, setMaxTasks, setMaxTasksCellular, setAllowMobileData, setVaultPin, completeOnboarding } = useAppSettings();
   const { resolvedSharedPayloads, clearSharedPayloads } = useSafeIncomingShare();
   const [input, setInput] = useState('');
@@ -1479,6 +1479,33 @@ export default function HomeScreen() {
     const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') check(); });
     return () => { cancelled = true; subscription.remove(); };
   }, []);
+
+  // بعد إعادة التثبيت لا يبقى سجل AsyncStorage، لكن الملفات المشتركة على الجهاز
+  // تبقى. انتظر تحميل السجل أولاً، ثم أعد فهرسة المكتبة تلقائياً عند منح الإذن.
+  const initialDeviceRestoreAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (allFilesGranted !== true) {
+      if (allFilesGranted === false) initialDeviceRestoreAttemptedRef.current = false;
+      return;
+    }
+    if (
+      Platform.OS !== 'android' ||
+      !downloadsRestored ||
+      hasStoredDownloads !== false ||
+      initialDeviceRestoreAttemptedRef.current
+    ) return;
+
+    initialDeviceRestoreAttemptedRef.current = true;
+    let cancelled = false;
+    void refreshFromDevice()
+      .then((restored) => {
+        if (!cancelled && restored > 0) setNotice(`استُعيد ${restored} ملف من التنزيلات السابقة ✓`);
+      })
+      .catch(() => {
+        if (!cancelled) setNotice('تعذّر فحص ملفات الجهاز — جرّب «استعادة مكتبة الجهاز» من القائمة.');
+      });
+    return () => { cancelled = true; };
+  }, [allFilesGranted, downloadsRestored, hasStoredDownloads, refreshFromDevice]);
 
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   // (v2.0.18) نتيجة فحص الرابط: العنوان الحقيقي + الصيغ الفعلية المتاحة لهذا الرابط.
