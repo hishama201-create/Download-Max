@@ -1333,8 +1333,9 @@ export async function previewCarouselImages(sourceUrl: string): Promise<string[]
   }
 }
 
-/** (v2.0.28) إعداد مختلف لمكان مكث.HttpStatusator */
-// الخيارات: التنزيل يسمح ببيانات الجوال ويُظهر تنبيهاً عند الأجهزة المدعومة.
+/** (v2.0.28) إعداد محرك التنزيل بالخلفية. */
+// إشعار التحكم الوحيد هو إشعار الخدمة الأمامية الخاص بالتطبيق؛ إشعار المكتبة يُعطّل
+// حتى لا يظهر للمستخدم إشعار ثانٍ متعارض بالنسبة والحالة.
 let bgDownloaderConfigured = false;
 function ensureBackgroundDownloaderConfig(): void {
   if (bgDownloaderConfigured) return;
@@ -1342,26 +1343,47 @@ function ensureBackgroundDownloaderConfig(): void {
     RNBackgroundDownloader.setConfig({
       progressInterval: 500,
       allowsCellularAccess: true,
-      showNotificationsEnabled: true,
-      showCompletionNotification: true,
-      notificationsGrouping: {
-        enabled: true,
-        mode: 'summaryOnly',
-        texts: {
-          downloadTitle: 'تنزيل جارٍ',
-          downloadStarting: 'بدء التنزيل…',
-          downloadProgress: 'جارٍ التنزيل… {progress}%',
-          downloadPaused: 'متوقف مؤقتاً',
-          downloadFinished: 'اكتمل التنزيل ✓',
-          downloadCancel: 'إلغاء',
-          groupTitle: 'التنزيلات',
-        },
-      },
+      showNotificationsEnabled: false,
+      showCompletionNotification: false,
     });
     bgDownloaderConfigured = true;
   } catch {
     // المكتبة غير متاحة على منصة الويب — فشل صامت؛ المحرك القديم يبقى شاحًا.
   }
+}
+
+function asFileUri(path: string): string {
+  if (path.startsWith('file://') || path.startsWith('content://')) return path;
+  return path.startsWith('/') ? `file://${path}` : path;
+}
+
+/**
+ * أحداث بعض إصدارات Android تعيد المسار الخام، وقد يصل حدث الاكتمال قبل أن يظهر
+ * الملف النهائي على واجهة الملفات. ننتظر ظهوره وحجمه الكامل، ونجرّب وجهة المهمة
+ * الأصلية أيضاً قبل اعتبار التنزيل مفقوداً.
+ */
+async function waitForCompletedBackgroundFile(
+  reportedLocation: string,
+  backgroundDestination: string,
+  finalDestination: string,
+  expectedBytes: number,
+): Promise<{ uri: string; size: number }> {
+  const candidates = [...new Set(
+    [reportedLocation, backgroundDestination, finalDestination]
+      .filter(Boolean)
+      .map(asFileUri),
+  )];
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    for (const uri of candidates) {
+      const info = await FileSystem.getInfoAsync(uri).catch(() => null);
+      const size = info && 'size' in info && typeof info.size === 'number' ? info.size : 0;
+      if (info?.exists && size > 0 && (expectedBytes <= 0 || size >= expectedBytes)) {
+        return { uri, size };
+      }
+    }
+    if (attempt < 9) await new Promise<void>((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error('لم يظهر ملف التنزيل المكتمل في مساحة التطبيق؛ أُعيدت المحاولة عبر مسار الحفظ الاحتياطي.');
 }
 
 /** (v2.0.28) تشغيل مهمة تنزيل على محرك الخلفية النظامي (يعمل ولو أُغلقت بجاك). */
@@ -1372,7 +1394,7 @@ async function runBackgroundDownload(
   record: { title: string; format: string },
   handlers: {
     onProgress: (bytesWritten: number, totalBytes: number) => void;
-    onDone: (location: string) => void | Promise<void>;
+    onDone: (location: string, bytesDownloaded: number, bytesTotal: number) => void | Promise<void>;
     onError: (message: string) => void;
   },
 ): Promise<boolean> {
@@ -1408,11 +1430,11 @@ async function runBackgroundDownload(
         .progress(({ bytesDownloaded, bytesTotal }) => {
           if (!settled) handlers.onProgress(bytesDownloaded, bytesTotal);
         })
-        .done(({ location }) => {
+        .done(({ location, bytesDownloaded, bytesTotal }) => {
           if (settled) return;
           settled = true;
           cancelBackgroundTasks.delete(id);
-          void Promise.resolve(handlers.onDone(location))
+          void Promise.resolve(handlers.onDone(location, bytesDownloaded, bytesTotal))
             .then(() => {
               backgroundTasks.delete(id);
               resolve(true);
@@ -1518,6 +1540,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
   /** مهمة تنزيل واحدة: تستخرج الرابط المباشر ثم تنزّل مع تتبع التقدم. */
   const runJob = useCallback(async (id: string) => {
+    let stopProgressWatcher: () => void = () => {};
     const item = itemsRef.current.find((candidate) => candidate.id === id);
     if (!item) {
       activeIdsRef.current.delete(id);
@@ -1672,11 +1695,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       // (6) أحداث التقدّم من expo-file-system القديمة لا تصل تحت New Architecture، فيبقى
       // الشريط عند 0% حتى يكتمل الملف. نقيس حجم الملف على القرص بأنفسنا كل ~350ms.
       let watchStopped = false;
+      let watchedPath = target;
       const progressWatcher = setInterval(() => {
         if (watchStopped) return;
         void (async () => {
           try {
-            const stat = await FileSystem.getInfoAsync(target);
+            const stat = await FileSystem.getInfoAsync(watchedPath);
             if (!('size' in stat) || typeof stat.size !== 'number' || stat.size <= 0) return;
             const expected = remoteLengthsRef.current.get(id) ?? item.totalBytes ?? 0;
             const now = Date.now();
@@ -1695,6 +1719,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
           } catch { /* الملف لم يُنشأ بعد — ننتظر الدورة القادمة */ }
         })();
       }, 350);
+      stopProgressWatcher = () => {
+        watchStopped = true;
+        clearInterval(progressWatcher);
+      };
       const onProgress = (progress: { totalBytesWritten: number; totalBytesExpectedToWrite: number }) => {
         const expected = progress.totalBytesExpectedToWrite > 0
           ? progress.totalBytesExpectedToWrite
@@ -1764,6 +1792,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       // التنزيل يكمل ولو خرج المستخدم من التطبيق أو أطفأ الشاشة، لأنه خارج خيط JS.
       // شبكة الأمان: عند أي رفض من محرك الخلفية نستأنف بالمحرك القديم (expo resumable).
       const bgDestination = `${target.replace(/[\\/]+$/, '')}.part`;
+      watchedPath = bgDestination;
       let bgUsed = false;
       try {
         const expectedSize = remoteLengthsRef.current.get(id) ?? item.totalBytes ?? 0;
@@ -1791,24 +1820,29 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             });
             updateForegroundDownload({ ...item, title: resolvedTitle }, bgDestination, expected, false);
           },
-          onDone: async (location) => {
+          onDone: async (location, bytesDownloaded) => {
             // اكتمال حقيقي في الخلفية: ننقل الجزء إلى الاسم النهائي ثم نكمل سلسلة الحفظ.
-            watchStopped = true;
-            clearInterval(progressWatcher);
             if (resumablesRef.current.get(id)) resumablesRef.current.delete(id);
             try {
-              const info = await FileSystem.getInfoAsync(location);
-              if (!info.exists) throw new Error('اكتمل التنزيل لكن الملف المؤقت غير موجود.');
+              const completedFile = await waitForCompletedBackgroundFile(location, bgDestination, target, bytesDownloaded);
               const finalPath = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, resolvedFormat))}`;
               try {
-                await FileSystem.moveAsync({ from: location, to: finalPath });
+                await FileSystem.moveAsync({ from: completedFile.uri, to: finalPath });
               } catch {
-                await FileSystem.copyAsync({ from: location, to: finalPath });
-                await FileSystem.deleteAsync(location, { idempotent: true });
+                await FileSystem.copyAsync({ from: completedFile.uri, to: finalPath });
+                const copied = await FileSystem.getInfoAsync(finalPath).catch(() => null);
+                const copiedSize = copied && 'size' in copied && typeof copied.size === 'number' ? copied.size : 0;
+                if (!copied?.exists || copiedSize < completedFile.size) {
+                  throw new Error('اكتمل التنزيل لكن تعذر التحقق من حفظ الملف النهائي.');
+                }
+                await FileSystem.deleteAsync(completedFile.uri, { idempotent: true });
               }
               target = finalPath;
               const statAfter = await FileSystem.getInfoAsync(target).catch(() => null);
               const finalSize = statAfter && 'size' in statAfter && typeof statAfter.size === 'number' ? statAfter.size : undefined;
+              if (!statAfter?.exists || !finalSize || finalSize < completedFile.size) {
+                throw new Error('اكتمل التنزيل لكن تعذر التحقق من الملف المحفوظ.');
+              }
               const deviceSaved = await mirrorToDeviceDownloads(target, target.split('/').pop() ?? 'file', item.type, downloadDirRef.current).catch(() => false);
               if (!deviceSaved) setDeviceSaveNeedsFolder(true);
               await patchItem(id, {
@@ -1820,6 +1854,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
                 title: resolvedTitle,
                 format: resolvedFormat,
                 deviceSaved: deviceSaved || undefined,
+                error: undefined,
               });
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
               void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: resolvedFormat, status: 'completed', progress: 1, bytesWritten: finalSize, totalBytes: finalSize, fileUri: target }));
@@ -1833,16 +1868,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               directUrlRef.current.delete(id);
               removeForegroundDownload(id);
             } catch (completionError) {
-              const message = completionError instanceof Error ? completionError.message : 'تعذر إتمام حفظ الملف بعد اكتمال التنزيل.';
-              await patchItem(id, { status: 'failed', error: message });
+              // لا نعلّم التنزيل فاشلاً هنا: runJob سيحاول محرك Expo الاحتياطي،
+              // ويحدّث الحالة النهائية فقط إذا فشل المساران.
               throw completionError;
-            } finally {
-              activeIdsRef.current.delete(id);
-              pumpRef.current();
             }
           },
-          onError: async (message) => {
-            patchItem(id, { error: message });
+          onError: async () => {
+            patchItem(id, { error: undefined });
             removeForegroundDownload(id);
           },
         });
@@ -1865,6 +1897,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
 
       // لا نترك إشعار المحرك الأصلي ظاهراً إذا استُخدم مسار Expo الاحتياطي.
       removeForegroundDownload(id);
+      watchedPath = target;
 
       // — شبكة الأمان (شبكة A/B): المحرك القديم expo resumable — يُستخدم إذا رفض محرك الخلفية —
       try {
@@ -1896,7 +1929,6 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         progressRef.current.delete(id);
         bytesRef.current.delete(id);
       }
-      const finalBytes = bytesRef.current.get(id);
       // (v2.0.12) الرابط المباشر يُمسح فقط بعد انتهاء حقيقي (نجاح/فشل) — الإيقاف يحتاجه.
       if (result) directUrlRef.current.delete(id);
 
@@ -1914,14 +1946,32 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         const uriExt = result.uri.split('.').pop()?.toLowerCase();
         if (uriExt && /^[a-z0-9]{2,5}$/i.test(uriExt) && MIME_TYPES[uriExt]) finalFormat = uriExt;
         const finalFilename = await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, finalFormat));
-        if (result.uri !== `${initialTypeDir}${finalFilename}`) {
+        const finalPath = `${initialTypeDir || baseDirectory}${finalFilename}`;
+        let finalUri = result.uri;
+        if (result.uri !== finalPath) {
           try {
-            await FileSystem.moveAsync({ from: result.uri, to: `${initialTypeDir}${finalFilename}` });
+            await FileSystem.moveAsync({ from: result.uri, to: finalPath });
+            finalUri = finalPath;
           } catch {
-            // نُبقي المسار الأصلي عند تعذر النقل.
+            try {
+              await FileSystem.copyAsync({ from: result.uri, to: finalPath });
+              const copied = await FileSystem.getInfoAsync(finalPath).catch(() => null);
+              const copiedSize = copied && 'size' in copied && typeof copied.size === 'number' ? copied.size : 0;
+              if (copied?.exists && copiedSize > 0) {
+                await FileSystem.deleteAsync(result.uri, { idempotent: true });
+                finalUri = finalPath;
+              }
+            } catch {
+              // نحتفظ بالمصدر الأصلي إذا تعذر النقل والنسخ، كي لا نفقد الملف.
+            }
           }
         }
-        target = `${initialTypeDir}${finalFilename}`;
+        target = finalUri;
+        const finalInfo = await FileSystem.getInfoAsync(target).catch(() => null);
+        const finalSize = finalInfo && 'size' in finalInfo && typeof finalInfo.size === 'number' ? finalInfo.size : undefined;
+        if (!finalInfo?.exists || !finalSize || finalSize <= 0) {
+          throw new Error('اكتمل التنزيل لكن تعذر التحقق من الملف المحفوظ.');
+        }
         // (v2.0.20) نسخة لمجلد الجهاز عبر السلسلة المضمونة — النتيجة تُسجَّل على العنصر
         // حتى لا تتكرر المحاولة، وفشلها الكلي يفتح منتقي المجلد مرة واحدة بدل الصمت.
         const deviceSaved = await mirrorToDeviceDownloads(target, finalFilename, item.type, downloadDirRef.current).catch(() => false);
@@ -1929,15 +1979,16 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
         await patchItem(id, {
           status: 'completed',
           progress: 1,
-          bytesWritten: finalBytes?.bytesWritten,
-          totalBytes: finalBytes?.totalBytes,
+          bytesWritten: finalSize,
+          totalBytes: finalSize,
           fileUri: target,
           title: resolvedTitle,
           format: finalFormat,
           deviceSaved: deviceSaved || undefined,
+          error: undefined,
         });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalBytes?.bytesWritten, totalBytes: finalBytes?.totalBytes, fileUri: target }));
+        void upsertHistoryEntry(historyEntryOf({ ...item, title: resolvedTitle, format: finalFormat, status: 'completed', progress: 1, bytesWritten: finalSize, totalBytes: finalSize, fileUri: target }));
         // توليد صورة مصغّرة للفيديو في الخلفية — فشلها لا يؤثر على اكتمال الملف.
         if (item.type === 'video') {
           void generateVideoThumbnail(target)
@@ -1961,6 +2012,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       void upsertHistoryEntry(historyEntryOf({ ...item, status: 'failed' }));
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     } finally {
+      stopProgressWatcher();
       activeIdsRef.current.delete(id);
       cancelledBackgroundIdsRef.current.delete(id);
       remoteLengthsRef.current.delete(id);
