@@ -1052,7 +1052,9 @@ async function saveFileToSafDirectory(localUri: string, filename: string, mimeTy
         // NativeFile.copy يأخذ اسم المصدر؛ عند تصادم الاسم ننسخ مؤقتاً إلى اسم
         // فريد حتى تصل النسخة إلى SAF بالاسم الجديد، لا فوق الملف السابق.
         if (destinationName !== filename) {
-          const tempName = await uniqueFilename(tempRoot, `DownloadMax-${Date.now()}-${destinationName}`);
+          // NativeFile.copy uses the source basename as the SAF destination name.
+          // Keep the staged basename identical to the collision-free SAF name.
+          const tempName = await uniqueFilename(tempRoot, destinationName);
           tempUri = `${tempRoot}${tempName}`;
           await FileSystem.copyAsync({ from: localUri, to: tempUri });
           sourceUri = tempUri;
