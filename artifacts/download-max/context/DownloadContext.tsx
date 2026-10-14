@@ -202,10 +202,10 @@ function ensureBackgroundDownloaderConfig(): void {
     RNBackgroundDownloader.setConfig({
       progressInterval: 500,
       allowsCellularAccess: true,
-      showNotificationsEnabled: true,
-      showCompletionNotification: true,
+      showNotificationsEnabled: false,
+      showCompletionNotification: false,
       notificationsGrouping: {
-        enabled: true,
+        enabled: false,
         mode: 'summaryOnly',
         texts: {
           downloadTitle: 'تنزيل جارٍ',
