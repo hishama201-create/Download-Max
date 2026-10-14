@@ -2,7 +2,7 @@ name: Build Android Release APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, refactor/simplify-downloads ]
   workflow_dispatch: {}
 
 jobs:
