@@ -17,6 +17,7 @@ import { extractAudioFromVideo } from '@/context/audio';
 import { generateVideoThumbnail } from '@/context/thumbnails';
 import type { DownloadStatus, MediaType, MediaRequestOptions, DownloadItem } from './types';
 export type { DownloadStatus, MediaType, MediaRequestOptions, DownloadItem } from './types';
+import { foregroundDownloadBridge, foregroundDownloadNativeModule, removeForegroundDownload, requestDownloadNotificationPermission, updateForegroundDownload, upsertForegroundDownload } from './foregroundBridge';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
@@ -33,63 +34,6 @@ type BackgroundTask = ReturnType<typeof RNBackgroundDownloader.createDownloadTas
 const backgroundTasks = new Map<string, BackgroundTask>();
 const cancelBackgroundTasks = new Map<string, () => void>();
 
-// — (v2.0.29) جسر الخدمة الأمامية من v2.0.26: يرفع أولوية التطبيق أثناء التنزيل —
-// بحيث لا يجمد أندرويد (Doze) الشبكة خلف تطبيقات أخرى أو شاشة مقفلة.
-type ForegroundDownloadBridge = {
-  upsertDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
-  updateDownload: (id: string, title: string, fileUri: string, totalBytes: number, paused: boolean) => void;
-  removeDownload: (id: string) => void;
-  consumePendingActions: () => Promise<{ id: string; action: string }[]>;
-};
-
-const foregroundDownloadNativeModule = NativeModules.DownloadForeground;
-const foregroundDownloadBridge = foregroundDownloadNativeModule as ForegroundDownloadBridge | undefined;
-let notificationPermissionRequested = false;
-
-async function requestDownloadNotificationPermission(): Promise<boolean> {
-  if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return true;
-  try {
-    const permission = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
-    if (await PermissionsAndroid.check(permission)) return true;
-    if (notificationPermissionRequested) return false;
-    notificationPermissionRequested = true;
-    return (await PermissionsAndroid.request(permission, {
-      title: 'إشعارات التنزيلات',
-      message: 'اسمح بالإشعارات لمتابعة تقدم التنزيل والتحكم به عند استخدام تطبيقات أخرى.',
-      buttonPositive: 'السماح',
-      buttonNegative: 'ليس الآن',
-    })) === PermissionsAndroid.RESULTS.GRANTED;
-  } catch {
-    return false;
-  }
-}
-
-function updateForegroundDownload(item: DownloadItem, fileUri = '', totalBytes = item.totalBytes ?? 0, paused = false) {
-  if (Platform.OS !== 'android') return;
-  try {
-    foregroundDownloadBridge?.updateDownload(item.id, item.title, fileUri, totalBytes, paused);
-  } catch {
-    // الإشعار واجهة مساعدة؛ لا نوقف التنزيل إن تعذر تحديثه.
-  }
-}
-
-function upsertForegroundDownload(item: DownloadItem, fileUri = '', totalBytes = item.totalBytes ?? 0, paused = false) {
-  if (Platform.OS !== 'android') return;
-  try {
-    foregroundDownloadBridge?.upsertDownload(item.id, item.title, fileUri, totalBytes, paused);
-  } catch {
-    // الإشعار واجهة مساعدة؛ لا نوقف التنزيل إن تعذر تشغيله.
-  }
-}
-
-function removeForegroundDownload(id: string) {
-  if (Platform.OS !== 'android') return;
-  try {
-    foregroundDownloadBridge?.removeDownload(id);
-  } catch {
-    // لا يؤثر فشل تنظيف الإشعار في سجل التنزيل.
-  }
-}
 /**
  * خدمة تحويل روابط الصفحات إلى روابط وسائط مباشرة.
  * يمكن تغييرها لكل بيئة عبر EXPO_PUBLIC_EXTRACTOR_URL (تُثبَّت وقت البناء).
