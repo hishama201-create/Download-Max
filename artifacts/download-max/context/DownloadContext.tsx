@@ -15,6 +15,8 @@ import { MaxTasks } from '@/context/SettingsContext';
 import { setPublicRootProvider, syncHistorySnapshot, upsertHistoryEntry, deleteHistoryEntry } from '@/context/historyDb';
 import { extractAudioFromVideo } from '@/context/audio';
 import { generateVideoThumbnail } from '@/context/thumbnails';
+import type { DownloadStatus, MediaType, MediaRequestOptions, DownloadItem } from './types';
+export type { DownloadStatus, MediaType, MediaRequestOptions, DownloadItem } from './types';
 
 const STORAGE_KEY = '@download-max/downloads';
 const DOWNLOAD_DIR_KEY = '@download-max/download-dir';
@@ -95,8 +97,6 @@ function removeForegroundDownload(id: string) {
 const EXTRACTOR_API_URL =
   process.env.EXPO_PUBLIC_EXTRACTOR_URL?.trim() || 'https://api-production-85a7.up.railway.app/';
 
-export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed';
-export type MediaType = 'video' | 'audio' | 'image';
 
 // خدمة يوتيوب الاحتياطية: تشتغل عندما ترفض الخدمة الأساسية الفيديو (youtube.login ومشقاته).
 // تعيد اسم الفيديو الحقيقي + رابط تنزيل نهائي بعد تجهيز الملف.
@@ -180,12 +180,6 @@ export async function fetchYoutubeTitle(sourceUrl: string): Promise<string | nul
   }
 }
 
-/** خيارات طلب الاستخراج: جودة الفيديو أو صيغة/معدل الصوت. */
-export type MediaRequestOptions =
-  | { mode: 'video'; videoQuality?: string }
-  | { mode: 'audio'; audioFormat?: string; audioBitrate?: string }
-  | { mode: 'image' };
-
 /** يبني خيارات طلب الاستخراج من نوع الوسائط والصيغة المختارة. */
 export function requestOptionsFor(type: MediaType, format: string): MediaRequestOptions {
   if (type === 'audio') {
@@ -200,33 +194,6 @@ export function requestOptionsFor(type: MediaType, format: string): MediaRequest
   }
   return { mode: 'image' };
 }
-
-export type DownloadItem = {
-  id: string;
-  url: string;
-  title: string;
-  type: MediaType;
-  format: string;
-  quality: string;
-  status: DownloadStatus;
-  progress: number;
-  bytesWritten?: number;
-  totalBytes?: number;
-  fileUri?: string;
-  error?: string;
-  inVault?: boolean;
-  /** (v2.0.20) هل وُجدت نسخة من الملف في مجلد الجهاز؟ يمنع إعادة النسخ مع كل فتح. */
-  deviceSaved?: boolean;
-  /** وقت النقل إلى سلة المحذوفات — وجوده يعني أن الملف في السلة. */
-  deletedAt?: number;
-  /** خيارات طلب الاستخراج (جودة الفيديو أو معدل الصوت المطلوبة). */
-  requestOptions?: MediaRequestOptions;
-  /** صورة مصغّرة للملف (لقطة من الفيديو) — تُولَّد بعد اكتمال التنزيل. */
-  thumbnailUri?: string;
-  /** الرابط محفوظ مباشر بالفعل (نتيجة استخراج سابقة) — يُنزَّل كما هو دون إعادة استخراج. */
-  resolvedUrl?: boolean;
-  createdAt: number;
-};
 
 type DownloadContextValue = {
   items: DownloadItem[];
