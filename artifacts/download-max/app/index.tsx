@@ -45,7 +45,7 @@ import { AccentKey, accentSwatches, MaxTasks, ThemeMode, useAppSettings } from '
  * مكتوب هنا ومضبوط مع app.json في كل تحديث: القراءة من expo-constants وقت التشغيل
  * ترجع فارغة في نسخ الإصدار المبنية، فيظهر السطر «الإصدار» بلا رقم.
  */
-const APP_VERSION = '2.0.33';
+const APP_VERSION = '2.0.34';
 
 /** وكيل متصفح جوّال يفهمه مشغّل يوتيوب داخل الـ WebView بدل وكيل سطح المكتب. */
 const YT_MOBILE_UA =
@@ -761,7 +761,7 @@ function YoutubeScreen({ colors, onDownload, onPlayingChange }: {
   onDownload: (videoUrl: string) => void;
   onPlayingChange?: (playing: boolean) => void;
 }) {
-  const apiKey = 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
+  const apiKey = process.env.EXPO_PUBLIC_YOUTUBE_API_KEY?.trim() || 'AIzaSyDVZgxxaq37dDj5wQ9wQrPO4Oumju4gI44';
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<YoutubeVideo[]>([]);
   const [loading, setLoading] = useState(false);
