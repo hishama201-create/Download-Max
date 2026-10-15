@@ -657,8 +657,12 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
             clearInterval(progressWatcher);
             if (resumablesRef.current.get(id)) resumablesRef.current.delete(id);
             try {
-              const info = await FileSystem.getInfoAsync(location);
-              if (!info.exists) throw new Error('اكتمل التنزيل لكن الملف المؤقت غير موجود.');
+              let found: string | null = null;
+              for (const cand of [location, `file://${location.replace(/^file:\/\//, '')}`, bgDestination, `file://${bgDestination.replace(/^file:\/\//, '')}`]) {
+                try { const probe = await FileSystem.getInfoAsync(cand); if (probe.exists) { found = cand; break; } } catch { /* جرّب التالي */ }
+              }
+              if (!found) throw new Error(`اكتمل التنزيل لكن الملف المؤقت غير موجود. [${location}]`);
+              location = found;
               const finalPath = `${initialTypeDir || baseDirectory}${await uniqueFilename(initialTypeDir || baseDirectory, safeFilename(resolvedTitle, resolvedFormat))}`;
               try {
                 await FileSystem.moveAsync({ from: location, to: finalPath });
